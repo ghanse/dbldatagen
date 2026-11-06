@@ -82,7 +82,7 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P1.1 | Package scaffold (`profiler/` uv workspace member) + profile spec v0.1 (model + JSON Schema) + CLI stub | — | merged (PR #6) |
 | P1.2 | Baseline PySpark engine: schema, row count, nulls, min/max/mean/std, distinct count | P1.1 | merged (PR #7) |
 | P1.3 | Dataset catalog: synthetic datasets with known ground truth (relational PK/FK model, skew, correlated columns, regex-shaped strings, check constraints, nested types, wide/tall), deterministic seeds, scale tiers | P1.1 | merged (PR #8) |
-| P1.4 | Reference sampler (profile -> PySpark DataFrames, multi-table, respects keys) | P1.1 | approved (PR #9), waiting on #8 |
+| P1.4 | Reference sampler (profile -> PySpark DataFrames, multi-table, respects keys) | P1.1 | merged (PR #9) |
 | P1.5 | Fidelity metrics: marginals (KS / Wasserstein / TVD), cardinality error, pattern match rate, pairwise dependence error, constraint satisfaction, referential integrity, discriminator AUC, privacy guard (exact-row copy rate, distance to closest record) | P1.1 | review (PR #10, stacked on #8) |
 | P1.6 | Runner + evaluator: fresh-process samples, wall/CPU/RSS, paired bootstrap gate, policy JSON, results layout, noise control (same build vs itself) | P1.3–P1.5 | in-progress (codes against Scorer protocol; wiring after P1.4/P1.5 merge) |
 | P1.7 | RSI log tooling: append-only `log.jsonl` writer/validator + `LOG.md` renderer; `rsi/RSI.md` | P1.1 | merged (PR #4) |
