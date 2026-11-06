@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
+from itertools import pairwise
 from typing import Any
 
 import numpy as np
@@ -59,16 +60,30 @@ def sample(profile: Profile, spark: SparkSession, *, seed: int, scale: float = 1
         count = round(table.row_count * scale)
         candidate_count = count * 4 if _expression_constraints(table) else count
         columns = _generate_table(table, candidate_count, seed, report)
-        _apply_relationships(table, columns, values, relationships, seed, report)
-        _apply_keys(table, columns, report)
         _apply_constraints(table, columns, report)
+        _apply_relationships(table, columns, values, relationships, seed, report)
+        protected = {
+            name
+            for relationship in relationships
+            if relationship.child_table == table.name
+            for name in relationship.child_columns
+        }
+        _apply_keys(table, columns, report, protected)
+        _audit_constraints(table, columns, report)
         rows = [
-            {column.name: columns[column.name][index] for column in table.columns} for index in range(candidate_count)
+            {"__row_id": index, **{column.name: columns[column.name][index] for column in table.columns}}
+            for index in range(candidate_count)
         ]
-        arrow = pa.Table.from_pylist(rows, schema=pa.schema([_arrow_field(column) for column in table.columns]))
-        construction_schema = st.StructType([_construction_field(column) for column in table.columns])
+        arrow_schema = pa.schema(
+            [pa.field("__row_id", pa.int64(), nullable=False), *[_arrow_field(c) for c in table.columns]]
+        )
+        arrow = pa.Table.from_pylist(rows, schema=arrow_schema)
+        construction_schema = st.StructType(
+            [st.StructField("__row_id", st.LongType(), False), *[_construction_field(c) for c in table.columns]]
+        )
         frame = spark.createDataFrame(arrow, schema=construction_schema)
         frame = frame.select(
+            F.col("__row_id"),
             *[
                 (
                     F.parse_json(F.col(column.name)).alias(column.name)
@@ -76,7 +91,7 @@ def sample(profile: Profile, spark: SparkSession, *, seed: int, scale: float = 1
                     else F.col(column.name)
                 )
                 for column in table.columns
-            ]
+            ],
         )
         frame = _apply_expressions(table, frame, count, report)
         frames[table_name] = frame
@@ -161,7 +176,10 @@ def _generate_column(
     path: str,
     uniforms: np.ndarray | None = None,
 ) -> list[Any]:
-    report.add(path, "used", "logical_type", "source_type", "nullable", "null_fraction")
+    report.add(path, "used", "logical_type", "nullable", "null_fraction")
+    report.add(path, "used" if column.logical_type == LogicalType.INTERVAL else "ignored", "source_type")
+    if column.value_count is not None:
+        report.add(path, "ignored", "value_count")
     values: list[Any]
     if column.logical_type == LogicalType.STRUCT:
         children = {
@@ -172,11 +190,17 @@ def _generate_column(
     elif column.logical_type in (LogicalType.ARRAY, LogicalType.MAP):
         values = _generate_collection(column, count, rng, report, path)
     else:
-        values = _generate_scalar(column, count, rng, report, path, uniforms)
+        null_count = min(count, round(column.null_fraction * count))
+        indexes = {int(index) for index in rng.permutation(count)[:null_count]}
+        present = [index for index in range(count) if index not in indexes]
+        present_uniforms = uniforms[present] if uniforms is not None else None
+        generated = _generate_scalar(column, len(present), rng, report, path, present_uniforms)
+        iterator = iter(generated)
+        values = [None if index in indexes else next(iterator) for index in range(count)]
+        return values
     if column.null_fraction and count:
         null_count = min(count, round(column.null_fraction * count))
-        indexes = rng.permutation(count)[:null_count]
-        for index in indexes:
+        for index in rng.permutation(count)[:null_count]:
             values[int(index)] = None
     return values
 
@@ -215,7 +239,7 @@ def _generate_scalar(
         report.add(path, "unmet", "logical_type")
     if kind == LogicalType.STRING and column.string and column.string.top_values:
         return values
-    return _apply_pool(column, values, rng, report, path)
+    return _apply_pool(column, values, rng, report, path, uniforms)
 
 
 def _ordered_values(  # noqa: PLR0912
@@ -227,11 +251,13 @@ def _ordered_values(  # noqa: PLR0912
     uniforms: np.ndarray | None,
 ) -> list[Any]:
     stats = column.numeric or column.temporal
-    u = rng.random(count) if uniforms is None else uniforms
+    u = np.clip(rng.random(count) if uniforms is None else uniforms, 0.0, np.nextafter(1.0, 0.0))
+    if column.logical_type in _INTEGER_TYPES | {LogicalType.DECIMAL}:
+        return _exact_ordered_values(column, count, rng, report, path, u)
     if column.numeric and column.numeric.histogram:
         histogram = column.numeric.histogram
         weights = np.asarray(histogram.counts, dtype=float)
-        bins = np.searchsorted(np.cumsum(weights / weights.sum()), u, side="right")
+        bins = np.minimum(np.searchsorted(np.cumsum(weights / weights.sum()), u, side="right"), len(weights) - 1)
         low = np.asarray([_number(histogram.edges[index], column) for index in bins])
         high = np.asarray([_number(histogram.edges[index + 1], column) for index in bins])
         raw = low + rng.random(count) * (high - low)
@@ -275,6 +301,106 @@ def _ordered_values(  # noqa: PLR0912
         if special:
             report.add(path, "used", "numeric.non_finite")
     return [_convert_ordered(value, column) for value in raw]
+
+
+def _exact_ordered_values(
+    column: ColumnProfile,
+    count: int,
+    rng: np.random.Generator,
+    report: ReportBuilder,
+    path: str,
+    uniforms: np.ndarray,
+) -> list[Any]:
+    stats = column.numeric
+    if stats and stats.histogram:
+        histogram = stats.histogram
+        weights = np.asarray(histogram.counts, dtype=float)
+        bins = np.minimum(np.searchsorted(np.cumsum(weights / weights.sum()), uniforms, side="right"), len(weights) - 1)
+        values = [
+            _exact_between(
+                _exact_number(histogram.edges[index], column),
+                _exact_number(histogram.edges[index + 1], column),
+                float(rng.random()),
+                column,
+                closed=index == len(histogram.counts) - 1,
+            )
+            for index in bins
+        ]
+        report.add(path, "used", "numeric.histogram")
+        for field in ("quantiles", "min", "max", "mean", "stddev"):
+            if getattr(stats, field) is not None:
+                report.add(path, "ignored", f"numeric.{field}")
+        return values
+    if stats and stats.quantiles:
+        quantiles = sorted(stats.quantiles, key=lambda item: item.q)
+        values = [_exact_quantile(value, quantiles, column) for value in uniforms]
+        report.add(path, "used", "numeric.quantiles")
+        for field in ("min", "max", "mean", "stddev"):
+            if getattr(stats, field) is not None:
+                report.add(path, "ignored", f"numeric.{field}")
+        return values
+    if stats and stats.min is not None and stats.max is not None:
+        low = _exact_number(stats.min, column)
+        high = _exact_number(stats.max, column)
+        if stats.mean is not None and stats.stddev is not None:
+            raw = np.clip(_normal_ppf(uniforms) * stats.stddev + stats.mean, float(low), float(high))
+            values = [_convert_exact(min(high, max(low, Decimal(str(value)))), column) for value in raw]
+            report.add(path, "used", "numeric.min", "numeric.max", "numeric.mean", "numeric.stddev")
+            report.add(path, "approximated", "numeric.clipped_normal")
+            return values
+        report.add(path, "used", "numeric.min", "numeric.max")
+        report.add(path, "approximated", "numeric.uniform")
+        return [_exact_between(low, high, float(value), column, closed=True) for value in uniforms]
+    report.add(path, "approximated", "type_default")
+    if column.cardinality == Cardinality.UNIQUE:
+        return [_convert_exact(Decimal(index), column) for index in range(count)]
+    return [_convert_exact(Decimal(0), column)] * count
+
+
+def _exact_quantile(value: float, quantiles: list[Any], column: ColumnProfile) -> Any:  # noqa: ANN401
+    if value <= quantiles[0].q:
+        return _convert_exact(_exact_number(quantiles[0].value, column), column)
+    if value >= quantiles[-1].q:
+        return _convert_exact(_exact_number(quantiles[-1].value, column), column)
+    for left, right in pairwise(quantiles):
+        if left.q <= value <= right.q:
+            fraction = Decimal(str((value - left.q) / (right.q - left.q)))
+            low = _exact_number(left.value, column)
+            high = _exact_number(right.value, column)
+            return _convert_exact(low + fraction * (high - low), column)
+    raise AssertionError("quantile interval not found")
+
+
+def _exact_number(value: Any, column: ColumnProfile) -> Decimal:  # noqa: ANN401
+    literal = _literal(value, column)
+    return literal if isinstance(literal, Decimal) else Decimal(literal)
+
+
+def _exact_between(
+    low: Decimal,
+    high: Decimal,
+    uniform: float,
+    column: ColumnProfile,
+    *,
+    closed: bool,
+) -> Any:  # noqa: ANN401
+    if column.logical_type in _INTEGER_TYPES:
+        lower, upper = int(low), int(high)
+        width = upper - lower + int(closed)
+        return lower if width <= 0 else lower + min(width - 1, int(uniform * width))
+    quantum = Decimal(1).scaleb(-(column.scale or 0))
+    lower, upper = int(low / quantum), int(high / quantum)
+    width = upper - lower + int(closed)
+    units = lower if width <= 0 else lower + min(width - 1, int(uniform * width))
+    return _convert_exact(Decimal(units) * quantum, column)
+
+
+def _convert_exact(value: Decimal, column: ColumnProfile) -> int | Decimal:
+    if column.logical_type in _INTEGER_TYPES:
+        return round(value)
+    quantum = Decimal(1).scaleb(-(column.scale or 0))
+    limit = Decimal(10) ** ((column.precision or 38) - (column.scale or 0)) - quantum
+    return min(limit, max(-limit, value)).quantize(quantum)
 
 
 def _string_values(
@@ -345,6 +471,10 @@ def _generate_collection(
         return [elements[offsets[i] : offsets[i + 1]] for i in range(count)]
     keys = _generate_column(children[0], total, rng, report, f"{path}.key")
     values = _generate_column(children[1], total, rng, report, f"{path}.value")
+    for index, key in enumerate(keys):
+        if key is None:
+            keys[index] = _map_key(index, children[0], keys)
+            report.add(f"{path}.key", "approximated", "map.null_key_redraw")
     offsets = np.cumsum([0, *lengths])
     result = []
     for index in range(count):
@@ -357,19 +487,37 @@ def _generate_collection(
     return result
 
 
+def _map_key(index: int, column: ColumnProfile, existing: list[Any]) -> Any:  # noqa: ANN401
+    if column.logical_type == LogicalType.BOOLEAN:
+        return bool(index % 2)
+    if column.logical_type == LogicalType.BINARY:
+        return index.to_bytes(8, "little")
+    return _unique_value(None, index + len(existing), column, existing)
+
+
 def _apply_pool(
-    column: ColumnProfile, values: list[Any], rng: np.random.Generator, report: ReportBuilder, path: str
+    column: ColumnProfile,
+    values: list[Any],
+    rng: np.random.Generator,
+    report: ReportBuilder,
+    path: str,
+    uniforms: np.ndarray | None,
 ) -> list[Any]:
     if column.cardinality == Cardinality.UNIQUE:
         return values
     size = column.distinct_count.value if column.distinct_count else _bucket_size(column.cardinality, len(values))
     if size is None or size <= 0 or not values:
         return values
-    pool = values[: min(size, len(values))]
+    ordered = sorted(values)
+    pool_size = min(size, len(ordered))
+    positions = np.linspace(0, len(ordered) - 1, pool_size, dtype=int)
+    pool = [ordered[index] for index in positions]
     report.add(path, "used", "distinct_count" if column.distinct_count else "cardinality")
     if column.distinct_count and not column.distinct_count.exact:
         report.add(path, "approximated", "distinct_count.approximate")
-    return [pool[int(index)] for index in rng.integers(0, len(pool), len(values))]
+    draws = rng.random(len(values)) if uniforms is None else uniforms
+    indexes = np.minimum((np.clip(draws, 0, np.nextafter(1.0, 0.0)) * len(pool)).astype(int), len(pool) - 1)
+    return [pool[index] for index in indexes]
 
 
 def _bucket_size(cardinality: Cardinality | None, count: int) -> int | None:
@@ -401,19 +549,30 @@ def _apply_relationships(
                 )
             )
         )
-        count = len(next(iter(columns.values()), []))
-        covered = min(count, round(count * relationship.coverage))
-        indexes = _fanout_indexes(covered, len(parents), relationship, rng)
+        non_null = [
+            index
+            for index, values in enumerate(zip(*(columns[name] for name in relationship.child_columns), strict=True))
+            if all(value is not None for value in values)
+        ]
+        covered = min(len(non_null), round(len(non_null) * relationship.coverage))
+        positions = rng.permutation(non_null).tolist()
+        covered_positions = positions[:covered]
+        uncovered_positions = positions[covered:]
+        indexes, fanout_used = _fanout_indexes(covered, len(parents), relationship, rng)
+        if not parents:
+            for child_name in relationship.child_columns:
+                report.add(f"{table.name}.{child_name}", "unmet", "relationship.parent_key")
+            continue
         for child_index, child_name in enumerate(relationship.child_columns):
-            values = [parents[parent][child_index] for parent in indexes]
-            values.extend(columns[child_name][covered:])
-            columns[child_name] = values
+            for position, parent in zip(covered_positions, indexes, strict=True):
+                columns[child_name][position] = parents[parent][child_index]
             path = f"{table.name}.{child_name}"
             report.add(path, "used", "relationship.coverage", "relationship.parent_key")
             if relationship.fan_out:
-                report.add(path, "used", "relationship.fan_out")
-                report.add(path, "approximated", "relationship.fan_out.weighted")
-        _exclude_parent_keys(table, columns, relationship, parents, covered)
+                report.add(path, "used" if fanout_used else "ignored", "relationship.fan_out")
+                if fanout_used:
+                    report.add(path, "approximated", "relationship.fan_out.discretized")
+        _exclude_parent_keys(table, columns, relationship, parents, uncovered_positions)
 
 
 def _exclude_parent_keys(
@@ -421,13 +580,13 @@ def _exclude_parent_keys(
     columns: dict[str, list[Any]],
     relationship: Relationship,
     parents: list[tuple[Any, ...]],
-    covered: int,
+    uncovered: list[int],
 ) -> None:
     parent_set = set(parents)
     count = len(next(iter(columns.values()), []))
     last_name = relationship.child_columns[-1]
     last_column = next(column for column in table.columns if column.name == last_name)
-    for index in range(covered, count):
+    for index in uncovered:
         key = tuple(columns[name][index] for name in relationship.child_columns)
         if key in parent_set:
             columns[last_name][index] = _unique_value(
@@ -435,34 +594,78 @@ def _exclude_parent_keys(
             )
 
 
-def _fanout_indexes(count: int, parent_count: int, relationship: Relationship, rng: np.random.Generator) -> np.ndarray:
+def _fanout_indexes(
+    count: int, parent_count: int, relationship: Relationship, rng: np.random.Generator
+) -> tuple[np.ndarray, bool]:
     if parent_count == 0:
-        return np.zeros(count, dtype=int)
-    if not relationship.fan_out or relationship.fan_out.stddev is None:
-        return rng.integers(0, parent_count, count)
-    weights = np.clip(rng.normal(relationship.fan_out.mean, relationship.fan_out.stddev, parent_count), 0, None)
-    if not weights.any():
-        weights[:] = 1
-    return rng.choice(parent_count, count, p=weights / weights.sum())
+        return np.zeros(count, dtype=int), False
+    stats = relationship.fan_out
+    if stats is None:
+        return rng.integers(0, parent_count, count), False
+    if not stats.min * parent_count <= count <= stats.max * parent_count:
+        return rng.integers(0, parent_count, count), False
+    if stats.quantiles:
+        quantiles = sorted(stats.quantiles, key=lambda item: item.q)
+        raw = np.interp(
+            rng.random(parent_count),
+            [item.q for item in quantiles],
+            [int(item.value) for item in quantiles],
+        )
+    elif stats.stddev is not None:
+        raw = rng.normal(stats.mean, stats.stddev, parent_count)
+    else:
+        raw = np.full(parent_count, stats.mean)
+    counts = np.clip(np.rint(raw), stats.min, stats.max).astype(int)
+    _adjust_counts(counts, count, stats.min, stats.max, rng)
+    indexes = np.repeat(np.arange(parent_count), counts)
+    rng.shuffle(indexes)
+    return indexes, True
 
 
-def _apply_keys(table: TableProfile, columns: dict[str, list[Any]], report: ReportBuilder) -> None:
+def _adjust_counts(counts: np.ndarray, target: int, minimum: int, maximum: int, rng: np.random.Generator) -> None:
+    delta = target - int(counts.sum())
+    direction = 1 if delta > 0 else -1
+    candidates = np.flatnonzero(counts < maximum if direction > 0 else counts > minimum)
+    cursor = 0
+    while delta and len(candidates):
+        index = int(candidates[cursor % len(candidates)])
+        counts[index] += direction
+        delta -= direction
+        cursor += 1
+        if cursor % len(candidates) == 0:
+            candidates = np.flatnonzero(counts < maximum if direction > 0 else counts > minimum)
+            rng.shuffle(candidates)
+
+
+def _apply_keys(table: TableProfile, columns: dict[str, list[Any]], report: ReportBuilder, protected: set[str]) -> None:
     keys = ([table.primary_key] if table.primary_key else []) + (table.unique_keys or [])
     count = len(next(iter(columns.values()), []))
     for key in keys:
         seen: set[tuple[Any, ...]] = set()
+        unmet = False
         for index in range(count):
             value = tuple(columns[name][index] for name in key.columns)
             needs_value = key is table.primary_key and any(item is None for item in value)
             duplicate = value in seen and not (key is not table.primary_key and any(item is None for item in value))
             if needs_value or duplicate:
-                last = key.columns[-1]
+                mutable = [name for name in key.columns if name not in protected]
+                if not mutable:
+                    unmet = True
+                    for name in key.columns:
+                        report.add(
+                            f"{table.name}.{name}",
+                            "unmet",
+                            "primary_key" if key is table.primary_key else "unique_keys",
+                        )
+                    continue
+                last = mutable[-1]
                 column = next(column for column in table.columns if column.name == last)
                 columns[last][index] = _unique_value(columns[last][index], index, column, columns[last])
                 value = tuple(columns[name][index] for name in key.columns)
             seen.add(value)
         for name in key.columns:
-            report.add(f"{table.name}.{name}", "used", "primary_key" if key is table.primary_key else "unique_keys")
+            if not unmet:
+                report.add(f"{table.name}.{name}", "used", "primary_key" if key is table.primary_key else "unique_keys")
 
 
 def _unique_value(value: Any, index: int, column: ColumnProfile, existing: list[Any]) -> Any:  # noqa: ANN401, PLR0911
@@ -471,18 +674,20 @@ def _unique_value(value: Any, index: int, column: ColumnProfile, existing: list[
         return f"{value or ''}_{index}"
     if kind in _INTEGER_TYPES:
         present = [item for item in existing if item is not None]
-        return (max(present) if present else 0) + index + 1
+        return (max(present) if present else 0) + 1
     if kind in (LogicalType.FLOAT32, LogicalType.FLOAT64):
         present = [item for item in existing if item is not None]
-        return float(max(present) if present else 0) + index + 1
+        return float(np.nextafter(max(present) if present else 0.0, math.inf))
     if kind == LogicalType.DECIMAL:
         present = [item for item in existing if item is not None]
         base = max(present) if present else Decimal(0)
-        return (base + index + 1).quantize(Decimal(1).scaleb(-(column.scale or 0)))
+        return (base + Decimal(1).scaleb(-(column.scale or 0))).quantize(Decimal(1).scaleb(-(column.scale or 0)))
     if kind == LogicalType.DATE:
-        return date(1970, 1, 1) + timedelta(days=index)
+        present = [item for item in existing if item is not None]
+        return (max(present) if present else date(1970, 1, 1)) + timedelta(days=1)
     if kind in (LogicalType.TIMESTAMP, LogicalType.TIMESTAMP_NTZ):
-        return datetime(1970, 1, 1) + timedelta(microseconds=index)
+        present = [item for item in existing if item is not None]
+        return (max(present) if present else datetime(1970, 1, 1)) + timedelta(microseconds=1)
     return f"{value}_{index}"
 
 
@@ -514,12 +719,52 @@ def _apply_constraints(table: TableProfile, columns: dict[str, list[Any]], repor
             ]
             report.add(f"{table.name}.{constraint.column}", "used", "check_constraints.enumeration")
         elif isinstance(constraint, ComparisonConstraint):
-            _enforce_comparison(columns, constraint)
+            _enforce_comparison(table, columns, constraint)
             report.add(f"{table.name}.{constraint.left}", "used", "check_constraints.comparison")
             report.add(f"{table.name}.{constraint.right}", "used", "check_constraints.comparison")
 
 
-def _enforce_comparison(columns: dict[str, list[Any]], constraint: ComparisonConstraint) -> None:
+def _audit_constraints(table: TableProfile, columns: dict[str, list[Any]], report: ReportBuilder) -> None:
+    operators = {
+        "<": lambda left, right: left < right,
+        "<=": lambda left, right: left <= right,
+        "=": lambda left, right: left == right,
+        "!=": lambda left, right: left != right,
+        ">=": lambda left, right: left >= right,
+        ">": lambda left, right: left > right,
+    }
+    for constraint in table.check_constraints or []:
+        failed = False
+        names: list[str] = []
+        if isinstance(constraint, RangeConstraint):
+            names = [constraint.column]
+            column = next(column for column in table.columns if column.name == constraint.column)
+            low = _literal(constraint.min, column) if constraint.min is not None else None
+            high = _literal(constraint.max, column) if constraint.max is not None else None
+            failed = any(
+                value is not None and ((low is not None and value < low) or (high is not None and value > high))
+                for value in columns[constraint.column]
+            )
+        elif isinstance(constraint, EnumerationConstraint):
+            names = [constraint.column]
+            column = next(column for column in table.columns if column.name == constraint.column)
+            allowed = {_literal(value, column) for value in constraint.values}
+            failed = any(value is not None and value not in allowed for value in columns[constraint.column])
+        elif isinstance(constraint, ComparisonConstraint):
+            names = [constraint.left, constraint.right]
+            pairs = zip(columns[constraint.left], columns[constraint.right], strict=True)
+            failed = any(
+                left is not None and right is not None and not operators[constraint.operator](*_comparable(left, right))
+                for left, right in pairs
+            )
+        if failed:
+            label = constraint.kind
+            report.unmet(table.name, label)
+            for name in names:
+                report.add(f"{table.name}.{name}", "unmet", f"check_constraints.{label}")
+
+
+def _enforce_comparison(table: TableProfile, columns: dict[str, list[Any]], constraint: ComparisonConstraint) -> None:
     operators = {
         "<": lambda left, right: left < right,
         "<=": lambda left, right: left <= right,
@@ -537,13 +782,37 @@ def _enforce_comparison(columns: dict[str, list[Any]], constraint: ComparisonCon
             and not operators[constraint.operator](comparable_left, comparable_right)
         ):
             if constraint.operator in ("<", "<="):
-                columns[constraint.right][index] = _coerce_like(left, right)
+                repaired = _coerce_like(left, right)
+                right_column = next(column for column in table.columns if column.name == constraint.right)
+                columns[constraint.right][index] = (
+                    _next_value(repaired, right_column, 1) if constraint.operator == "<" else repaired
+                )
             elif constraint.operator in (">", ">="):
-                columns[constraint.left][index] = _coerce_like(right, left)
+                repaired = _coerce_like(right, left)
+                left_column = next(column for column in table.columns if column.name == constraint.left)
+                columns[constraint.left][index] = (
+                    _next_value(repaired, left_column, 1) if constraint.operator == ">" else repaired
+                )
             elif constraint.operator == "=":
                 columns[constraint.right][index] = left
             else:
                 columns[constraint.right][index] = _different(right)
+
+
+def _next_value(value: Any, column: ColumnProfile, direction: int) -> Any:  # noqa: ANN401
+    kind = column.logical_type
+    if kind in _INTEGER_TYPES:
+        return value + direction
+    if kind == LogicalType.DECIMAL:
+        return value + Decimal(1).scaleb(-(column.scale or 0)) * direction
+    if kind in (LogicalType.FLOAT32, LogicalType.FLOAT64):
+        target = math.inf if direction > 0 else -math.inf
+        return float(np.nextafter(value, target))
+    if kind == LogicalType.DATE:
+        return value + timedelta(days=direction)
+    if kind in (LogicalType.TIMESTAMP, LogicalType.TIMESTAMP_NTZ):
+        return value + timedelta(microseconds=direction)
+    return _different(value)
 
 
 def _comparable(left: Any, right: Any) -> tuple[Any, Any]:  # noqa: ANN401
@@ -579,7 +848,7 @@ def _expression_constraints(table: TableProfile) -> list[ExpressionConstraint]:
 def _apply_expressions(table: TableProfile, frame: DataFrame, count: int, report: ReportBuilder) -> DataFrame:
     constraints = _expression_constraints(table)
     if not constraints:
-        return frame
+        return frame.orderBy("__row_id").drop("__row_id")
     filtered = frame
     failed: list[ExpressionConstraint] = []
     for constraint in constraints:
@@ -587,16 +856,18 @@ def _apply_expressions(table: TableProfile, frame: DataFrame, count: int, report
             filtered = filtered.filter(f"COALESCE(({constraint.expression}), false)")
         except Exception:
             failed.append(constraint)
-    if not failed and filtered.limit(count).count() == count:
+    selected = filtered.orderBy("__row_id").limit(count)
+    selected_count = selected.count()
+    if not failed and selected_count == count:
         for column in table.columns:
             report.add(f"{table.name}.{column.name}", "used", "check_constraints.expression")
-        return filtered.limit(count)
+        return selected.drop("__row_id")
     for constraint in constraints:
-        if constraint in failed or filtered.limit(count).count() < count:
+        if constraint in failed or selected_count < count:
             report.unmet(table.name, constraint.expression)
             for column in table.columns:
                 report.add(f"{table.name}.{column.name}", "unmet", "check_constraints.expression")
-    return frame.limit(count)
+    return frame.orderBy("__row_id").limit(count).drop("__row_id")
 
 
 def _apply_categorical_dependencies(
@@ -631,7 +902,8 @@ def _nearest_psd(matrix: np.ndarray) -> tuple[np.ndarray, bool]:
 
 
 def _normal_cdf(values: np.ndarray) -> np.ndarray:
-    return np.asarray([0.5 * (1 + math.erf(value / math.sqrt(2))) for value in values])
+    probabilities = np.asarray([0.5 * (1 + math.erf(value / math.sqrt(2))) for value in values])
+    return np.clip(probabilities, 0.0, np.nextafter(1.0, 0.0))
 
 
 def _normal_ppf(values: np.ndarray) -> np.ndarray:

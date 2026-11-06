@@ -213,6 +213,8 @@ def test_report_classifies_used_ignored_and_unmet_fields(spark: SparkSession) ->
 
     assert "numeric.quantiles" in report.columns["t.x"].used
     assert {"numeric.min", "numeric.max", "dependencies.correlation_ratio"} <= set(report.columns["t.x"].ignored)
+    assert "source_type" in report.columns["t.x"].ignored
+    assert "nullable" in report.columns["t.x"].used
     assert "dependencies.correlation_ratio" in report.columns["t.kind"].ignored
     assert "check_constraints.expression" in report.columns["t.x"].unmet
     assert report.unmet_constraints == {"t": ("x > 100",)}

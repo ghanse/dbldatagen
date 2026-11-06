@@ -93,3 +93,30 @@ def test_nested_lengths_and_child_marginals(spark: SparkSession) -> None:
 
     assert all(len(row.items) == 3 and set(row.items) == {5} for row in rows)
     assert all(len(row.lookup) == 2 and set(row.lookup.values()) == {2.5} for row in rows)
+
+
+def test_map_null_keys_are_redrawn_without_shortening(spark: SparkSession) -> None:
+    mapping = column(
+        "lookup",
+        LogicalType.MAP,
+        children=[
+            column(
+                "key",
+                LogicalType.STRING,
+                nullable=True,
+                null_fraction=0.5,
+                string=StringStats(length=LengthStats(min=12, max=12)),
+                value_count=600,
+            ),
+            column("value", LogicalType.INT32),
+        ],
+        collection_length=LengthStats(min=3, max=3),
+    )
+
+    result = sample(profile(TableProfile(name="t", row_count=200, columns=[mapping])), spark, seed=15)
+    rows = result.tables["t"].collect()
+
+    assert all(len(row.lookup) == 3 and None not in row.lookup for row in rows)
+    key_report = result.report.columns["t.lookup.key"]
+    assert "map.null_key_redraw" in key_report.approximated
+    assert "value_count" in key_report.ignored

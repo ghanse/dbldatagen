@@ -111,10 +111,14 @@ coverage = result.report
 ```
 
 Pearson and Spearman dependencies use a Gaussian copula with a nearest-positive-semidefinite correlation matrix.
-Cramér's V is approximated by mixing independent categorical draws with a deterministic left-to-right category mapping;
-the requested coefficient controls the mixture strength but is not guaranteed to equal the resulting coefficient.
+Cramér's V is approximated by replacing the requested share of sampled right-hand categories through a deterministic
+left-to-right category mapping; the requested coefficient controls the mixture strength but is not guaranteed to equal
+the resulting coefficient for imbalanced marginals.
 Expression constraints use bounded oversampling followed by Spark SQL filtering; any unmet expression is recorded rather
 than failing the sample.
+
+The reference sampler is designed for benchmark tiers up to `s` (about 100,000 rows and the catalog's roughly
+200-column wide table). Tier `m` measures profiler speed and is not a supported fidelity-sampling workload.
 
 ## Development
 
