@@ -20,28 +20,33 @@ Guard: **privacy** — the profile must not leak raw rows or rare identifying va
 ## Architecture
 
 ```
-profiler/
+profiler/                     distribution `dbldatagen-profiler` (uv workspace member) — the system under improvement
   PLAN.md                     this file
-  pyproject.toml              separate distribution `dbldatagen-profiler` (uv workspace member)
   spec/profile.schema.json    engine-neutral, versioned profile contract (generated from the model)
   src/dbldatagen_profiler/
     model/                    profile data model (pydantic) — the contract
     engines/spark/            PySpark engine
     cli.py                    `dbldatagen-profile` CLI
-  rust/                       Rust engine (Polars or DataFusion), single static binary, same contract
-  bench/                      RSI benchmark harness (frozen per experiment)
-    catalog/                  dataset catalog with known ground-truth structure
-    sampler/                  reference reconstructor: profile -> synthetic data
-    fidelity/                 reconstruction metrics
-    runner/                   fresh-process sampling of profile time / CPU / RSS
-    evaluate/                 paired bootstrap gate against policy
-    policies/*.json           frozen acceptance policies
+  rust/                       Rust engine (Polars or DataFusion), single binary, same contract (deferred)
   rsi/
     RSI.md                    the RSI procedure and roles
-    log.jsonl                 append-only audit log (source of truth)
-    LOG.md                    human-readable rendering of log.jsonl
+    LOG_SCHEMA.md             audit log entry schema
+    log.jsonl                 append-only, hash-chained audit log (source of truth)
+    LOG.md                    rendered from log.jsonl
+    tools/rsi_log.py          append / verify / render / show
     experiments/<id>/         per-experiment frozen inputs, raw results, verdict, retained patch
+profiler-bench/               distribution `dbldatagen-profiler-bench` (uv workspace member) — the measuring stick
+  src/profiler_bench/
+    catalog/                  seeded datasets + ground-truth manifests, tiers xs / s / m
+    sampler/                  reference reconstructor: profile -> synthetic data
+    fidelity/                 reconstruction, structure-recovery, and privacy metrics
+    runner/                   fresh-process sampling of profile time / CPU / RSS
+    evaluate/                 paired bootstrap gate against policy
+  policies/*.json             frozen acceptance policies
+  COVERAGE.md                 which structures each dataset exercises; known gaps
 ```
+
+The benchmark is a separate distribution, so a profiler change cannot silently change how it is measured.
 
 Design rules:
 
@@ -51,6 +56,7 @@ Design rules:
   use cannot improve the score, so a proposal that adds a profile feature must also extend the sampler.
 - **Frozen per experiment:** the dataset catalog, fidelity metrics, and policy. Changing them is a separate,
   logged benchmark change, never mixed with a profiler change.
+- **Two kinds of fidelity:** data-level reconstruction (synthetic vs source) and structure recovery (profile vs the dataset's ground-truth manifest).
 - **Ceiling check:** fidelity of a real-vs-held-out-real split gives the best achievable score for each dataset.
 - No anchoring to current dbldatagen features. Generator gaps go in the "Generator follow-ups" section below.
 
@@ -72,11 +78,11 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 
 | ID | Item | Depends on | Status |
 |----|------|------------|--------|
-| P1.1 | Package scaffold (`profiler/` uv workspace member) + profile spec v0.1 (model + JSON Schema) + CLI stub | — | in-progress |
-| P1.2 | Baseline PySpark engine: schema, row count, nulls, min/max/mean/std, distinct count | P1.1 | in-progress |
-| P1.3 | Dataset catalog: synthetic datasets with known ground truth (relational PK/FK model, skew, correlated columns, regex-shaped strings, check constraints, nested types, wide/tall), deterministic seeds, scale tiers | P1.1 | in-progress |
-| P1.4 | Reference sampler (profile -> PySpark DataFrames, multi-table, respects keys) | P1.1 | in-progress |
-| P1.5 | Fidelity metrics: marginals (KS / Wasserstein / TVD), cardinality error, pattern match rate, pairwise dependence error, constraint satisfaction, referential integrity, discriminator AUC, privacy guard (exact-row copy rate, distance to closest record) | P1.1 | in-progress |
+| P1.1 | Package scaffold (`profiler/` uv workspace member) + profile spec v0.1 (model + JSON Schema) + CLI stub | — | review (PR #6) |
+| P1.2 | Baseline PySpark engine: schema, row count, nulls, min/max/mean/std, distinct count | P1.1 | review (PR #6) |
+| P1.3 | Dataset catalog: synthetic datasets with known ground truth (relational PK/FK model, skew, correlated columns, regex-shaped strings, check constraints, nested types, wide/tall), deterministic seeds, scale tiers | P1.1 | review (PR #6) |
+| P1.4 | Reference sampler (profile -> PySpark DataFrames, multi-table, respects keys) | P1.1 | review (PR #6) |
+| P1.5 | Fidelity metrics: marginals (KS / Wasserstein / TVD), cardinality error, pattern match rate, pairwise dependence error, constraint satisfaction, referential integrity, discriminator AUC, privacy guard (exact-row copy rate, distance to closest record) | P1.1 | review (PR #6) |
 | P1.6 | Runner + evaluator: fresh-process samples, wall/CPU/RSS, paired bootstrap gate, policy JSON, results layout, noise control (same build vs itself) | P1.3–P1.5 | todo |
 | P1.7 | RSI log tooling: append-only `log.jsonl` writer/validator + `LOG.md` renderer; `rsi/RSI.md` | P1.1 | merged (PR #4) |
 | P1.7a | Fix: `rsi_log.py append --kind` flag is dropped; add CLI-flag tests | P1.7 | merged (PR #5) |
