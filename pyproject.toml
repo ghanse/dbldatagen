@@ -106,7 +106,7 @@ exclude-newer-package = { "databricks-sdk" = false }
 required-version = "~= 0.11.0"
 
 [tool.uv.workspace]
-members = ["profiler"]
+members = ["profiler", "profiler-bench"]
 
 # pydoc-markdown: auto-generate the core API reference (docs/core/reference/api).
 # Scoped to the dbldatagen.core package only -- the v0 API is documented via
