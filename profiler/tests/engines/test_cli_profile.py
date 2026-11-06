@@ -21,3 +21,17 @@ def test_profile_parquet_end_to_end(spark: SparkSession, tmp_path: Path) -> None
     profile = load_profile(json.loads(output.read_text(encoding="utf-8")), strict=True)
     assert profile.tables[0].name == "items"
     assert profile.tables[0].row_count == 2
+    assert profile.source is not None
+    assert profile.source.name == "items"
+    assert profile.source.format == "parquet"
+    assert profile.source.location is None
+    assert str(source) not in output.read_text(encoding="utf-8")
+
+
+def test_profile_reports_spark_read_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    output = tmp_path / "profile.json"
+    missing = tmp_path / "missing.parquet"
+    result = main(["profile", "--table", f"missing={missing}", "--format", "parquet", "-o", str(output)])
+    assert result == 1
+    assert "dbldatagen-profile profile:" in capsys.readouterr().err
+    assert not output.exists()

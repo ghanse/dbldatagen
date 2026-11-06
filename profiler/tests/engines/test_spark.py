@@ -1,6 +1,7 @@
 """Tests for the baseline PySpark profiling engine."""
 
-from datetime import date, datetime
+import time
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 import jsonschema
@@ -118,8 +119,8 @@ def test_maps_every_type_family_and_validates_schema(spark: SparkSession) -> Non
 def test_profiles_flat_statistics(spark: SparkSession) -> None:
     schema = "number long, text string, moment timestamp, flag boolean, all_null int, constant double"
     rows = [
-        (1, "a", datetime(2026, 1, 1), True, None, 2.0),
-        (2, "abcd", datetime(2026, 1, 3), False, None, 2.0),
+        (1, "a", datetime(2026, 1, 1, tzinfo=timezone.utc), True, None, 2.0),
+        (2, "abcd", datetime(2026, 1, 3, tzinfo=timezone.utc), False, None, 2.0),
         (None, None, None, None, None, None),
     ]
     table = profile_dataframe("stats", spark.createDataFrame(rows, schema)).tables[0]
@@ -140,8 +141,7 @@ def test_profiles_flat_statistics(spark: SparkSession) -> None:
     assert number.numeric.mean == pytest.approx(1.5)
     assert number.numeric.stddev == pytest.approx(2**-0.5)
     assert text.string.length.model_dump(exclude_none=True) == {"min": 1, "max": 4, "mean": 2.5}
-    assert moment.temporal.min is not None
-    assert datetime.fromisoformat(moment.temporal.min).utcoffset() is not None
+    assert moment.temporal.min == "2026-01-01T00:00:00Z"
     assert flag.boolean.true_fraction == 0.5
     assert columns["all_null"].numeric.model_dump(exclude_none=True) == {}
     assert columns["constant"].numeric.stddev == 0.0
@@ -153,6 +153,31 @@ def test_profiles_empty_table(spark: SparkSession) -> None:
     assert table.columns[0].null_fraction == 0.0
     assert table.columns[0].distinct_count is not None
     assert table.columns[0].distinct_count.value == 0
+
+
+def test_timestamp_extremes_are_utc_when_host_is_not(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    try:
+        with monkeypatch.context() as patch:
+            patch.setenv("TZ", "America/New_York")
+            time.tzset()
+            frame = spark.sql("SELECT TIMESTAMP '2026-01-02 03:04:05' AS moment")
+            column = profile_dataframe("timestamps", frame).tables[0].columns[0]
+    finally:
+        time.tzset()
+    assert column.temporal is not None
+    assert column.temporal.min == "2026-01-02T03:04:05Z"
+    assert column.temporal.max == "2026-01-02T03:04:05Z"
+
+
+def test_non_finite_float_extremes_are_omitted(spark: SparkSession) -> None:
+    column = (
+        profile_dataframe("non_finite", spark.createDataFrame([(float("inf"),)], "value double")).tables[0].columns[0]
+    )
+    assert column.numeric is not None
+    assert column.numeric.min is None
+    assert column.numeric.max is None
+    assert "min" not in column.numeric.model_dump(exclude_none=True)
+    assert "max" not in column.numeric.model_dump(exclude_none=True)
 
 
 def test_lossless_decimal_and_int64_extremes(spark: SparkSession) -> None:

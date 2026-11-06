@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from importlib import import_module
 from pathlib import Path
 
-from dbldatagen_profiler.model import dump_profile, load_profile, render_json_schema
+from dbldatagen_profiler.model import SourceInfo, dump_profile, load_profile, render_json_schema
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -82,6 +82,8 @@ def _schema(args: argparse.Namespace) -> int:
 
 def _profile(args: argparse.Namespace) -> int:
     """Profiles the input tables and writes a validated JSON profile."""
+    spark_errors = import_module("pyspark.errors")
+    py4j_errors = import_module("py4j.protocol")
     try:
         parsed = [_parse_table(value) for value in args.table]
         inputs = dict(parsed)
@@ -89,12 +91,18 @@ def _profile(args: argparse.Namespace) -> int:
             raise ValueError("duplicate table name")
         SparkSession = import_module("pyspark.sql").SparkSession
         profile_tables = import_module("dbldatagen_profiler.engines.spark").profile_tables
-        spark = SparkSession.builder.master("local[*]").appName("dbldatagen-profiler").getOrCreate()
+        spark = (
+            SparkSession.builder.master("local[*]")
+            .appName("dbldatagen-profiler")
+            .config("spark.sql.session.timeZone", "UTC")
+            .getOrCreate()
+        )
         tables = {name: spark.read.format(args.format).load(path) for name, path in inputs.items()}
         profile = profile_tables(tables)
+        profile.source = SourceInfo(name=", ".join(inputs), format=args.format)
         load_profile(profile.model_dump(mode="json"), strict=True)
         args.output.write_text(dump_profile(profile) + "\n", encoding="utf-8")
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, spark_errors.PySparkException, py4j_errors.Py4JError) as error:
         print(f"dbldatagen-profile profile: {error}", file=sys.stderr)
         return 1
     return 0

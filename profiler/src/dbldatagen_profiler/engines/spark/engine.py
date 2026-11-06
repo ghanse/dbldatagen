@@ -85,6 +85,7 @@ def profile_dataframe(name: str, df: DataFrame, *, privacy: PrivacyPolicy | None
 
 
 def _profile_table(name: str, df: DataFrame, privacy: PrivacyPolicy) -> TableProfile:
+    df.sparkSession.conf.set("spark.sql.session.timeZone", "UTC")
     expressions: list[Column] = [F.count(F.lit(1)).alias("__row_count")]
     for index, field in enumerate(df.schema.fields):
         expressions.extend(_aggregate_expressions(df[field.name], field.dataType, index))
@@ -130,7 +131,12 @@ def _aggregate_expressions(column: Column, data_type: T.DataType, index: int) ->
             ]
         )
     elif isinstance(data_type, _temporal_types()):
-        expressions.extend([F.min(column).alias(f"{prefix}_min"), F.max(column).alias(f"{prefix}_max")])
+        expressions.extend(
+            [
+                F.min(column).cast("string").alias(f"{prefix}_min"),
+                F.max(column).cast("string").alias(f"{prefix}_max"),
+            ]
+        )
     elif isinstance(data_type, T.BooleanType):
         expressions.append(F.avg(column.cast("double")).alias(f"{prefix}_true_fraction"))
     elif isinstance(data_type, (T.ArrayType, T.MapType)):
@@ -253,6 +259,8 @@ def _encode_numeric(value: object, data_type: T.DataType) -> int | float | str |
         return None
     if isinstance(data_type, (T.LongType, T.DecimalType)):
         return str(value) if not isinstance(value, Decimal) else format(value, "f")
+    if isinstance(data_type, (T.FloatType, T.DoubleType)):
+        return _finite_float(value)
     if isinstance(value, int | float):
         return value
     raise TypeError(f"unexpected numeric value {value!r}")
@@ -288,6 +296,8 @@ def _temporal_stats(
 def _encode_temporal(value: object, data_type: T.DataType) -> str | None:
     if value is None:
         return None
+    if isinstance(value, str):
+        return _encode_temporal_string(value, data_type)
     if isinstance(data_type, T.DateType) and isinstance(value, date):
         return value.isoformat()
     if isinstance(data_type, _time_types()) and isinstance(value, time):
@@ -295,7 +305,17 @@ def _encode_temporal(value: object, data_type: T.DataType) -> str | None:
     if not isinstance(value, datetime):
         raise TypeError(f"unexpected temporal value {value!r}")
     rendered = value.isoformat()
-    return rendered if isinstance(data_type, _timestamp_ntz_types()) else value.astimezone().isoformat()
+    if isinstance(data_type, _timestamp_ntz_types()):
+        return rendered
+    return value.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _encode_temporal_string(value: str, data_type: T.DataType) -> str:
+    """Encodes a temporal value rendered in the UTC Spark session."""
+    rendered = value.replace(" ", "T")
+    if isinstance(data_type, (*_timestamp_ntz_types(), T.DateType, *_time_types())):
+        return rendered
+    return f"{rendered}Z"
 
 
 def _logical_type(data_type: T.DataType) -> LogicalType:
