@@ -8,7 +8,8 @@
   "privacy": {
     "min_value_count": 20,
     "extremes": "generalized",
-    "enumerations": "suppressed"
+    "enumerations": "suppressed",
+    "allow_expression_constraints": false
   },
   "source": {
     "name": "shop",

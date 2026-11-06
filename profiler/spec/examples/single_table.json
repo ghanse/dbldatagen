@@ -8,7 +8,8 @@
   "privacy": {
     "min_value_count": 10,
     "extremes": "exact",
-    "enumerations": "exact"
+    "enumerations": "exact",
+    "allow_expression_constraints": true
   },
   "source": {
     "name": "crm",

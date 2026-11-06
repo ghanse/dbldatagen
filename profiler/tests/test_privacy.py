@@ -38,6 +38,7 @@ def enumeration(min_value_count: int) -> dict[str, Any]:
 def test_default_policy_is_conservative(minimal_profile: dict[str, Any]) -> None:
     privacy = load_profile(minimal_profile).privacy
     assert (privacy.min_value_count, privacy.extremes.value, privacy.enumerations.value) == (10, "exact", "exact")
+    assert privacy.allow_expression_constraints is False
 
 
 def test_top_values_meeting_k_are_accepted(minimal_profile: dict[str, Any]) -> None:
@@ -100,3 +101,63 @@ def test_suppressed_extremes_forbid_min_max(minimal_profile: dict[str, Any]) -> 
 def test_strict_privacy_profile_may_omit_all_literals(minimal_profile: dict[str, Any]) -> None:
     privacy = {"min_value_count": 50, "extremes": "suppressed", "enumerations": "suppressed"}
     load_profile(profile_with(minimal_profile, privacy, string={"length": {"mean": 4.0}}), strict=True)
+
+
+def numeric_column(**numeric: object) -> dict[str, Any]:
+    """Returns a float64 column with the given numeric stats."""
+    column = {"name": "x", "logical_type": "float64", "source_type": "double", "nullable": False}
+    return {**column, "null_fraction": 0.0, "numeric": numeric}
+
+
+@pytest.mark.parametrize(
+    ("numeric", "ok"),
+    [
+        ({"quantiles": [{"q": 0.01, "value": 1.0}, {"q": 0.99, "value": 9.0}]}, True),
+        ({"quantiles": [{"q": 0.0, "value": 0.0}]}, False),
+        ({"quantiles": [{"q": 1.0, "value": 10.0}]}, False),
+        ({"histogram": {"edges": [0, 5, 10], "counts": [1, 1], "generalized_outer_edges": True}}, True),
+        ({"histogram": {"edges": [0.3, 5, 9.7], "counts": [1, 1]}}, False),
+    ],
+)
+def test_suppressed_extremes_cover_quantiles_and_histogram_edges(
+    minimal_profile: dict[str, Any], numeric: dict[str, Any], ok: bool
+) -> None:
+    minimal_profile["privacy"] = {"extremes": "suppressed"}
+    minimal_profile["tables"][0]["columns"].append(numeric_column(**numeric))
+    if ok:
+        load_profile(minimal_profile)
+    else:
+        with pytest.raises(ValidationError, match="suppressed"):
+            load_profile(minimal_profile)
+
+
+def test_extreme_quantiles_and_exact_edges_are_allowed_by_default(minimal_profile: dict[str, Any]) -> None:
+    histogram = {"edges": [0.3, 9.7], "counts": [2]}
+    quantiles = [{"q": 0.0, "value": 0.3}, {"q": 1.0, "value": 9.7}]
+    minimal_profile["tables"][0]["columns"].append(numeric_column(quantiles=quantiles, histogram=histogram))
+    load_profile(minimal_profile)
+
+
+@pytest.mark.parametrize(("coverage", "ok"), [(0.02, True), (0.018, False)])
+def test_patterns_must_cover_k_rows(minimal_profile: dict[str, Any], coverage: float, ok: bool) -> None:
+    patterns = {"patterns": [{"regex": "[a-z]+", "coverage": 0.9}, {"regex": "ACME-[0-9]{4}", "coverage": coverage}]}
+    profile = profile_with(minimal_profile, string=patterns)
+    if ok:
+        load_profile(profile)
+    else:
+        with pytest.raises(ValidationError, match="ACME"):
+            load_profile(profile)
+
+
+@pytest.mark.parametrize(("privacy", "ok"), [(None, False), ({"allow_expression_constraints": True}, True)])
+def test_expression_constraints_need_explicit_permission(
+    minimal_profile: dict[str, Any], privacy: dict[str, Any] | None, ok: bool
+) -> None:
+    profile = profile_with(minimal_profile, privacy)
+    expression = {"kind": "expression", "expression": "s <> 'secret'", "satisfied_fraction": 1.0}
+    profile["tables"][0]["check_constraints"] = [expression]
+    if ok:
+        load_profile(profile)
+    else:
+        with pytest.raises(ValidationError, match="expression"):
+            load_profile(profile)

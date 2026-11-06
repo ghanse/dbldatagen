@@ -458,7 +458,7 @@
       "type": "object"
     },
     "Histogram": {
-      "description": "Histogram over the non-null values of a numeric column.\n\nBin `i` holds values in `[edges[i], edges[i + 1])`; the last bin also holds\n`edges[-1]`. The edges span every profiled value, so no value falls outside\nthe bins and the counts add up to the number of non-null values profiled.\n\nAttributes:\n    edges: Non-decreasing bin edges, encoded by the column's logical type; one more than the number of bins.\n    counts: Number of values in each bin.\n    sampled: Whether the counts come from a sample rather than every row (default false).",
+      "description": "Histogram over the non-null values of a numeric column.\n\nBin `i` holds values in `[edges[i], edges[i + 1])`; the last bin also holds\n`edges[-1]`. The edges span every profiled value, so no value falls outside\nthe bins and the counts add up to the number of non-null values profiled.\n\nAttributes:\n    edges: Non-decreasing bin edges, encoded by the column's logical type; one more than the number of bins.\n    counts: Number of values in each bin.\n    sampled: Whether the counts come from a sample rather than every row (default false).\n    generalized_outer_edges: Whether the first and last edges were rounded or widened rather than being the exact\n        data extremes (default false). Must be true when `privacy.extremes` is \"suppressed\".",
       "properties": {
         "edges": {
           "items": {
@@ -492,6 +492,11 @@
         "sampled": {
           "default": false,
           "title": "Sampled",
+          "type": "boolean"
+        },
+        "generalized_outer_edges": {
+          "default": false,
+          "title": "Generalized Outer Edges",
           "type": "boolean"
         }
       },
@@ -733,7 +738,7 @@
       "type": "object"
     },
     "Pattern": {
-      "description": "Regular expression that matches part of a string column.\n\nAttributes:\n    regex: Regular expression that a matching value satisfies in full.\n    coverage: Fraction of non-null values that match the expression.",
+      "description": "Regular expression that matches part of a string column.\n\nAttributes:\n    regex: Regular expression that a matching value satisfies in full.\n    coverage: Fraction of non-null values that match the expression; must cover at least\n        `privacy.min_value_count` rows.",
       "properties": {
         "regex": {
           "title": "Regex",
@@ -754,7 +759,7 @@
       "type": "object"
     },
     "PrivacyPolicy": {
-      "description": "Privacy policy that the producer applied when writing the profile.\n\nAttributes:\n    min_value_count: Fewest rows a literal value must occur in before it may appear in `top_values` or an\n        enumeration constraint (default 10).\n    extremes: Treatment of numeric and temporal `min` and `max` statistics and range constraint bounds\n        (default \"exact\"). When \"suppressed\", none of them may appear.\n    enumerations: Treatment of `top_values` and enumeration constraints (default \"exact\"). When \"suppressed\",\n        none of them may appear.",
+      "description": "Privacy policy that the producer applied when writing the profile.\n\nAttributes:\n    min_value_count: Fewest rows a literal value must occur in before it may appear in `top_values` or an\n        enumeration constraint, and fewest rows a string pattern must match (default 10). Literals embedded in\n        regexes are checked by the benchmark's privacy guard, not by this model.\n    extremes: Treatment of data extremes (default \"exact\"). When \"suppressed\", numeric and temporal `min` and\n        `max`, quantiles at q=0 and q=1, and range constraint bounds may not appear, and histograms must set\n        `generalized_outer_edges`.\n    enumerations: Treatment of `top_values` and enumeration constraints (default \"exact\"). When \"suppressed\",\n        none of them may appear.\n    allow_expression_constraints: Whether SQL expression constraints, which may embed literal values, may\n        appear (default false).",
       "properties": {
         "min_value_count": {
           "default": 10,
@@ -769,6 +774,11 @@
         "enumerations": {
           "$ref": "#/$defs/ValueTreatment",
           "default": "exact"
+        },
+        "allow_expression_constraints": {
+          "default": false,
+          "title": "Allow Expression Constraints",
+          "type": "boolean"
         }
       },
       "title": "PrivacyPolicy",

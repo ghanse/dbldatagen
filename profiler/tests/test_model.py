@@ -27,7 +27,12 @@ def test_minimal_profile_omits_unset_blocks(minimal_profile: dict[str, Any]) -> 
     profile = load_profile(minimal_profile)
     dumped = json.loads(dump_profile(profile))
     assert set(dumped) == {"spec_version", "created_at", "engine", "privacy", "tables"}
-    assert dumped["privacy"] == {"min_value_count": 10, "extremes": "exact", "enumerations": "exact"}
+    assert dumped["privacy"] == {
+        "min_value_count": 10,
+        "extremes": "exact",
+        "enumerations": "exact",
+        "allow_expression_constraints": False,
+    }
     assert dumped["tables"][0]["columns"][0] == minimal_profile["tables"][0]["columns"][0]
 
 
@@ -133,8 +138,9 @@ def test_created_at_requires_utc_offset(minimal_profile: dict[str, Any]) -> None
     ("logical_type", "valid", "invalid"),
     [
         ("int64", ["9223372036854775807", "-1", "0"], [9223372036854775807, 1, "1.0", "01", "1e3"]),
-        ("uint64", ["18446744073709551615"], [1]),
-        ("decimal", ["12345678901234567890.12", "-0.5", "3"], [0.5, 3, "1.", ".5", "NaN"]),
+        ("uint64", ["18446744073709551615", "0"], [1, "-1", "-0"]),
+        ("uint32", [0, 4294967295], [-1, "1"]),
+        ("decimal", ["123456789012345678901234567890123456.12", "-0.5", "3", "0.25"], [0.5, 3, "1.", ".5", "NaN"]),
         ("int32", [1, -7], ["1", 1.5, True]),
         ("float64", [1, 1.5], ["1.5", False]),
     ],
@@ -165,9 +171,23 @@ def test_decimal_histogram_edges_are_lossless() -> None:
 @pytest.mark.parametrize(
     ("logical_type", "valid", "invalid"),
     [
-        ("date", ["2026-11-06"], ["2026-11-06T00:00:00", "11/06/2026", 20261106]),
-        ("time", ["08:30:00", "08:30:00.123456789"], ["8:30", "08:30:00Z"]),
-        ("timestamp", ["2026-11-06T08:30:00Z", "2026-11-06T08:30:00.5-07:00"], ["2026-11-06T08:30:00", "2026-11-06"]),
+        (
+            "date",
+            ["2026-11-06", "2024-02-29"],
+            ["2026-11-06T00:00:00", "11/06/2026", 20261106, "2026-13-45", "2025-02-29"],
+        ),
+        ("time", ["08:30:00", "08:30:00.123456789"], ["8:30", "08:30:00Z", "24:00:00", "12:61:00"]),
+        (
+            "timestamp",
+            ["2026-11-06T08:30:00Z", "2026-11-06T08:30:00.5-07:00", "2026-11-06T08:30:00+18:00"],
+            [
+                "2026-11-06T08:30:00",
+                "2026-11-06",
+                "2026-11-06T08:30:00+18:01",
+                "2026-11-06T08:30:00+19:00",
+                "2026-02-30T00:00:00Z",
+            ],
+        ),
         ("timestamp_ntz", ["2026-11-06T08:30:00.000001"], ["2026-11-06T08:30:00Z", "2026-11-06T08:30:00+00:00"]),
     ],
 )
@@ -202,6 +222,7 @@ def test_constraint_literals_follow_column_type(
 def test_expression_dialect_defaults_to_spark(minimal_profile: dict[str, Any]) -> None:
     constraint = {"kind": "expression", "expression": "id > 0", "satisfied_fraction": 1.0}
     minimal_profile["tables"][0]["check_constraints"] = [constraint]
+    minimal_profile["privacy"] = {"allow_expression_constraints": True}
     table = load_profile(minimal_profile).tables[0]
     assert table.check_constraints is not None
     assert table.check_constraints[0].model_dump()["dialect"] == "spark"
@@ -212,3 +233,23 @@ def test_fan_out_quantiles_are_integer_counts(minimal_profile: dict[str, Any]) -
     minimal_profile["relationships"] = [relationship(fan_out=fan_out)]
     with pytest.raises(ValidationError):
         load_profile(minimal_profile)
+
+
+@pytest.mark.parametrize(
+    ("precision", "scale", "valid", "invalid"),
+    [
+        (5, 2, ["999.99", "-999.99", "0.5", "0", "12"], ["1000.00", "1.234", "-1000"]),
+        (2, 2, ["0.99", "0", "-0.01"], ["1.00", "0.001"]),
+        (3, 0, ["999", "-1"], ["1000", "1.5"]),
+    ],
+)
+def test_decimal_literals_fit_precision_and_scale(
+    precision: int, scale: int, valid: list[str], invalid: list[str]
+) -> None:
+    extra = {"logical_type": "decimal", "source_type": f"decimal({precision},{scale})", "precision": precision}
+    extra["scale"] = scale
+    for value in valid:
+        ColumnProfile.model_validate(column(**extra, numeric={"min": value}))
+    for value in invalid:
+        with pytest.raises(ValidationError):
+            ColumnProfile.model_validate(column(**extra, numeric={"min": value}))
