@@ -44,6 +44,7 @@ VERDICTS = {
     "review": {"approved", "changes_requested", "rejected"},
 }
 JSON_FIELDS = {"targets", "invariants", "summary_metrics", "blocking_issues"}
+APPEND_FIELDS = {"kind", "actor", "work_item", "summary"} | set().union(*KIND_FIELDS.values())
 
 
 class LogError(ValueError):
@@ -265,7 +266,7 @@ def _load_values(args: argparse.Namespace) -> dict[str, Any]:
             raise LogError("append input must be a JSON object")
     else:
         values = {}
-    for field in KIND_FIELDS.keys() | {"actor", "work_item", "summary"} | set().union(*KIND_FIELDS.values()):
+    for field in APPEND_FIELDS:
         value = getattr(args, field, None)
         if value is not None:
             if field in JSON_FIELDS:
@@ -290,9 +291,9 @@ def _parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="reads fields from a JSON file, or - for stdin",
     )
-    fields = {"kind", "actor", "work_item", "summary"} | set().union(*KIND_FIELDS.values())
-    for field in sorted(fields):
-        append_parser.add_argument(f"--{field.replace('_', '-')}", dest=field)
+    for field in sorted(APPEND_FIELDS):
+        help_text = "JSON-encoded array or object" if field in JSON_FIELDS else None
+        append_parser.add_argument(f"--{field.replace('_', '-')}", dest=field, help=help_text)
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--log", type=Path, default=argparse.SUPPRESS)
     render_parser = subparsers.add_parser("render")
