@@ -338,7 +338,7 @@ class StringStats(_SpecModel):
     Attributes:
         length: Optional distribution of value lengths.
         patterns: Optional regular expressions with the fraction of values each one matches.
-        top_values: Optional most frequent values. Allowed on top-level columns only; each value must occur in at
+        top_values: Optional most frequent values; each value must occur in at
             least `privacy.min_value_count` rows.
     """
 
@@ -399,6 +399,9 @@ class ColumnProfile(_SpecModel):
         temporal: Optional statistics for `date`, `time`, `timestamp`, and `timestamp_ntz`.
         boolean: Optional statistics for `boolean`.
         collection_length: Optional distribution of entry counts for non-null `array` and `map` values.
+        value_count: Optional number of values, including nulls, that a nested column's statistics cover. Only valid
+            on nested columns; required on `array` and `map` children, and on their descendants, that carry
+            `patterns` or `top_values`. Struct fields without it inherit their parent's count.
     """
 
     name: str = Field(min_length=1)
@@ -416,6 +419,7 @@ class ColumnProfile(_SpecModel):
     temporal: TemporalStats | None = None
     boolean: BooleanStats | None = None
     collection_length: LengthStats | None = None
+    value_count: Count | None = None
 
     @model_validator(mode="after")
     def _check_type_consistency(self) -> ColumnProfile:
@@ -490,12 +494,21 @@ def _check_children(column: ColumnProfile) -> None:
         raise ValueError(f"column {column.name!r}: children are only valid for struct, array, and map")
 
 
-def nested_columns(columns: list[ColumnProfile]) -> Iterator[ColumnProfile]:
-    """Yields every column nested below `columns`, at any depth, excluding `columns` themselves."""
-    for column in columns:
-        for child in column.children or []:
-            yield child
-            yield from nested_columns([child])
+def counted_columns(column: ColumnProfile, value_count: int | None) -> Iterator[tuple[ColumnProfile, int | None]]:
+    """Yields a column and every column nested below it, each with the number of values its statistics cover.
+
+    Args:
+        column: Column to start from.
+        value_count: Number of values `column` covers: the table row count for a top-level column.
+
+    Yields:
+        `(column, value_count)` pairs. A child's own `value_count` wins; otherwise struct fields inherit their
+        parent's count and array or map children get None.
+    """
+    yield column, value_count
+    inherited = value_count if column.logical_type == LogicalType.STRUCT else None
+    for child in column.children or []:
+        yield from counted_columns(child, inherited if child.value_count is None else child.value_count)
 
 
 class KeyCandidate(_SpecModel):
@@ -875,10 +888,11 @@ def _check_table_privacy(table: TableProfile, policy: PrivacyPolicy) -> None:
     k = policy.min_value_count
     suppress_extremes = policy.extremes == ValueTreatment.SUPPRESSED
     suppress_enumerations = policy.enumerations == ValueTreatment.SUPPRESSED
-    if any(column.string and column.string.top_values for column in nested_columns(table.columns)):
-        raise ValueError(f"table {table.name!r}: top_values are only allowed on top-level columns")
-    for column in [*table.columns, *nested_columns(table.columns)]:
-        _check_column_privacy(column, table.row_count * (1.0 - column.null_fraction), policy)
+    if any(column.value_count is not None for column in table.columns):
+        raise ValueError(f"table {table.name!r}: value_count is only valid on nested columns")
+    for top_level in table.columns:
+        for column, value_count in counted_columns(top_level, table.row_count):
+            _check_column_privacy(column, value_count, policy)
     for constraint in table.check_constraints or []:
         if isinstance(constraint, RangeConstraint) and suppress_extremes:
             raise ValueError(f"table {table.name!r}: range constraint present but privacy.extremes is suppressed")
@@ -893,17 +907,17 @@ def _check_table_privacy(table: TableProfile, policy: PrivacyPolicy) -> None:
                 )
 
 
-def _check_column_privacy(column: ColumnProfile, non_null_rows: float, policy: PrivacyPolicy) -> None:
+def _check_column_privacy(column: ColumnProfile, value_count: int | None, policy: PrivacyPolicy) -> None:
     """Checks that a column's statistics follow the privacy policy.
 
     Args:
         column: Column to check.
-        non_null_rows: Estimated number of non-null values, used to turn fractions into row counts.
+        value_count: Number of values the column's statistics cover, or None when it is unknown.
         policy: Privacy policy the producer declared.
 
     Raises:
-        ValueError: If a value or pattern covers fewer than `policy.min_value_count` rows, or a suppressed value
-            class is present.
+        ValueError: If a value or pattern covers fewer than `policy.min_value_count` values, literal-bearing
+            statistics have no known value count, or a suppressed value class is present.
     """
     k = policy.min_value_count
     stats = column.numeric or column.temporal
@@ -920,6 +934,11 @@ def _check_column_privacy(column: ColumnProfile, non_null_rows: float, policy: P
     string = column.string or StringStats()
     if string.top_values and policy.enumerations == ValueTreatment.SUPPRESSED:
         raise ValueError(f"column {column.name!r}: top_values present but privacy.enumerations is suppressed")
+    if value_count is None:
+        if string.top_values or string.patterns:
+            raise ValueError(f"column {column.name!r}: nested patterns or top_values require value_count")
+        return
+    non_null_rows = value_count * (1.0 - column.null_fraction)
     rare = [entry.value for entry in string.top_values or [] if round(entry.frequency * non_null_rows) < k]
     rare += [pattern.regex for pattern in string.patterns or [] if round(pattern.coverage * non_null_rows) < k]
     if rare:

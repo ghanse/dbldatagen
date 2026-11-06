@@ -178,7 +178,8 @@
               "source_type": "string",
               "nullable": false,
               "null_fraction": 0.0,
-              "cardinality": "low"
+              "cardinality": "low",
+              "value_count": 16200
             }
           ],
           "collection_length": {

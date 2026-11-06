@@ -1,3 +1,4 @@
+import copy
 from typing import Any
 
 import pytest
@@ -69,12 +70,91 @@ def test_enumeration_below_k_is_rejected(minimal_profile: dict[str, Any]) -> Non
     load_profile(profile)
 
 
-def test_nested_top_values_are_rejected(minimal_profile: dict[str, Any]) -> None:
+def array_profile(
+    minimal_profile: dict[str, Any], string: dict[str, Any], value_count: int | None, row_count: int = 1000
+) -> dict[str, Any]:
+    """Returns `minimal_profile` with an array<string> column whose elements carry `string` stats."""
     element = {"name": "element", "logical_type": "string", "source_type": "string", "nullable": False}
-    element |= {"null_fraction": 0.0, "string": top_values(0.5)}
+    element |= {"null_fraction": 0.0, "string": string}
+    if value_count is not None:
+        element["value_count"] = value_count
     profile = profile_with(minimal_profile, logical_type="array", source_type="array<string>", children=[element])
-    with pytest.raises(ValidationError, match="top-level"):
+    profile["tables"][0]["row_count"] = row_count
+    return profile
+
+
+@pytest.mark.parametrize(
+    ("value_count", "frequency", "ok"),
+    [
+        (5000, 0.002, True),
+        (100, 0.05, False),
+        (100, 0.1, True),
+        (None, 0.5, False),
+    ],
+    ids=["more-elements-than-rows", "fewer-elements-than-rows-rare", "fewer-elements-than-rows-ok", "missing"],
+)
+def test_nested_top_values_use_value_count(
+    minimal_profile: dict[str, Any], value_count: int | None, frequency: float, ok: bool
+) -> None:
+    profile = array_profile(minimal_profile, top_values(frequency), value_count)
+    if ok:
         load_profile(profile)
+    else:
+        with pytest.raises(ValidationError, match=r"value_count|fewer than 10"):
+            load_profile(profile)
+
+
+@pytest.mark.parametrize(
+    ("value_count", "coverage", "ok"),
+    [(20000, 0.001, True), (20, 0.4, False), (20, 0.5, True), (None, 1.0, False)],
+    ids=["more-elements-than-rows", "fewer-elements-than-rows-rare", "fewer-elements-than-rows-ok", "missing"],
+)
+def test_nested_patterns_use_value_count(
+    minimal_profile: dict[str, Any], value_count: int | None, coverage: float, ok: bool
+) -> None:
+    patterns = {"patterns": [{"regex": "[a-z]+", "coverage": coverage}]}
+    profile = array_profile(minimal_profile, patterns, value_count)
+    if ok:
+        load_profile(profile)
+    else:
+        with pytest.raises(ValidationError, match=r"value_count|fewer than 10"):
+            load_profile(profile)
+
+
+def test_nested_value_count_wins_over_table_rows(minimal_profile: dict[str, Any]) -> None:
+    profile = array_profile(minimal_profile, top_values(0.01), value_count=500, row_count=1_000_000)
+    with pytest.raises(ValidationError, match="fewer than 10"):
+        load_profile(profile)
+
+
+def test_struct_fields_inherit_value_count(minimal_profile: dict[str, Any]) -> None:
+    field: dict[str, Any] = {"name": "zip", "logical_type": "string", "source_type": "string", "nullable": True}
+    field |= {"null_fraction": 0.0, "string": {"patterns": [{"regex": "[0-9]{5}", "coverage": 0.02}]}}
+    struct: dict[str, Any] = {"logical_type": "struct", "source_type": "struct<zip:string>", "children": [field]}
+    load_profile(profile_with(copy.deepcopy(minimal_profile), **struct))
+    field["string"]["patterns"][0]["coverage"] = 0.005
+    with pytest.raises(ValidationError, match="fewer than 10"):
+        load_profile(profile_with(minimal_profile, **struct))
+
+
+def test_struct_inside_array_needs_element_value_count(minimal_profile: dict[str, Any]) -> None:
+    field = {"name": "f", "logical_type": "string", "source_type": "string", "nullable": True, "null_fraction": 0.0}
+    field["string"] = {"patterns": [{"regex": "x", "coverage": 1.0}]}
+    element = {"name": "element", "logical_type": "struct", "source_type": "struct<f:string>", "nullable": True}
+    element |= {"null_fraction": 0.0, "children": [field]}
+    profile = profile_with(
+        minimal_profile, logical_type="array", source_type="array<struct<f:string>>", children=[element]
+    )
+    with pytest.raises(ValidationError, match="value_count"):
+        load_profile(profile)
+    element["value_count"] = 50
+    load_profile(profile)
+
+
+def test_value_count_is_rejected_on_top_level_columns(minimal_profile: dict[str, Any]) -> None:
+    minimal_profile["tables"][0]["columns"][0]["value_count"] = 2
+    with pytest.raises(ValidationError, match="nested"):
+        load_profile(minimal_profile)
 
 
 def test_suppressed_enumerations_forbid_top_values(minimal_profile: dict[str, Any]) -> None:

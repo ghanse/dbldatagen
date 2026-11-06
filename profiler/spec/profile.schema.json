@@ -31,7 +31,7 @@
       "type": "string"
     },
     "ColumnProfile": {
-      "description": "Profile of a single column, or of a field nested inside a complex column.\n\nNested types use `children`: a struct lists its fields, an array has one child\nnamed \"element\", and a map has two children named \"key\" and \"value\". Child\nstatistics are computed over all nested values, not over rows.\n\nAttributes:\n    name: Column or field name.\n    logical_type: Engine-neutral logical type.\n    source_type: Type name as reported by the source system, e.g. \"decimal(10,2)\".\n    nullable: Whether the schema allows nulls.\n    null_fraction: Fraction of values that are null.\n    precision: Total digits; required for `decimal` and absent otherwise.\n    scale: Digits after the decimal point; required for `decimal` and absent otherwise.\n    children: Nested field profiles; required for `struct`, `array`, and `map`, absent otherwise.\n    distinct_count: Optional number of distinct non-null values.\n    cardinality: Optional cardinality bucket.\n    numeric: Optional statistics for numeric types.\n    string: Optional statistics for `string`.\n    temporal: Optional statistics for `date`, `time`, `timestamp`, and `timestamp_ntz`.\n    boolean: Optional statistics for `boolean`.\n    collection_length: Optional distribution of entry counts for non-null `array` and `map` values.",
+      "description": "Profile of a single column, or of a field nested inside a complex column.\n\nNested types use `children`: a struct lists its fields, an array has one child\nnamed \"element\", and a map has two children named \"key\" and \"value\". Child\nstatistics are computed over all nested values, not over rows.\n\nAttributes:\n    name: Column or field name.\n    logical_type: Engine-neutral logical type.\n    source_type: Type name as reported by the source system, e.g. \"decimal(10,2)\".\n    nullable: Whether the schema allows nulls.\n    null_fraction: Fraction of values that are null.\n    precision: Total digits; required for `decimal` and absent otherwise.\n    scale: Digits after the decimal point; required for `decimal` and absent otherwise.\n    children: Nested field profiles; required for `struct`, `array`, and `map`, absent otherwise.\n    distinct_count: Optional number of distinct non-null values.\n    cardinality: Optional cardinality bucket.\n    numeric: Optional statistics for numeric types.\n    string: Optional statistics for `string`.\n    temporal: Optional statistics for `date`, `time`, `timestamp`, and `timestamp_ntz`.\n    boolean: Optional statistics for `boolean`.\n    collection_length: Optional distribution of entry counts for non-null `array` and `map` values.\n    value_count: Optional number of values, including nulls, that a nested column's statistics cover. Only valid\n        on nested columns; required on `array` and `map` children, and on their descendants, that carry\n        `patterns` or `top_values`. Struct fields without it inherit their parent's count.",
       "properties": {
         "name": {
           "minLength": 1,
@@ -172,6 +172,19 @@
             }
           ],
           "default": null
+        },
+        "value_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value Count"
         }
       },
       "required": [
@@ -1057,7 +1070,7 @@
       "type": "object"
     },
     "StringStats": {
-      "description": "Statistics for a string column.\n\nAttributes:\n    length: Optional distribution of value lengths.\n    patterns: Optional regular expressions with the fraction of values each one matches.\n    top_values: Optional most frequent values. Allowed on top-level columns only; each value must occur in at\n        least `privacy.min_value_count` rows.",
+      "description": "Statistics for a string column.\n\nAttributes:\n    length: Optional distribution of value lengths.\n    patterns: Optional regular expressions with the fraction of values each one matches.\n    top_values: Optional most frequent values; each value must occur in at\n        least `privacy.min_value_count` rows.",
       "properties": {
         "length": {
           "anyOf": [

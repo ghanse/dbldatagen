@@ -94,8 +94,11 @@ The `privacy` block records the policy the producer applied:
 
 - `min_value_count` (default 10): a value may appear in `top_values` or an enumeration constraint only if at least this
   many rows hold it. The model checks `top_values` frequencies against the table's row count and null fraction, and
-  each enumeration's `min_value_count` (the row count of its rarest value). `top_values` are allowed on top-level
-  columns only.
+  each enumeration's `min_value_count` (the row count of its rarest value). String `patterns` must also cover at least
+  this many values. For nested columns, counts come from the column's `value_count` (the number of nested values its
+  statistics cover); struct fields inherit their parent's count. A nested array or map child that has `patterns` or
+  `top_values` but no `value_count` is rejected. Literals embedded in regexes are checked by the benchmark's privacy
+  guard, not by the model.
 - `extremes` and `enumerations`: `exact`, `generalized`, or `suppressed`. When suppressed, min/max statistics and
   range bounds (for `extremes`), or `top_values` and enumeration constraints (for `enumerations`), must be absent.
 
