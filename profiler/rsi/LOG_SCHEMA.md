@@ -1,6 +1,8 @@
 # RSI log schema
 
 `log.jsonl` is the append-only source of truth. Each line is one JSON object. `LOG.md` is a generated view.
+The hash chain detects changes behind the tip but does not protect the tip by itself; git history seals the committed tip.
+Polly is the single designated appender.
 
 Every entry has these fields:
 
@@ -27,7 +29,7 @@ fields are allowed. Generated fields (`seq`, `ts`, and `prev_hash`) cannot be su
 | `implementation` | `proposal_id`, `branch`, `pr_url`, `commit`, `worktree` |
 | `benchmark` | `proposal_id`, `experiment_id`, `baseline_commit`, `candidate_commit`, `harness_hash`, `policy`, `results_path`, `summary_metrics` |
 | `disposition` | `proposal_id`, `verdict` (`accepted`, `rejected`, or `inconclusive`), `reason`, `evidence_path`, `retained_patch` |
-| `review` | `proposal_id`, `reviewer`, `verdict`, `blocking_issues` |
+| `review` | `proposal_id`, `reviewer`, `verdict` (`approved`, `changes_requested`, or `rejected`), `blocking_issues` |
 | `benchmark_change` | `justification` |
 
 `targets` is an array or object naming datasets and metrics. `invariants` and `blocking_issues` are arrays.
@@ -37,7 +39,7 @@ fields are allowed. Generated fields (`seq`, `ts`, and `prev_hash`) cannot be su
 
 - A proposal ID is introduced once by `proposal`.
 - `triage` requires a prior proposal.
-- `implementation` requires a prior accepted triage.
+- `implementation` requires the latest prior triage to be accepted.
 - `benchmark` requires a prior implementation.
 - `review` requires a prior implementation.
 - `disposition` requires a prior benchmark.

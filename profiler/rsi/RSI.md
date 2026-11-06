@@ -2,6 +2,8 @@
 
 The profiler optimizes reconstruction accuracy first and profiling speed second. No candidate may weaken the privacy guard:
 profiles must not expose raw rows or rare identifying values.
+Polly is the single designated appender. The hash chain exposes changes behind the tip, while git history seals the
+committed tip.
 
 ## Roles
 

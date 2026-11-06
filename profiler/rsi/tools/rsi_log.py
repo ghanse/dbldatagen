@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
+import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -39,6 +41,7 @@ KIND_FIELDS = {
 VERDICTS = {
     "triage": {"accepted", "deferred", "rejected"},
     "disposition": {"accepted", "rejected", "inconclusive"},
+    "review": {"approved", "changes_requested", "rejected"},
 }
 JSON_FIELDS = {"targets", "invariants", "summary_metrics", "blocking_issues"}
 
@@ -52,13 +55,11 @@ def canonical_line(entry: dict[str, Any]) -> str:
     return json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def read_log(path: Path) -> tuple[list[dict[str, Any]], list[bytes]]:
-    """Reads entries and their exact serialized lines from a log."""
-    if not path.exists():
-        return [], []
+def _parse_log(content: bytes) -> tuple[list[dict[str, Any]], list[bytes]]:
+    """Parses entries and their exact serialized lines from log bytes."""
     entries: list[dict[str, Any]] = []
     lines: list[bytes] = []
-    for line_number, raw_line in enumerate(path.read_bytes().splitlines(), 1):
+    for line_number, raw_line in enumerate(content.splitlines(), 1):
         if not raw_line.strip():
             raise LogError(f"line {line_number}: blank lines are not allowed")
         try:
@@ -70,6 +71,11 @@ def read_log(path: Path) -> tuple[list[dict[str, Any]], list[bytes]]:
         entries.append(entry)
         lines.append(raw_line)
     return entries, lines
+
+
+def read_log(path: Path) -> tuple[list[dict[str, Any]], list[bytes]]:
+    """Reads entries and their exact serialized lines from a log."""
+    return _parse_log(path.read_bytes()) if path.exists() else ([], [])
 
 
 def _nonempty_string(entry: dict[str, Any], field: str, line_number: int) -> None:
@@ -119,7 +125,7 @@ def _validate_entry(entry: dict[str, Any], line_number: int) -> None:
 def validate(entries: list[dict[str, Any]], lines: list[bytes]) -> None:
     """Validates entry schemas, ordering, hashes, and references."""
     proposals: set[str] = set()
-    accepted: set[str] = set()
+    triage_verdicts: dict[str, str] = {}
     implementations: set[str] = set()
     benchmarks: set[str] = set()
     for index, entry in enumerate(entries):
@@ -144,10 +150,9 @@ def validate(entries: list[dict[str, Any]], lines: list[bytes]) -> None:
         elif kind == "triage":
             if proposal_id not in proposals:
                 raise LogError(f"line {line_number}: triage requires a prior proposal")
-            if entry["verdict"] == "accepted":
-                accepted.add(proposal_id)
+            triage_verdicts[proposal_id] = entry["verdict"]
         elif kind == "implementation":
-            if proposal_id not in accepted:
+            if triage_verdicts.get(proposal_id) != "accepted":
                 raise LogError(f"line {line_number}: implementation requires a prior accepted triage")
             implementations.add(proposal_id)
         elif kind == "benchmark":
@@ -156,8 +161,11 @@ def validate(entries: list[dict[str, Any]], lines: list[bytes]) -> None:
             benchmarks.add(proposal_id)
         elif kind == "disposition" and proposal_id not in benchmarks:
             raise LogError(f"line {line_number}: disposition requires a prior benchmark")
-        elif kind == "review" and proposal_id not in implementations:
-            raise LogError(f"line {line_number}: review requires a prior implementation")
+        elif kind == "review":
+            if proposal_id not in proposals:
+                raise LogError(f"line {line_number}: review requires a prior proposal")
+            if proposal_id not in implementations:
+                raise LogError(f"line {line_number}: review requires a prior implementation")
 
 
 def verify(path: Path) -> list[dict[str, Any]]:
@@ -169,20 +177,24 @@ def verify(path: Path) -> list[dict[str, Any]]:
 
 def append_entry(path: Path, values: dict[str, Any]) -> dict[str, Any]:
     """Validates and appends one entry to a log."""
-    entries, lines = read_log(path)
-    validate(entries, lines)
     forbidden = {"seq", "ts", "prev_hash"} & values.keys()
     if forbidden:
         raise LogError(f"generated fields cannot be supplied: {', '.join(sorted(forbidden))}")
-    entry = dict(values)
-    entry["seq"] = len(entries) + 1
-    entry["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-    entry["prev_hash"] = hashlib.sha256(lines[-1]).hexdigest() if lines else None
-    new_line = canonical_line(entry).encode()
-    validate([*entries, entry], [*lines, new_line])
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("ab") as handle:
+    with path.open("a+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.seek(0)
+        entries, lines = _parse_log(handle.read())
+        validate(entries, lines)
+        entry = dict(values)
+        entry["seq"] = len(entries) + 1
+        entry["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        entry["prev_hash"] = hashlib.sha256(lines[-1]).hexdigest() if lines else None
+        new_line = canonical_line(entry).encode()
+        validate([*entries, entry], [*lines, new_line])
+        handle.seek(0, os.SEEK_END)
         handle.write(new_line + b"\n")
+        handle.flush()
     return entry
 
 
