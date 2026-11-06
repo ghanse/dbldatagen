@@ -2,6 +2,7 @@ from typing import Any
 
 import pytest
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
 from dbldatagen_profiler.engines.spark import profile_tables
 from dbldatagen_profiler.model import Profile
@@ -151,3 +152,129 @@ def test_structure_score_round_trips(retail: tuple[Profile, Manifest]) -> None:
     score = score_structure(profile, truth)
     assert StructureScore.model_validate_json(score.model_dump_json()) == score
     assert score_structure(profile, truth).model_dump_json() == score.model_dump_json()
+
+
+def _precision(score: StructureScore, table: str, name: str) -> float:
+    precision = _category(score, table, name).precision
+    return 1.0 if precision is None else precision
+
+
+def _add(profile: Profile, table: str, key: str, entries: list[dict[str, Any]]) -> Profile:
+    data = profile.model_dump(mode="json")
+    if table == "":
+        data[key] = [*(data.get(key) or []), *entries]
+    else:
+        target = next(t for t in data["tables"] if t["name"] == table)
+        target[key] = [*(target.get(key) or []), *entries]
+    return Profile.model_validate(data)
+
+
+def test_false_unplanted_claims_lower_precision_and_true_ones_do_not(
+    spark: SparkSession, retail: tuple[Profile, Manifest]
+) -> None:
+    profile, truth = retail
+    real = load("retail", "xs", 0, spark)
+    oracle = _oracle(profile, truth)
+    regions = sorted(r["region"] for r in real["customers"].select("region").distinct().collect())
+    low, high = real["order_items"].agg(F.min("unit_price"), F.max("unit_price")).collect()[0]
+    child = real["products"].select("product_id")
+    coverage = child.join(real["customers"].select(F.col("customer_id").alias("product_id")), "product_id", "left_semi")
+    true_coverage = coverage.count() / child.count()
+
+    honest = _add(
+        oracle,
+        "customers",
+        "check_constraints",
+        [
+            {
+                "kind": "enumeration",
+                "column": "region",
+                "values": regions,
+                "min_value_count": 10,
+                "satisfied_fraction": 1.0,
+            },
+        ],
+    )
+    honest = _add(
+        honest,
+        "order_items",
+        "check_constraints",
+        [
+            {"kind": "range", "column": "unit_price", "min": str(low), "max": str(high), "satisfied_fraction": 1.0},
+        ],
+    )
+    honest = _add(honest, "customers", "unique_keys", [{"columns": ["email", "segment"], "confidence": 1.0}])
+    honest = _add(
+        honest,
+        "",
+        "relationships",
+        [
+            {
+                "child_table": "products",
+                "child_columns": ["product_id"],
+                "parent_table": "customers",
+                "parent_columns": ["customer_id"],
+                "coverage": true_coverage,
+            }
+        ],
+    )
+    false = _add(
+        oracle,
+        "customers",
+        "check_constraints",
+        [
+            {
+                "kind": "enumeration",
+                "column": "region",
+                "values": ["nowhere"],
+                "min_value_count": 10,
+                "satisfied_fraction": 1.0,
+            },
+        ],
+    )
+    false = _add(
+        false,
+        "order_items",
+        "check_constraints",
+        [
+            {
+                "kind": "range",
+                "column": "unit_price",
+                "min": str(high + 1),
+                "max": str(high + 2),
+                "satisfied_fraction": 1.0,
+            },
+        ],
+    )
+    false = _add(false, "customers", "unique_keys", [{"columns": ["segment"], "confidence": 1.0}])
+    false = _add(
+        false,
+        "",
+        "relationships",
+        [
+            {
+                "child_table": "orders",
+                "child_columns": ["order_id"],
+                "parent_table": "customers",
+                "parent_columns": ["customer_id"],
+                "coverage": 1.0,
+            }
+        ],
+    )
+
+    base = score_structure(oracle, truth, real=real)
+    true_score = score_structure(honest, truth, real=real)
+    false_score = score_structure(false, truth, real=real)
+    for table, name in (
+        ("customers", "checks"),
+        ("order_items", "checks"),
+        ("customers", "keys"),
+        ("orders", "foreign_keys"),
+    ):
+        assert _precision(true_score, table, name) == _precision(base, table, name), (table, name)
+    assert "foreign_keys" not in next(t for t in true_score.tables if t.name == "products").categories
+    assert _precision(false_score, "customers", "checks") < 1.0
+    assert _precision(false_score, "order_items", "checks") < 1.0
+    assert _precision(false_score, "customers", "keys") < 1.0
+    assert _precision(false_score, "orders", "foreign_keys") < 1.0
+    assert false_score.score < base.score

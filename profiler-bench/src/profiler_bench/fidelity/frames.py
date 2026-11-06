@@ -8,7 +8,8 @@ partitioning and selects identical rows on both sides of a comparison.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import pandas as pd
@@ -20,6 +21,11 @@ from pyspark.sql import types as T
 from profiler_bench.catalog.manifest import Column, Table
 
 
+CHARACTER_CLASSES: tuple[tuple[str, Callable[[str], bool]], ...] = (
+    ("#digits", str.isdigit),
+    ("#letters", str.isalpha),
+    ("#punctuation", lambda c: not c.isalnum() and not c.isspace()),
+)
 ROW_FRAME = ""
 HASH = "__h"
 HASH_RANGE = 2**62
@@ -60,6 +66,25 @@ class _Collection:
     expr: str
     dtype: T.ArrayType | T.MapType
     truth: Column | None
+
+
+def string_features(values: pd.Series, formats: Sequence[str]) -> dict[str, pd.Series]:
+    """Returns features derived from a string column, keyed by the suffix added to its path.
+
+    `#chars` is the length, `#digits`, `#letters`, and `#punctuation` count character classes, and `#format` (when
+    the manifest declares formats) is the index of the first format the value fully matches, or `unmatched`. They let
+    joint structure of identifier-like columns be compared without comparing the values themselves.
+    """
+    present = values.dropna().astype(str)
+    features = {"#chars": present.map(len)}
+    for suffix, test in CHARACTER_CLASSES:
+        features[suffix] = present.map(lambda s, t=test: sum(map(t, s)))
+    if formats:
+        compiled = [re.compile(f) for f in formats]
+        features["#format"] = present.map(
+            lambda s: next((str(i) for i, p in enumerate(compiled) if p.fullmatch(s)), "unmatched")
+        )
+    return {suffix: feature.reindex(values.index) for suffix, feature in features.items()}
 
 
 def leaf_kind(leaf: Leaf, values: pd.Series, max_distinct: int) -> str:

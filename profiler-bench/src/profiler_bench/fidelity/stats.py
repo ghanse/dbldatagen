@@ -85,9 +85,15 @@ def spearman(x: pd.Series, y: pd.Series) -> float:
     return pearson(x.rank(), y.rank())
 
 
+def _scaled(values: np.ndarray) -> np.ndarray:
+    """Returns `values` divided by their largest magnitude, so squares cannot overflow; scale-free measures keep."""
+    largest = float(np.abs(values).max()) if len(values) else 0.0
+    return values / largest if largest > 0 else values
+
+
 def pearson(x: pd.Series, y: pd.Series) -> float:
     """Returns the Pearson correlation, or 0 when either side is constant or there are fewer than two rows."""
-    a, b = x.to_numpy(dtype=np.float64), y.to_numpy(dtype=np.float64)
+    a, b = _scaled(x.to_numpy(dtype=np.float64)), _scaled(y.to_numpy(dtype=np.float64))
     if len(a) < 2 or a.std() == 0 or b.std() == 0:
         return 0.0
     return float(np.corrcoef(a, b)[0, 1])
@@ -102,7 +108,7 @@ def cramers_v(x: pd.Series, y: pd.Series) -> float:
 
 def correlation_ratio(x: pd.Series, y: pd.Series, bins: int, numeric_x: bool) -> float:
     """Returns eta of numeric `y` given `x`, with numeric `x` cut into quantile bins, or 0 when `y` is constant."""
-    values = y.to_numpy(dtype=np.float64)
+    values = _scaled(y.to_numpy(dtype=np.float64))
     if len(values) < 2 or values.std() == 0:
         return 0.0
     groups = pd.qcut(x, bins, labels=False, duplicates="drop") if numeric_x else x.astype(str)

@@ -1,11 +1,14 @@
 import json
 from collections.abc import Callable, Iterator
 
+import numpy as np
+import pandas as pd
 import pytest
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
-from profiler_bench.catalog import load, materialize
+from profiler_bench.catalog import Manifest, load, materialize
+from profiler_bench.catalog.manifest import Column, Format, Table
 from profiler_bench.fidelity import ReconstructionScore, ceiling, load_config, overall, score_reconstruction
 from profiler_bench.fidelity.scores import TableReconstruction
 
@@ -177,3 +180,71 @@ def test_ceiling_is_high_but_below_identical(spark: SparkSession, numeric_identi
     assert summary.relative["numeric"] == 1.0
     assert summary.relative_score == 1.0
     assert top.relative_to(top) == 1.0
+
+
+def _patterned(spark: SparkSession, shuffle: bool) -> tuple[DataFrame, DataFrame, Manifest]:
+    rng = np.random.default_rng(0)
+    n = 4000
+    kind = rng.choice(["A", "B"], n)
+    letters = rng.choice(list("ABCDEFGHIJ"), (n, 3))
+    digits = rng.integers(0, 10, (n, 10))
+    code = [
+        "".join(letters[i]) + "-" + "".join(map(str, digits[i, :4])) if kind[i] == "A" else "".join(map(str, digits[i]))
+        for i in range(n)
+    ]
+    real = pd.DataFrame({"id": np.arange(n), "kind": kind, "code": code})
+    synth = real.copy()
+    if shuffle:
+        synth["code"] = rng.permutation(synth["code"].to_numpy())
+    formats = (Format(regex=r"[A-J]{3}-[0-9]{4}", share=0.5), Format(regex=r"[0-9]{10}", share=0.5))
+    table = Table(
+        name="t",
+        row_count=n,
+        primary_key=("id",),
+        columns=(
+            Column(name="id", type="bigint", unique=True),
+            Column(name="kind", type="string"),
+            Column(name="code", type="string", formats=formats),
+        ),
+    )
+    manifest = Manifest(dataset="patterned", tier="xs", structure_seed=0, description="", tables=(table,))
+    return spark.createDataFrame(real), spark.createDataFrame(synth), manifest
+
+
+def test_shuffled_patterned_string_loses_its_dependence(spark: SparkSession) -> None:
+    real, same, manifest = _patterned(spark, shuffle=False)
+    _, shuffled, _ = _patterned(spark, shuffle=True)
+    baseline = score_reconstruction({"t": real}, {"t": same}, manifest, seed=0).tables[0]
+    broken = score_reconstruction({"t": real}, {"t": shuffled}, manifest, seed=0).tables[0]
+    assert baseline.score == pytest.approx(1.0)
+    assert next(c for c in broken.columns if c.path == "code").metrics["format"] == 1.0
+    pair = next(p for p in broken.pairs if set(p.columns) == {"code#format", "kind"})
+    assert pair.real > 0.9 and pair.score < 0.1
+    assert broken.discriminator is not None and broken.discriminator.score < 0.8
+    assert broken.score < baseline.score - 0.05
+
+
+def test_relative_score_caps_each_group_at_its_ceiling() -> None:
+    def table(groups: dict[str, float]) -> TableReconstruction:
+        return TableReconstruction(
+            name="t",
+            real_rows=1,
+            synth_rows=1,
+            schema_match=1.0,
+            groups=groups,
+            weights={"marginal": 0.5, "keys": 0.5},
+            score=sum(groups.values()) / 2,
+        )
+
+    candidate, top = table({"marginal": 1.0, "keys": 0.5}), table({"marginal": 0.5, "keys": 1.0})
+    assert candidate.score / top.score == 1.0
+    assert candidate.relative_to(top) == pytest.approx(0.75)
+
+
+def test_effective_weights_are_renormalized_over_present_groups(numeric_identical: ReconstructionScore) -> None:
+    table = _table(numeric_identical, "measurements")
+    config = load_config().reconstruction_weights
+    assert set(table.weights) == set(table.groups)
+    assert sum(table.weights.values()) == pytest.approx(1.0)
+    total = sum(config[g] for g in table.groups)
+    assert table.weights["marginal"] == pytest.approx(config["marginal"] / total)

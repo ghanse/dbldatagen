@@ -7,7 +7,10 @@ Every check is pass/fail against a threshold of the metrics configuration; value
 
 from __future__ import annotations
 
+import itertools
 import math
+import re
+import zlib
 from collections.abc import Iterator, Mapping, Sequence
 
 import numpy as np
@@ -20,7 +23,7 @@ from dbldatagen_profiler.model import ColumnProfile, EnumerationConstraint, Logi
 from profiler_bench.catalog.manifest import Manifest, Table
 from profiler_bench.fidelity import regex, stats
 from profiler_bench.fidelity.config import MetricsConfig, load_config
-from profiler_bench.fidelity.frames import ROW_FRAME, collect, identifier, leaf_kind, require_utc
+from profiler_bench.fidelity.frames import ROW_FRAME, bounded, collect, identifier, leaf_kind, require_utc
 from profiler_bench.fidelity.scores import GuardCheck, PrivacyScore
 from profiler_bench.fidelity.truth import (
     VALUE_LEAK_CATEGORIES,
@@ -73,11 +76,19 @@ def score_privacy(
     limits = config.privacy
     checks: list[GuardCheck] = []
     for table in manifest.tables:
-        if table.name in synth and table.name in real and table.name in holdout:
-            checks += _table_checks(table, real[table.name], synth[table.name], holdout[table.name], seed, config)
-    leaks = _profile_leaks(profile, manifest, real, limits.min_substring_length)
+        if table.name not in real:
+            continue
+        if table.name not in synth:
+            checks.append(_unmeasured(f"{table.name}.synth_table_present", 1.0))
+            continue
+        keys = set(table.primary_key) | {
+            c for fk in manifest.foreign_keys if fk.child_table == table.name for c in fk.child_columns
+        }
+        checks += _table_checks(table, real[table.name], synth[table.name], holdout[table.name], keys, seed, config)
+    patterns = _small_patterns(profile, profile.privacy.min_value_count, limits.min_regex_language)
+    leaks = _profile_leaks(profile, manifest, real, patterns, seed, config.sampling.privacy_rows)
     checks.append(_at_most("profile.sensitive_value_leaks", sum(leaks.values()), limits.max_profile_leaks, leaks))
-    violations = _k_violations(profile, real)
+    violations = _k_violations(profile, real, patterns, seed, config.sampling.privacy_rows)
     checks.append(_at_most("profile.k_threshold", sum(violations.values()), limits.max_k_violations, violations))
     return PrivacyScore(
         dataset=manifest.dataset,
@@ -86,6 +97,11 @@ def score_privacy(
         checks=checks,
         passed=all(c.passed for c in checks),
     )
+
+
+def _unmeasured(name: str, threshold: float) -> GuardCheck:
+    """Returns a failed check for something the synth lacks, so a missing table or column can never pass."""
+    return GuardCheck(name=name, value=0.0, threshold=threshold, passed=False, detail={"unmeasured": 1.0})
 
 
 def _at_most(name: str, value: float, threshold: float, detail: Mapping[str, float] | None = None) -> GuardCheck:
@@ -108,14 +124,30 @@ def _excess(name: str, synth: tuple[float, int], holdout: tuple[float, int], thr
 
 
 def _table_checks(
-    truth: Table, real: DataFrame, synth: DataFrame, holdout: DataFrame, seed: int, config: MetricsConfig
+    truth: Table,
+    real: DataFrame,
+    synth: DataFrame,
+    holdout: DataFrame,
+    keys: set[str],
+    seed: int,
+    config: MetricsConfig,
 ) -> list[GuardCheck]:
     limits = config.privacy
     real_types = {f.name: f.dataType.simpleString() for f in real.schema.fields}
     synth_types = {f.name: f.dataType.simpleString() for f in synth.schema.fields}
     shared = [n for n, t in real_types.items() if synth_types.get(n) == t]
-    checks = []
-    if shared:
+    coverage = len(shared) / len(real_types) if real_types else 1.0
+    real_rows, synth_rows = real.count(), synth.count()
+    present = 1.0 if synth_rows or not real_rows else 0.0
+    checks = [
+        GuardCheck(name=f"{truth.name}.synth_columns_present", value=coverage, threshold=1.0, passed=coverage >= 1.0),
+        GuardCheck(name=f"{truth.name}.synth_rows_present", value=present, threshold=1.0, passed=present >= 1.0),
+    ]
+    if not shared:
+        names = ("copy_rate_excess", "dcr_ratio", "partial_copy_rate_excess")
+        thresholds = (limits.max_copy_rate_excess, limits.min_dcr_ratio, limits.max_copy_rate_excess)
+        checks += [_unmeasured(f"{truth.name}.{n}", t) for n, t in zip(names, thresholds, strict=True)]
+    else:
         checks.append(
             _excess(
                 f"{truth.name}.copy_rate_excess",
@@ -126,29 +158,108 @@ def _table_checks(
             )
         )
         checks.append(_dcr(truth, real, synth.select(*(identifier(n) for n in shared)), holdout, seed, config))
+        values = [c for c in shared if c not in keys]
+        checks += _partial_copy(truth.name, real, synth, holdout, values, seed, config)
     for path, category in sensitive_columns(truth).items():
-        if category in VALUE_LEAK_CATEGORIES and path.split(".")[0] in shared:
-            checks.append(
-                _excess(
-                    f"{truth.name}.{path}.value_leak_rate_excess",
-                    _value_leak_rate(synth, real, path),
-                    _value_leak_rate(holdout, real, path),
-                    limits.max_synth_leak_rate_excess,
-                    limits.noise_z,
-                )
+        if category not in VALUE_LEAK_CATEGORIES:
+            continue
+        name = f"{truth.name}.{path}.value_leak_rate_excess"
+        if path.split(".")[0] not in shared:
+            checks.append(_unmeasured(name, limits.max_synth_leak_rate_excess))
+            continue
+        checks.append(
+            _excess(
+                name,
+                _value_leak_rate(synth, real, path),
+                _value_leak_rate(holdout, real, path),
+                limits.max_synth_leak_rate_excess,
+                limits.noise_z,
             )
+        )
     for columns in quasi_identifier_sets(truth):
-        if set(columns) <= set(shared):
-            checks.append(
-                _excess(
-                    f"{truth.name}.quasi_identifiers[{','.join(columns)}].match_rate_excess",
-                    _match_rate(synth, real, columns, unique_only=True),
-                    _match_rate(holdout, real, columns, unique_only=True),
-                    limits.max_qi_match_rate_excess,
-                    limits.noise_z,
-                )
+        name = f"{truth.name}.quasi_identifiers[{','.join(columns)}].match_rate_excess"
+        if not set(columns) <= set(shared):
+            checks.append(_unmeasured(name, limits.max_qi_match_rate_excess))
+            continue
+        checks.append(
+            _excess(
+                name,
+                _match_rate(synth, real, columns, unique_only=True),
+                _match_rate(holdout, real, columns, unique_only=True),
+                limits.max_qi_match_rate_excess,
+                limits.noise_z,
             )
+        )
     return checks
+
+
+def _partial_copy(
+    table: str,
+    real: DataFrame,
+    synth: DataFrame,
+    holdout: DataFrame,
+    shared: Sequence[str],
+    seed: int,
+    config: MetricsConfig,
+) -> list[GuardCheck]:
+    """Returns a check that no column pair reproduces real-unique value pairs more often than the holdout does.
+
+    A synth row that copies some columns of a real row, row-aligned, reproduces the real row's combination of values
+    in every pair of copied columns; combinations unique in the real table do not recur by chance. Primary key and
+    foreign key columns are left out by the caller: their values follow from the key structure, which any sampler
+    reproduces, so pairs with them measure that structure rather than copying.
+    """
+    pairs = list(itertools.combinations(shared, 2))
+    if not pairs:
+        return []
+    limit = config.privacy.partial_copy_pairs
+    if len(pairs) > limit:
+        rng = np.random.default_rng([seed, zlib.crc32(table.encode())])
+        pairs = [pairs[i] for i in sorted(rng.choice(len(pairs), size=limit, replace=False))]
+    synth_rates, holdout_rates = _pair_match_rates(synth, real, pairs), _pair_match_rates(holdout, real, pairs)
+    checks = [
+        _excess("", synth_rate, holdout_rate, config.privacy.max_copy_rate_excess, config.privacy.noise_z)
+        for synth_rate, holdout_rate in zip(synth_rates, holdout_rates, strict=True)
+    ]
+    worst = max(range(len(pairs)), key=lambda i: checks[i].value)
+    return [
+        GuardCheck(
+            name=f"{table}.partial_copy_rate_excess",
+            value=checks[worst].value,
+            threshold=config.privacy.max_copy_rate_excess,
+            passed=all(c.passed for c in checks),
+            detail={
+                **checks[worst].detail,
+                "pairs": float(len(pairs)),
+                "failed_pairs": float(sum(not c.passed for c in checks)),
+            },
+        )
+    ]
+
+
+def _pair_keys(df: DataFrame, pairs: Sequence[tuple[str, str]]) -> DataFrame:
+    keys = ", ".join(
+        f"named_struct('p', {i}, 'k', to_json(struct({identifier(a)} AS a, {identifier(b)} AS b)))"
+        for i, (a, b) in enumerate(pairs)
+    )
+    return df.selectExpr(f"inline(array({keys}))")
+
+
+def _pair_match_rates(
+    rows: DataFrame, reference: DataFrame, pairs: Sequence[tuple[str, str]]
+) -> list[tuple[float, int]]:
+    """Returns, for each column pair, the share of `rows` whose pair of values is unique in `reference`."""
+    total = rows.count()
+    unique = _pair_keys(reference, pairs).groupBy("p", "k").count().where("count = 1").select("p", "k")
+    matched = {
+        r["p"]: r["n"]
+        for r in _pair_keys(rows, pairs)
+        .join(unique, ["p", "k"], "left_semi")
+        .groupBy("p")
+        .agg(F.count(F.lit(1)).alias("n"))
+        .collect()
+    }
+    return [((matched.get(i, 0) / total if total else 0.0), total) for i in range(len(pairs))]
 
 
 def _row_key(df: DataFrame, columns: Sequence[str]) -> DataFrame:
@@ -257,11 +368,43 @@ def _profile_columns(columns: Sequence[ColumnProfile]) -> Iterator[ColumnProfile
         yield from _profile_columns(column.children or [])
 
 
+def _small_patterns(profile: Profile, k: int, minimum: float) -> list[tuple[str, re.Pattern[str]]]:
+    """Returns the profile's regexes that match fewer than max(k, minimum) strings, so they can single out values."""
+    limit = max(float(k), minimum)
+    found = []
+    for table in profile.tables:
+        for column in _profile_columns(table.columns):
+            for pattern in (column.string.patterns or []) if column.string else []:
+                if regex.language_size(pattern.regex) < limit:
+                    try:
+                        found.append((pattern.regex, re.compile(pattern.regex)))
+                    except re.error:
+                        continue
+    return found
+
+
+def _sample_values(values: DataFrame, cap: int, seed: int) -> list[str]:
+    """Returns up to about `cap` distinct non-null values of column `v`, chosen by a seeded hash, as strings."""
+    distinct = values.selectExpr("CAST(v AS STRING) AS v").dropna().distinct()
+    return [r["v"] for r in bounded(distinct, distinct.count(), cap, seed).select("v").collect()]
+
+
 def _profile_leaks(
-    profile: Profile, manifest: Manifest, real: Mapping[str, DataFrame], min_length: int
+    profile: Profile,
+    manifest: Manifest,
+    real: Mapping[str, DataFrame],
+    patterns: Sequence[tuple[str, re.Pattern[str]]],
+    seed: int,
+    cap: int,
 ) -> dict[str, float]:
+    """Counts sensitive real values the profile gives away, per column.
+
+    A value leaks when it equals a string of the profile JSON or a literal run of a profile regex (checked on every
+    value), or when a profile regex with a small language (see `_small_patterns`) fully matches it (checked on a
+    seeded sample of the column's values).
+    """
     strings = sorted(_profile_strings(profile))
-    if not strings or not real:
+    if not real:
         return {}
     session = next(iter(real.values())).sparkSession
     candidates = F.broadcast(session.createDataFrame([(s,) for s in strings], "c string"))
@@ -274,15 +417,26 @@ def _profile_leaks(
                 continue
             expr = ".".join(identifier(p) for p in path.split("."))
             values = real[table.name].selectExpr(f"CAST({expr} AS STRING) AS v").dropna().distinct()
-            condition = (F.col("c") == F.col("v")) | (
-                (F.length("v") >= min_length) & (F.instr(F.col("c"), F.col("v")) > 0)
-            )
-            leaks[f"{table.name}.{path}"] = float(values.join(candidates, condition).select("v").distinct().count())
+            exact = {r["v"] for r in values.join(candidates, F.col("c") == F.col("v"), "left_semi").collect()}
+            matched = {v for v in _sample_values(values, cap, seed) for _, p in patterns if p.fullmatch(v)}
+            leaks[f"{table.name}.{path}"] = float(len(exact | matched))
     return leaks
 
 
-def _k_violations(profile: Profile, real: Mapping[str, DataFrame]) -> dict[str, float]:
+def _k_violations(
+    profile: Profile,
+    real: Mapping[str, DataFrame],
+    patterns: Sequence[tuple[str, re.Pattern[str]]],
+    seed: int,
+    cap: int,
+) -> dict[str, float]:
+    """Counts literal values of the profile held by fewer than `privacy.min_value_count` real rows, per source.
+
+    Sources are `top_values`, enumeration constraints, and regexes with a small language (see `_small_patterns`),
+    whose matches among a seeded sample of the column's values are treated as literals.
+    """
     k = profile.privacy.min_value_count
+    small = {source for source, _ in patterns}
     violations: dict[str, float] = {}
     try:
         Profile.model_validate(profile.model_dump(mode="json"))
@@ -296,6 +450,12 @@ def _k_violations(profile: Profile, real: Mapping[str, DataFrame]) -> dict[str, 
         for path, values, column in _literal_columns(df, table.columns):
             if column.string and column.string.top_values:
                 listed.append((f"{path} top_values", values, [v.value for v in column.string.top_values]))
+            for i, pattern in enumerate((column.string.patterns or []) if column.string else []):
+                if pattern.regex in small:
+                    compiled = re.compile(pattern.regex)
+                    hits = [v for v in _sample_values(values, cap, seed) if compiled.fullmatch(v)]
+                    if hits:
+                        listed.append((f"{path} pattern {i}", values, hits))
         top_level = {c.name for c in table.columns}
         for constraint in table.check_constraints or []:
             if isinstance(constraint, EnumerationConstraint) and constraint.column in top_level:

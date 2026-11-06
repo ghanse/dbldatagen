@@ -132,7 +132,9 @@ class PrivacyThresholds(_Model):
             holdout's share.
         max_k_violations: Most literal values allowed below the profile's `min_value_count`.
         noise_z: Standard errors of sampling noise added to every rate-excess threshold.
-        min_substring_length: Shortest sensitive value searched for as a substring of profile strings.
+        min_regex_language: A profile regex that fully matches a real value leaks it, and is held to the k-threshold,
+            when it matches fewer than max(k, this) strings.
+        partial_copy_pairs: Most column pairs per table checked for row-aligned partial copying.
     """
 
     max_copy_rate_excess: float = Field(ge=0.0)
@@ -142,7 +144,8 @@ class PrivacyThresholds(_Model):
     max_qi_match_rate_excess: float = Field(ge=0.0)
     max_k_violations: int = Field(ge=0)
     noise_z: float = Field(ge=0.0)
-    min_substring_length: int = Field(gt=0)
+    min_regex_language: float = Field(gt=0)
+    partial_copy_pairs: int = Field(gt=0)
 
 
 class MetricsConfig(_Model):

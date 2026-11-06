@@ -2,8 +2,10 @@
 
 Each planted item (a key, foreign key, check, functional dependency, dependency, string format, null rate, or
 cardinality) earns a credit in [0, 1]. Recall is the mean credit over planted items; precision is the mean credit over
-the profile's claims about the same targets. A structure the profile spec cannot express, or the profile omits, is
-reported as not recovered. Planted values are the manifest's generating parameters.
+the profile's claims about the same targets. Key, foreign key, check, and dependency claims about structure the
+manifest does not plant are checked against the real data (see `claims`): true ones are left out of precision and
+false ones count as 0. A structure the profile spec cannot express, or the profile omits, is reported as not
+recovered. Planted values are the manifest's generating parameters.
 """
 
 from __future__ import annotations
@@ -11,11 +13,12 @@ from __future__ import annotations
 import math
 import re
 import zlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timezone
 from typing import Any
 
 import numpy as np
+from pyspark.sql import DataFrame, SparkSession
 
 from dbldatagen_profiler.model import (
     Cardinality,
@@ -41,6 +44,7 @@ from profiler_bench.catalog.manifest import (
 )
 from profiler_bench.catalog.verification import _rate
 from profiler_bench.fidelity import regex
+from profiler_bench.fidelity.claims import Verifier
 from profiler_bench.fidelity.config import MetricsConfig, load_config
 from profiler_bench.fidelity.scores import (
     StructureCategory,
@@ -50,6 +54,7 @@ from profiler_bench.fidelity.scores import (
     mean,
     weighted,
 )
+from profiler_bench.fidelity.truth import load_instance
 
 
 FLIPPED = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "=": "=", "!=": "!="}
@@ -57,19 +62,40 @@ IMPLIES = {"<": {"<", "<=", "!="}, ">": {">", ">=", "!="}, "=": {"=", "<=", ">="
 
 
 def score_structure(
-    profile: Profile, manifest: Manifest, *, seed: int = 0, config: MetricsConfig | None = None
+    profile: Profile,
+    manifest: Manifest,
+    *,
+    real: Mapping[str, DataFrame] | None = None,
+    sample_seed: int | None = None,
+    seed: int = 0,
+    config: MetricsConfig | None = None,
 ) -> StructureScore:
     """Scores how much of the structure planted in a catalog dataset the profile recovered.
 
     Args:
         profile: Profile of the dataset.
         manifest: Ground-truth manifest of the dataset.
-        seed: Seed of the strings generated to test regex equivalence.
+        real: Real DataFrames the profile was computed from, used to check claims about unplanted structure;
+            defaults to the catalog instance at the manifest's structure seed and `sample_seed`.
+        sample_seed: Catalog sample seed of the real data; defaults to the structure seed.
+        seed: Seed of the strings generated to test regex equivalence and of the dependency samples.
         config: Metrics configuration; defaults to the packaged one.
+
+    Raises:
+        RuntimeError: If `real` is not given and no Spark session is active.
     """
     config = config or load_config()
+    if real is None:
+        session = SparkSession.getActiveSession()
+        if session is None:
+            raise RuntimeError("score_structure needs `real` or an active SparkSession")
+        sample = manifest.structure_seed if sample_seed is None else sample_seed
+        real = load_instance(
+            manifest.dataset, manifest.tier, structure_seed=manifest.structure_seed, sample_seed=sample, spark=session
+        )
+    verifier = Verifier(real, seed, config)
     profiled = {t.name: t for t in profile.tables}
-    tables = [_score_table(t, profiled.get(t.name), profile, manifest, seed, config) for t in manifest.tables]
+    tables = [_score_table(t, profiled.get(t.name), profile, manifest, verifier, seed, config) for t in manifest.tables]
     return StructureScore(
         dataset=manifest.dataset,
         config_version=config.version,
@@ -80,28 +106,36 @@ def score_structure(
 
 
 def _score_table(
-    truth: Table, table: TableProfile | None, profile: Profile, manifest: Manifest, seed: int, config: MetricsConfig
+    truth: Table,
+    table: TableProfile | None,
+    profile: Profile,
+    manifest: Manifest,
+    verifier: Verifier,
+    seed: int,
+    config: MetricsConfig,
 ) -> TableStructure:
     tol = config.structure_tolerances
     categories = {
-        "keys": _keys(truth, table),
-        "foreign_keys": _foreign_keys(truth, profile, manifest),
-        "checks": _checks(truth, table, tol.range_relative),
+        "keys": _keys(truth, table, verifier),
+        "foreign_keys": _foreign_keys(truth, profile, manifest, verifier),
+        "checks": _checks(truth, table, tol.range_relative, verifier),
         "functional_dependencies": _functional_dependencies(truth, table),
-        "dependencies": _dependencies(truth, table, tol.dependency),
+        "dependencies": _dependencies(truth, table, tol.dependency, verifier),
         "patterns": _patterns(truth, table, seed, config),
         "null_rates": _null_rates(truth, table),
         "cardinality": _cardinality(truth, table, tol.distinct_log_ratio),
     }
     present = {name: c for name, c in categories.items() if c is not None}
-    _, score = weighted({name: c.score for name, c in present.items()}, config.structure_weights)
-    return TableStructure(name=truth.name, categories=present, score=score)
+    _, weights, score = weighted({name: c.score for name, c in present.items()}, config.structure_weights)
+    return TableStructure(name=truth.name, categories=present, weights=weights, score=score)
 
 
 def _category(items: list[StructureItem], claims: Sequence[float] | None) -> StructureCategory | None:
-    if not items:
+    """Returns a category's recall, precision, and score; recall is 1 when nothing is planted but claims were scored,
+    so false claims about a table without planted structure still cost precision."""
+    if not items and not claims:
         return None
-    recall = sum(i.credit for i in items) / len(items)
+    recall = sum(i.credit for i in items) / len(items) if items else 1.0
     precision = sum(claims) / len(claims) if claims else None
     if precision is None:
         score = recall
@@ -117,7 +151,12 @@ def _item(target: str, credit: float, note: str | None = None) -> StructureItem:
     return StructureItem(target=target, status=status, credit=credit, note=None if credit >= 1.0 else note)
 
 
-def _keys(truth: Table, table: TableProfile | None) -> StructureCategory | None:
+def _unplanted(holds: bool) -> list[float]:
+    """Returns the precision entry of a claim about unplanted structure: none when it holds, 0 when it is false."""
+    return [] if holds else [0.0]
+
+
+def _keys(truth: Table, table: TableProfile | None, verifier: Verifier) -> StructureCategory | None:
     primary = frozenset(truth.primary_key)
     unique = {frozenset(k) for k in truth.unique_keys}
     unique |= {frozenset({c.name}) for c in truth.columns if c.unique and frozenset({c.name}) != primary}
@@ -131,11 +170,13 @@ def _keys(truth: Table, table: TableProfile | None) -> StructureCategory | None:
         _item(f"unique key {sorted(k)}", float(k in claimed_all), "not claimed") for k in sorted(unique, key=sorted)
     ]
     planted = unique | ({primary} if primary else set())
-    claims = [float(k in planted) for k in claimed_all]
+    claims = [1.0 for k in claimed_all if k in planted]
+    for key in sorted(claimed_all - planted, key=sorted):
+        claims += _unplanted(verifier.key(truth.name, sorted(key), primary=key == claimed_primary))
     return _category(items, claims)
 
 
-def _foreign_keys(truth: Table, profile: Profile, manifest: Manifest) -> StructureCategory | None:
+def _foreign_keys(truth: Table, profile: Profile, manifest: Manifest, verifier: Verifier) -> StructureCategory | None:
     def signature(child: str, cc: Sequence[str], parent: str, pc: Sequence[str]) -> tuple[Any, ...]:
         return (child, tuple(cc), parent, tuple(pc))
 
@@ -144,15 +185,19 @@ def _foreign_keys(truth: Table, profile: Profile, manifest: Manifest) -> Structu
         for fk in manifest.foreign_keys
         if fk.child_table == truth.name
     }
-    claimed = {
-        signature(r.child_table, r.child_columns, r.parent_table, r.parent_columns)
+    relationships = {
+        signature(r.child_table, r.child_columns, r.parent_table, r.parent_columns): r
         for r in profile.relationships or []
         if r.child_table == truth.name
     }
     items = [
-        _item(f"{s[0]}{list(s[1])} -> {s[2]}{list(s[3])}", float(s in claimed), "not claimed") for s in sorted(planted)
+        _item(f"{s[0]}{list(s[1])} -> {s[2]}{list(s[3])}", float(s in relationships), "not claimed")
+        for s in sorted(planted)
     ]
-    return _category(items, [float(s in planted) for s in claimed])
+    claims = [1.0 for s in relationships if s in planted]
+    for s in sorted(set(relationships) - planted):
+        claims += _unplanted(verifier.foreign_key(relationships[s]))
+    return _category(items, claims)
 
 
 def _number(value: Bound | bool) -> float | None:
@@ -245,7 +290,7 @@ def _check_target(check: Check) -> str:
     return check.sql
 
 
-def _checks(truth: Table, table: TableProfile | None, tolerance: float) -> StructureCategory | None:
+def _checks(truth: Table, table: TableProfile | None, tolerance: float, verifier: Verifier) -> StructureCategory | None:
     claims = list(table.check_constraints or []) if table else []
     items: list[StructureItem] = []
     best: dict[int, float] = {}
@@ -254,7 +299,11 @@ def _checks(truth: Table, table: TableProfile | None, tolerance: float) -> Struc
         for i, credit in credits.items():
             best[i] = max(best.get(i, 0.0), credit)
         items.append(_item(_check_target(check), max(credits.values(), default=0.0), "no matching constraint"))
-    return _category(items, [best[i] for i in sorted(best)])
+    scored = [best[i] for i in sorted(best)]
+    for i, claim in enumerate(claims):
+        if i not in best:
+            scored += _unplanted(verifier.check(truth.name, claim))
+    return _category(items, scored)
 
 
 def _functional_dependencies(truth: Table, table: TableProfile | None) -> StructureCategory | None:
@@ -280,7 +329,9 @@ def _dependency_key(columns: Sequence[str], method: str) -> tuple[Any, ...]:
     return (method, tuple(columns) if ordered else frozenset(columns))
 
 
-def _dependencies(truth: Table, table: TableProfile | None, tolerance: float) -> StructureCategory | None:
+def _dependencies(
+    truth: Table, table: TableProfile | None, tolerance: float, verifier: Verifier
+) -> StructureCategory | None:
     claims = [(d, _dependency_key(d.columns, d.method.value)) for d in (table.dependencies or [] if table else [])]
     rows = max(truth.row_count, 1)
     planted = {}
@@ -294,6 +345,9 @@ def _dependencies(truth: Table, table: TableProfile | None, tolerance: float) ->
         note = f"claimed {values}" if values else "not claimed"
         items.append(_item(f"{dep.measure}{list(dep.columns)} = {dep.value:.3f}", credit, note))
     scored = [float(abs(c.value - planted[k][0]) <= planted[k][1]) for c, k in claims if k in planted]
+    for claim, key in claims:
+        if key not in planted:
+            scored += _unplanted(verifier.dependency(truth.name, claim))
     return _category(items, scored)
 
 

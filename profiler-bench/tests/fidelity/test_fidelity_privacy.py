@@ -1,12 +1,14 @@
 import re
 
+import pandas as pd
 import pytest
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, SparkSession, Window
+from pyspark.sql import functions as F
 
 from dbldatagen_profiler.engines.spark import profile_tables
 from dbldatagen_profiler.model import Profile
 from profiler_bench.catalog import load, materialize
-from profiler_bench.fidelity import PrivacyScore, privacy, score_privacy
+from profiler_bench.fidelity import PrivacyScore, privacy, score_privacy, stats
 
 
 def _checks(score: PrivacyScore) -> dict[str, bool]:
@@ -58,7 +60,7 @@ def test_sensitive_values_in_the_profile_are_found(
     )
     detail = {c.name: c for c in score.checks}
     assert detail["profile.sensitive_value_leaks"].value == 1
-    assert detail["profile.k_threshold"].detail == {"customers.email top_values": 1.0}
+    assert detail["profile.k_threshold"].detail == {"customers.email top_values": 1.0, "customers.email pattern 0": 1.0}
     assert not score.passed
 
 
@@ -85,3 +87,103 @@ def test_every_value_leak_class_is_checked(spark: SparkSession) -> None:
     assert "contacts.session_token.value_leak_rate_excess" in names
     assert "contacts.comment.value_leak_rate_excess" in names
     assert not any("home_zip.value_leak" in n for n in names)
+
+
+def _independent(spark: SparkSession) -> dict[str, DataFrame]:
+    return load("retail", "xs", 0, spark, sample_seed=3)
+
+
+def _with_patterns(profile: Profile, table: str, column: str, regexes: list[str]) -> Profile:
+    data = profile.model_dump(mode="json")
+    target = next(c for t in data["tables"] if t["name"] == table for c in t["columns"] if c["name"] == column)
+    target["string"] = {**(target.get("string") or {}), "patterns": [{"regex": r, "coverage": 0.5} for r in regexes]}
+    return Profile.model_validate(data)
+
+
+def test_empty_synth_fails_every_table(real: dict[str, DataFrame], profile: Profile) -> None:
+    score = score_privacy(real, {}, profile, materialize("retail", "xs", 0).manifest)
+    assert not score.passed
+    assert {c.name for c in score.checks if not c.passed} >= {f"{t}.synth_table_present" for t in real}
+
+
+def test_missing_and_retyped_columns_fail_explicitly(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    synth = _independent(spark)
+    synth["orders"] = synth["orders"].drop("status")
+    synth["customers"] = synth["customers"].drop("email")
+    synth["products"] = synth["products"].select(
+        *(F.encode(F.col(c).cast("string"), "utf-8").alias(c) for c in synth["products"].columns)
+    )
+    synth["order_items"] = synth["order_items"].limit(0)
+    checks = {c.name: c for c in score_privacy(real, synth, profile, materialize("retail", "xs", 0).manifest).checks}
+    assert not checks["orders.synth_columns_present"].passed
+    assert not checks["customers.email.value_leak_rate_excess"].passed
+    assert checks["customers.email.value_leak_rate_excess"].detail == {"unmeasured": 1.0}
+    assert checks["products.synth_columns_present"].value == 0.0
+    assert not checks["products.copy_rate_excess"].passed
+    assert not checks["products.dcr_ratio"].passed
+    assert not checks["order_items.synth_rows_present"].passed
+
+
+def test_obfuscated_literal_regexes_leak(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:
+    email = real["customers"].orderBy("customer_id").collect()[0]["email"]
+    grouped = "".join(f"({c})" if c.isalnum() else re.escape(c) for c in email)
+    classes = "".join(f"[{c}]" if c.isalnum() else re.escape(c) for c in email)
+    for pattern in (grouped, classes):
+        leaky = _with_patterns(profile, "customers", "email", [pattern])
+        score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+        detail = {c.name: c for c in score.checks}
+        assert detail["profile.sensitive_value_leaks"].detail["customers.email"] == 1.0, pattern
+        assert detail["profile.k_threshold"].detail["customers.email pattern 0"] == 1.0, pattern
+
+
+def test_rare_literal_in_a_pattern_fails_the_k_audit(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    sku = real["products"].orderBy("product_id").collect()[0]["sku"]
+    pattern = "".join(f"({c})" for c in sku)
+    leaky = _with_patterns(profile, "products", "sku", [pattern])
+    score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+    detail = {c.name: c for c in score.checks}
+    assert detail["profile.k_threshold"].detail == {"products.sku pattern 0": 1.0}
+    assert detail["profile.sensitive_value_leaks"].passed
+
+
+def test_broad_patterns_are_not_flagged(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:
+    broad = _with_patterns(profile, "products", "sku", [r"[A-Z]{3}-\d{4}"])
+    broad = _with_patterns(
+        broad, "customers", "email", [r"[a-z]+\.[a-z]+[0-9]+@(example\.com|mail\.test|corp\.example)"]
+    )
+    score = score_privacy(real, _independent(spark), broad, materialize("retail", "xs", 0).manifest)
+    assert score.passed, [c for c in score.checks if not c.passed]
+
+
+def test_partial_row_copying_is_detected(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:
+    synth = _independent(spark)
+    copied = ["email", "signup_date", "country"]
+    order = Window.orderBy("customer_id")
+    kept = synth["customers"].drop(*copied).withColumn("__r", F.row_number().over(order))
+    source = real["customers"].select(*copied, F.row_number().over(order).alias("__r"))
+    synth["customers"] = kept.join(source, "__r").select(*real["customers"].columns)
+    checks = {c.name: c for c in score_privacy(real, synth, profile, materialize("retail", "xs", 0).manifest).checks}
+    assert checks["customers.copy_rate_excess"].passed
+    partial = checks["customers.partial_copy_rate_excess"]
+    assert not partial.passed
+    assert partial.value > 0.9
+    assert partial.detail["failed_pairs"] >= 3
+
+
+def test_dcr_weights_each_column_at_most_about_one() -> None:
+    reference = pd.DataFrame({"n": [0.0, 1.0, 2.0, 3.0], "c": ["a", "b", "a", "b"], "s": ["x1", "x2", "x3", "x4"]})
+    kinds = {"n": "numeric", "c": "categorical", "s": "string"}
+    encoder = stats.Encoder(reference, kinds, 20)
+    row = reference.iloc[[0]]
+    flipped = row.assign(c="b")
+    distance = privacy._closest(encoder, flipped, row)
+    assert distance[0] == pytest.approx(1.0)
+    renamed = row.assign(s="zz")
+    one_string = privacy._closest(encoder, renamed, row)[0] ** 2
+    assert 1.0 <= one_string <= 2.0 + 1e-9
+    shifted = row.assign(n=2.0)
+    assert privacy._closest(encoder, shifted, row)[0] == pytest.approx(0.5)

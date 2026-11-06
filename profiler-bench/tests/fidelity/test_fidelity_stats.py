@@ -2,6 +2,7 @@ import re
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from profiler_bench.fidelity import regex, stats
 
@@ -73,3 +74,19 @@ def test_generated_strings_match_their_regex() -> None:
 
 def test_literals_split_alternatives() -> None:
     assert regex.literals(r"john\.doe@(example\.com|corp)") == ["john.doe@", "example.com", "corp"]
+
+
+@pytest.mark.parametrize(
+    ("pattern", "size"),
+    [
+        (r"(j)(o)(h)(n)@x\.com", 1.0),
+        (r"[j][o]hn", 1.0),
+        (r"john|jane", 2.0),
+        (r"[A-Z]{3}-\d{4}", 26**3 * 10**4),
+        (r"[ab]{1,2}", 6.0),
+        (r"[a-z]+", float("inf")),
+        (r"\w{1000}", float("inf")),
+    ],
+)
+def test_language_size(pattern: str, size: float) -> None:
+    assert regex.language_size(pattern) == size

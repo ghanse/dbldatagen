@@ -7,10 +7,11 @@ alternation, and repeats; lookarounds and back-references are not supported.
 from __future__ import annotations
 
 import importlib
+import math
 import re
 import string
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import numpy as np
@@ -137,3 +138,78 @@ def _literals(items: Sequence[tuple[Any, Any]], runs: list[str]) -> None:
         elif name in REPEATS:
             _literals(av[2], runs)
     runs.append("".join(current))
+
+
+UNICODE = 2**16
+MAX_EXPONENT = 300
+CLASS_SIZES = {"CATEGORY_DIGIT": 10, "CATEGORY_WORD": 63, "CATEGORY_SPACE": 6}
+
+
+def language_size(regex: str) -> float:
+    """Returns an estimate of how many strings fully match `regex`; `inf` when a repeat is unbounded.
+
+    Character classes count their members, with `.`, negated classes, and negated categories counted as 2**16
+    characters, `\\d` as 10, `\\w` as 63, and `\\s` as 6. Anchors and lookarounds count as one. A regex that does not
+    parse counts as the single literal string it is.
+    """
+    try:
+        items = _parser.parse(regex)
+    except re.error:
+        return 1.0
+    return _size(items)
+
+
+def _size(items: Sequence[tuple[Any, Any]]) -> float:
+    total = 1.0
+    for item in items:
+        total *= _item_size(item)
+        if total == float("inf"):
+            return total
+    return total
+
+
+def _repeat_size(av: tuple[Any, Any, Any]) -> float:
+    low, high, inner = av
+    if high == _parser.MAXREPEAT:
+        return float("inf")
+    base = _size(inner)
+    if base <= 1:
+        return 1.0
+    if high * math.log10(base) > MAX_EXPONENT:
+        return float("inf")
+    return float(sum(base**count for count in range(low, high + 1)))
+
+
+ONE_SIZED = frozenset({"LITERAL", "AT", "ASSERT", "ASSERT_NOT", "GROUPREF", "GROUPREF_EXISTS"})
+SIZES: dict[str, Callable[[Any], float]] = {
+    "CATEGORY": lambda av: float(CLASS_SIZES.get(av.name, UNICODE)),
+    "IN": lambda av: _class_size(av),
+    "BRANCH": lambda av: sum(_size(branch) for branch in av[1]),
+    "SUBPATTERN": lambda av: _size(av[-1]),
+    "ATOMIC_GROUP": lambda av: _size(av[-1]),
+    **dict.fromkeys(REPEATS, _repeat_size),
+}
+
+
+def _item_size(item: tuple[Any, Any]) -> float:
+    op, av = item
+    if op.name in ONE_SIZED:
+        return 1.0
+    return SIZES[op.name](av) if op.name in SIZES else float(UNICODE)
+
+
+def _class_size(items: Sequence[tuple[Any, Any]]) -> float:
+    if any(op.name == "NEGATE" for op, _ in items):
+        return float(UNICODE)
+    size = 0.0
+    for op, av in items:
+        name = op.name
+        if name == "LITERAL":
+            size += 1
+        elif name == "RANGE":
+            size += av[1] - av[0] + 1
+        elif name == "CATEGORY":
+            size += CLASS_SIZES.get(av.name, UNICODE)
+        else:
+            size += UNICODE
+    return size

@@ -33,7 +33,16 @@ from profiler_bench.catalog.manifest import (
 )
 from profiler_bench.fidelity import stats
 from profiler_bench.fidelity.config import MetricsConfig, load_config
-from profiler_bench.fidelity.frames import ROW_FRAME, Leaf, collect, identifier, leaf_kind, quoted, require_utc
+from profiler_bench.fidelity.frames import (
+    ROW_FRAME,
+    Leaf,
+    collect,
+    identifier,
+    leaf_kind,
+    quoted,
+    require_utc,
+    string_features,
+)
 from profiler_bench.fidelity.scores import (
     CheckScore,
     ColumnScore,
@@ -139,7 +148,13 @@ def _score_table(
     if truth.name not in synth:
         groups = dict.fromkeys(config.reconstruction_weights, 0.0)
         return TableReconstruction(
-            name=truth.name, real_rows=real_rows, synth_rows=0, schema_match=0.0, groups=groups, score=0.0
+            name=truth.name,
+            real_rows=real_rows,
+            synth_rows=0,
+            schema_match=0.0,
+            groups=groups,
+            weights=dict(config.reconstruction_weights),
+            score=0.0,
         )
     synth_df = synth[truth.name]
     real_types = {f.name: f.dataType.simpleString() for f in real_df.schema.fields}
@@ -177,6 +192,7 @@ def _score_table(
         if n not in good
     ]
     row_frame_kinds = {leaf.path: kinds[leaf.path] for leaf in real_leaves if leaf.frame == ROW_FRAME}
+    row_frame_kinds |= _derive(real_leaves, kinds, real_frames[ROW_FRAME], synth_frames[ROW_FRAME], config)
     pairs = _pairs(truth, row_frame_kinds, real_frames[ROW_FRAME], synth_frames[ROW_FRAME], seed, config)
     checks = _checks(truth, synth_df, set(good))
     keys = _keys(truth, synth_df, set(good))
@@ -184,7 +200,7 @@ def _score_table(
     usable = {p: k for p, k in row_frame_kinds.items() if p in synth_frames[ROW_FRAME].columns}
     discriminator = _discriminator(real_frames[ROW_FRAME], synth_frames[ROW_FRAME], usable, seed, config)
     marginal = [mean([v for k, v in c.metrics.items() if k in MARGINAL_METRICS]) for c in columns]
-    groups, score = weighted(
+    groups, weights, score = weighted(
         {
             "schema": (schema_match + _ratio(real_rows, synth_rows)) / 2,
             "marginal": mean([m for m in marginal if m is not None]),
@@ -211,8 +227,34 @@ def _score_table(
         foreign_keys=fks,
         discriminator=discriminator,
         groups=groups,
+        weights=weights,
         score=score,
     )
+
+
+def _derive(
+    leaves: list[Leaf], kinds: Mapping[str, str], real: pd.DataFrame, synth: pd.DataFrame, config: MetricsConfig
+) -> dict[str, str]:
+    """Adds the derived features of every high-cardinality row-level string column to both frames, in place.
+
+    Returns:
+        The kind of each derived feature: `#format` is categorical, the rest are judged like any other numbers.
+    """
+    derived: dict[str, str] = {}
+    limit = config.marginal.categorical_max_distinct
+    for leaf in leaves:
+        if leaf.frame != ROW_FRAME or kinds[leaf.path] != "string":
+            continue
+        formats = [f.regex for f in leaf.truth.formats] if leaf.truth is not None else []
+        for frame in (real, synth):
+            if leaf.path in frame.columns:
+                for suffix, feature in string_features(frame[leaf.path], formats).items():
+                    frame[f"{leaf.path}{suffix}"] = feature
+        for suffix in string_features(pd.Series([], dtype=object), formats):
+            values = real[f"{leaf.path}{suffix}"].dropna()
+            small = suffix == "#format" or values.nunique() <= limit
+            derived[f"{leaf.path}{suffix}"] = "categorical" if small else "numeric"
+    return derived
 
 
 def _ratio(a: float, b: float) -> float:
@@ -352,7 +394,7 @@ def _pairs(
     candidates = [
         pair
         for pair in itertools.combinations(sorted(p for p, k in kinds.items() if k in ("numeric", "categorical")), 2)
-        if frozenset(pair) not in taken and "." not in pair[0] + pair[1]
+        if frozenset(pair) not in taken and "." not in pair[0] + pair[1] and _root(pair[0]) != _root(pair[1])
     ]
     rng = np.random.default_rng([seed, zlib.crc32(truth.name.encode())])
     count = min(config.dependence.random_pairs, len(candidates))
@@ -363,9 +405,9 @@ def _pairs(
     ]
     result = []
     for (columns, measure), is_declared in [*((d, True) for d in declared), *((r, False) for r in random_pairs)]:
-        real_value = _measure(real, columns, measure, kinds, config)
+        real_value = pair_measure(real, columns, measure, kinds, config)
         present = set(columns) <= set(synth.columns)
-        synth_value = _measure(synth, columns, measure, kinds, config) if present else None
+        synth_value = pair_measure(synth, columns, measure, kinds, config) if present else None
         score = clamp(1 - abs(real_value - synth_value)) if synth_value is not None else 0.0
         result.append(
             PairScore(
@@ -373,6 +415,10 @@ def _pairs(
             )
         )
     return result
+
+
+def _root(path: str) -> str:
+    return path.split("#")[0]
 
 
 def _measure_for(a: str, b: str) -> str:
@@ -383,9 +429,18 @@ def _measure_for(a: str, b: str) -> str:
     return "correlation_ratio"
 
 
-def _measure(
+def pair_measure(
     frame: pd.DataFrame, columns: tuple[str, str], measure: str, kinds: Mapping[str, str], config: MetricsConfig
 ) -> float:
+    """Returns a dependence measure of two sampled columns; numeric columns drop non-finite values.
+
+    Args:
+        frame: Sampled values, one column per leaf.
+        columns: The two columns; for `correlation_ratio` the first is the conditioning column.
+        measure: `pearson`, `spearman`, `cramers_v`, or `correlation_ratio`.
+        kinds: Kind of each column: `numeric`, `categorical`, `string`, or `length`.
+        config: Metrics configuration.
+    """
     x_name, y_name = columns
     pdf = frame[[x_name, y_name]].dropna()
     numeric_x = measure in ("pearson", "spearman") or (measure == "correlation_ratio" and kinds[x_name] == "numeric")

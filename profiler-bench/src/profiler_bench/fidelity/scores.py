@@ -134,6 +134,8 @@ class TableReconstruction(_Score):
         foreign_keys: Foreign keys whose child is this table.
         discriminator: Two-sample classifier score, when both sides have enough rows.
         groups: Score per reconstruction group present in this table.
+        weights: Effective weight of each group in `score`: the configured weights renormalized over the groups present.
+            Tables with different groups weight the same group differently, so compare table scores group by group.
         score: Weighted mean of `groups`.
     """
 
@@ -148,7 +150,20 @@ class TableReconstruction(_Score):
     foreign_keys: list[ForeignKeyScore] = []
     discriminator: DiscriminatorScore | None = None
     groups: dict[str, Score]
+    weights: dict[str, float]
     score: Score
+
+    def relative_to(self, ceiling: TableReconstruction) -> float:
+        """Returns the weighted mean of each group as a fraction of the ceiling's same group, each capped at 1.
+
+        A group the ceiling lacks, or scores 0, counts as is. Capping per group keeps a group above its ceiling from
+        masking one below it.
+        """
+        relative = {
+            name: min(1.0, value / ceiling.groups[name]) if ceiling.groups.get(name, 0.0) > 0 else value
+            for name, value in self.groups.items()
+        }
+        return clamp(sum(self.weights[name] * value for name, value in relative.items()))
 
 
 class ReconstructionScore(_Score):
@@ -173,8 +188,13 @@ class ReconstructionScore(_Score):
     score: Score
 
     def relative_to(self, ceiling: ReconstructionScore) -> float:
-        """Returns this score as a fraction of the real-vs-real `ceiling`, capped at 1."""
-        return min(1.0, self.score / ceiling.score) if ceiling.score > 0 else 1.0
+        """Returns the mean over tables of each table's score relative to the real-vs-real `ceiling`.
+
+        See `TableReconstruction.relative_to`; a table missing from the ceiling counts with its own score.
+        """
+        ceilings = {t.name: t for t in ceiling.tables}
+        values = [t.relative_to(ceilings[t.name]) if t.name in ceilings else t.score for t in self.tables]
+        return mean(values) or 0.0
 
 
 class StructureItem(_Score):
@@ -218,11 +238,13 @@ class TableStructure(_Score):
     Attributes:
         name: Table name.
         categories: Categories with planted items.
+        weights: Effective weight of each category in `score`, renormalized over the categories present.
         score: Weighted mean of the category scores.
     """
 
     name: str
     categories: dict[str, StructureCategory]
+    weights: dict[str, float]
     score: Score
 
 
@@ -303,13 +325,20 @@ def mean(values: Sequence[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
-def weighted(groups: Mapping[str, float | None], weights: Mapping[str, float]) -> tuple[dict[str, float], float]:
-    """Returns the present groups and their weighted mean, renormalized over present groups; 1 when none is present."""
+def weighted(
+    groups: Mapping[str, float | None], weights: Mapping[str, float]
+) -> tuple[dict[str, float], dict[str, float], float]:
+    """Returns the present groups, their effective weights, and their weighted mean.
+
+    Weights are renormalized over the present groups, so a table without, say, foreign keys spreads that weight over
+    the rest; the mean is 1 when no group is present.
+    """
     present = {name: value for name, value in groups.items() if value is not None}
     total = sum(weights[name] for name in present)
     if total == 0:
-        return present, 1.0
-    return present, clamp(sum(weights[name] * value for name, value in present.items()) / total)
+        return present, {}, 1.0
+    effective = {name: weights[name] / total for name in present}
+    return present, effective, clamp(sum(effective[name] * value for name, value in present.items()))
 
 
 def clamp(value: float) -> float:
