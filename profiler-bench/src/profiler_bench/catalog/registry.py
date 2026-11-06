@@ -13,7 +13,7 @@ from typing import NamedTuple
 import pyarrow as pa
 
 from profiler_bench.catalog import gen, manifest
-from profiler_bench.catalog.gen import Rng, rng_factory
+from profiler_bench.catalog.gen import STRUCTURE, Rng, rng_factory
 from profiler_bench.catalog.manifest import Column, ForeignKey, Manifest, Table
 
 
@@ -44,14 +44,17 @@ class Dataset:
     Attributes:
         name: Dataset name.
         description: What the dataset exercises.
-        build: Generator taking the tier's base row count and a stream factory.
+        build: Generator taking the tier's base row count, the row stream factory (sample seed), and the
+            structure stream factory (structure seed). Everything the manifest declares, including
+            vocabularies, value rank orders, and generating parameters, comes from the structure streams
+            or constants, so the manifest depends only on the structure seed and the tier.
         sizes: Expected row count of each table for a base row count, without generating data.
             Counts are exact for deterministic tables and expectations for random ones.
     """
 
     name: str
     description: str
-    build: Callable[[int, Rng], Build]
+    build: Callable[[int, Rng, Rng], Build]
     sizes: Callable[[int], dict[str, float]] | None = None
 
     def fingerprint(self) -> str:
@@ -69,13 +72,17 @@ class Dataset:
         return digest.hexdigest()[:16]
 
 
-def generate(dataset: Dataset, tier: str, seed: int) -> tuple[dict[str, pa.Table], Manifest]:
+def generate(
+    dataset: Dataset, tier: str, seed: int, sample_seed: int | None = None
+) -> tuple[dict[str, pa.Table], Manifest]:
     """Generates a dataset in memory and returns its tables with the completed manifest.
 
     Args:
         dataset: Catalog entry.
         tier: Scale tier name.
-        seed: Seed for every random stream.
+        seed: Structure seed: generating parameters and vocabularies. Also the sample seed when
+            `sample_seed` is None.
+        sample_seed: Seed for the rows drawn from the structure.
 
     Raises:
         KeyError: If `tier` is unknown.
@@ -83,7 +90,8 @@ def generate(dataset: Dataset, tier: str, seed: int) -> tuple[dict[str, pa.Table
     """
     if tier not in TIERS:
         raise KeyError(f"unknown tier {tier!r}; expected one of {sorted(TIERS)}")
-    build = dataset.build(TIERS[tier], rng_factory(seed, dataset.name))
+    rows = seed if sample_seed is None else sample_seed
+    build = dataset.build(TIERS[tier], rng_factory(rows, dataset.name), rng_factory(seed, dataset.name, STRUCTURE))
     if sorted(build.tables) != sorted(t.name for t in build.truth):
         raise ValueError(f"{dataset.name}: declared tables do not match generated tables")
     files = TIER_FILES[tier]
@@ -91,7 +99,7 @@ def generate(dataset: Dataset, tier: str, seed: int) -> tuple[dict[str, pa.Table
     result = Manifest(
         dataset=dataset.name,
         tier=tier,
-        seed=seed,
+        structure_seed=seed,
         description=dataset.description,
         tables=truth,
         foreign_keys=tuple(build.foreign_keys),

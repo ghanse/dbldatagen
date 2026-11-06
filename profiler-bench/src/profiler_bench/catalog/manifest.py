@@ -60,7 +60,7 @@ class Family(str, Enum):
     - `exponential`: `scale` (the mean).
     - `pareto`: `alpha`, `scale` (the minimum).
     - `poisson`: `lam`, optional `shift` added to every draw.
-    - `binomial`: `n`, `p`.
+    - `binomial`: `n`, `p`, optional `shift` added to every draw.
     - `negative_binomial`: `n`, `p` (numpy parameterization, mean `n(1-p)/p`).
     - `zipf`: `s`, `n_values`; value of rank `k` has probability proportional to `k**-s`.
     - `categorical`: `values`, `probabilities`.
@@ -103,7 +103,10 @@ REQUIRED_PARAMS: dict[Family, frozenset[str]] = {
     Family.SEQUENCE: frozenset({"start", "step"}),
     Family.SEASONAL: frozenset({"start", "end", "hour_weights", "weekday_weights"}),
 }
-OPTIONAL_PARAMS: dict[Family, frozenset[str]] = {Family.POISSON: frozenset({"shift"})}
+OPTIONAL_PARAMS: dict[Family, frozenset[str]] = {
+    Family.POISSON: frozenset({"shift"}),
+    Family.BINOMIAL: frozenset({"shift"}),
+}
 
 
 def _is_number(value: object) -> bool:
@@ -186,7 +189,8 @@ def _poisson(p: dict[str, Any]) -> list[str]:
 
 
 def _binomial(p: dict[str, Any]) -> list[str]:
-    return ([] if _is_int(p["n"]) and p["n"] >= 1 else ["n must be a positive integer"]) + _probability(p, "p")
+    errors = [] if _is_int(p["n"]) and p["n"] >= 1 else ["n must be a positive integer"]
+    return errors + _probability(p, "p") + ([] if _is_int(p.get("shift", 0)) else ["shift must be an integer"])
 
 
 def _zipf(p: dict[str, Any]) -> list[str]:
@@ -544,7 +548,9 @@ class Manifest(_Model):
             from, not statistics of this instance (see `profiler_bench.catalog.realized`).
         dataset: Catalog dataset name.
         tier: Scale tier the data was generated at.
-        seed: Seed the data was generated with.
+        structure_seed: Seed of the generating parameters and vocabularies. The manifest depends only on
+            it and the tier; the rows also depend on a sample seed, which the manifest does not record.
+            Input that uses the earlier name `seed` is accepted.
         description: What the dataset exercises.
         tables: Planted structure of every table.
         foreign_keys: Foreign keys between tables.
@@ -554,10 +560,17 @@ class Manifest(_Model):
     declared_values: Literal["generating_parameters"] = "generating_parameters"
     dataset: str
     tier: str
-    seed: int
+    structure_seed: int
     description: str
     tables: tuple[Table, ...]
     foreign_keys: tuple[ForeignKey, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_seed(cls, data: object) -> object:
+        if isinstance(data, dict) and "seed" in data and "structure_seed" not in data:
+            return {("structure_seed" if k == "seed" else k): v for k, v in data.items()}
+        return data
 
     @model_validator(mode="after")
     def _check_foreign_keys(self) -> Manifest:
@@ -570,6 +583,11 @@ class Manifest(_Model):
             if fk.parent_columns not in (parent.primary_key, *parent.unique_keys):
                 raise ValueError(f"foreign key target {fk.parent_table}{list(fk.parent_columns)} is not a key")
         return self
+
+    @property
+    def seed(self) -> int:
+        """Returns the structure seed (the name used before seeds were split)."""
+        return self.structure_seed
 
     def table(self, name: str) -> Table:
         """Returns the table called `name`."""

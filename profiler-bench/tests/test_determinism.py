@@ -16,6 +16,7 @@ from pyspark.sql import SparkSession
 from profiler_bench.catalog import DATASETS, generate, materialize, registry
 from profiler_bench.catalog.gen import rng_factory
 from profiler_bench.catalog.hashing import little_endian, table_hash
+from profiler_bench.catalog.store import content_hash
 
 
 @pytest.mark.parametrize("name", sorted(DATASETS))
@@ -106,7 +107,7 @@ def test_materialize_reuses_the_cached_instance(tmp_path: Path) -> None:
 
 def test_cache_path_includes_the_generator_fingerprint(tmp_path: Path) -> None:
     instance = materialize("temporal", "xs", 0, tmp_path)
-    assert instance.path == tmp_path / "temporal" / "xs" / "seed-0" / DATASETS["temporal"].fingerprint()
+    assert instance.path == tmp_path / "temporal" / "xs" / "seed-0" / "sample-0" / DATASETS["temporal"].fingerprint()
 
 
 def test_fingerprint_includes_library_versions(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -170,3 +171,39 @@ def _golden_table() -> pa.Table:
 
 def test_table_hash_is_pinned_across_hosts() -> None:
     assert table_hash(_golden_table()) == GOLDEN_TABLE_HASH
+
+
+@pytest.mark.parametrize("name", sorted(DATASETS))
+def test_manifest_depends_only_on_the_structure_seed(name: str) -> None:
+    first_rows, first = generate(DATASETS[name], "xs", 0, sample_seed=1)
+    second_rows, second = generate(DATASETS[name], "xs", 0, sample_seed=2)
+    assert first == second
+    assert first.model_dump_json() == second.model_dump_json()
+    assert all(table_hash(first_rows[t]) != table_hash(second_rows[t]) for t in first_rows if first_rows[t].num_rows)
+
+
+def test_structure_seed_changes_the_declared_structure() -> None:
+    _, first = generate(DATASETS["nested"], "xs", 0, sample_seed=1)
+    _, second = generate(DATASETS["nested"], "xs", 1, sample_seed=1)
+    assert first.table("wide").columns != second.table("wide").columns
+
+
+def test_seed_alone_sets_both_seeds(tmp_path: Path) -> None:
+    alias = materialize("strings", "xs", 3, tmp_path)
+    explicit = materialize("strings", "xs", 3, tmp_path, sample_seed=3)
+    other = materialize("strings", "xs", 3, tmp_path, sample_seed=4)
+    assert (alias.structure_seed, alias.sample_seed) == (3, 3)
+    assert alias.path == explicit.path
+    assert alias.content_hash == explicit.content_hash
+    assert other.path != alias.path
+    assert other.manifest == alias.manifest
+    assert other.content_hash != alias.content_hash
+    assert other.path == tmp_path / "strings" / "xs" / "seed-3" / "sample-4" / DATASETS["strings"].fingerprint()
+
+
+def test_content_hash_covers_both_seeds(tmp_path: Path) -> None:
+    instance = materialize("temporal", "xs", 0, tmp_path, sample_seed=1)
+    manifest_path = instance.path / "manifest.json"
+    assert content_hash(instance.table_hashes, manifest_path, 0, 1) == instance.content_hash
+    assert content_hash(instance.table_hashes, manifest_path, 0, 2) != instance.content_hash
+    assert content_hash(instance.table_hashes, manifest_path, 1, 1) != instance.content_hash

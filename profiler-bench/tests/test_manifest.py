@@ -66,7 +66,7 @@ def test_manifest_rejects_foreign_key_to_non_key() -> None:
         Manifest(
             dataset="d",
             tier="xs",
-            seed=0,
+            structure_seed=0,
             description="",
             tables=(parent, child),
             foreign_keys=(
@@ -172,3 +172,12 @@ def test_realistic_tables_are_shuffled_with_hashed_keys(name: str, table: str) -
     key = truth.table(table).primary_key[0]
     values = tables[table].column(key).to_numpy()
     assert not (values[1:] >= values[:-1]).all()
+
+
+def test_manifest_accepts_the_earlier_seed_field() -> None:
+    _, truth = generate(DATASETS["numeric"], "xs", 4)
+    data = truth.model_dump()
+    data["seed"] = data.pop("structure_seed")
+    restored = Manifest.model_validate(data)
+    assert restored == truth
+    assert restored.seed == restored.structure_seed == 4

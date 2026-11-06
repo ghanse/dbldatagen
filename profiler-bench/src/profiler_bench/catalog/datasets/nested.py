@@ -56,17 +56,17 @@ def sizes(n: int) -> dict[str, float]:
     return {"profiles": n, "wide": max(500, n // 10)}
 
 
-def build(n: int, rng: Rng) -> Build:
+def build(n: int, rng: Rng, structure: Rng) -> Build:
     """Generates the `profiles` table with `n` rows and the `wide` table with `max(500, n // 10)` rows."""
     rows = sizes(n)
-    profiles, profiles_truth = _profiles(n, rng)
-    wide, wide_truth = _wide(int(rows["wide"]), rng)
+    profiles, profiles_truth = _profiles(n, rng, structure)
+    wide, wide_truth = _wide(int(rows["wide"]), rng, structure)
     return Build({"profiles": profiles, "wide": wide}, [profiles_truth, wide_truth], [])
 
 
-def _profiles(n: int, rng: Rng) -> tuple[pa.Table, Table]:
-    streets = [w.capitalize() for w in gen.words(rng("address.street.names"), 300)]
-    cities = [w.capitalize() for w in gen.words(rng("address.city.names"), N_CITIES)]
+def _profiles(n: int, rng: Rng, structure: Rng) -> tuple[pa.Table, Table]:
+    streets = [w.capitalize() for w in gen.words(structure("address.street.names"), 300)]
+    cities = [w.capitalize() for w in gen.words(structure("address.city.names"), N_CITIES)]
     address = pa.StructArray.from_arrays(
         [
             gen.join(
@@ -226,8 +226,8 @@ def _profiles(n: int, rng: Rng) -> tuple[pa.Table, Table]:
     return table, truth
 
 
-def _wide(n: int, rng: Rng) -> tuple[pa.Table, Table]:
-    params = rng("wide.params")
+def _wide(n: int, rng: Rng, structure: Rng) -> tuple[pa.Table, Table]:
+    params = structure("wide.params")
     names = [f"c{i:03d}" for i in range(WIDE_FLOATS + WIDE_INTS + WIDE_STRINGS)]
     null_rates = [float(r) for r in params.choice(WIDE_NULL_RATES, len(names))]
     data: dict[str, pa.Array] = {}

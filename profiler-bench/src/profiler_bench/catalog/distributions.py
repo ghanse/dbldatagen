@@ -245,13 +245,13 @@ def _poisson(v: np.ndarray, p: dict[str, Any]) -> list[str]:
 
 
 def _binomial(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    trials, prob = int(p["n"]), p["p"]
-    failures = _integral(v) + _bounds(v, 0, trials)
+    trials, prob, shift = int(p["n"]), p["p"], int(p.get("shift", 0))
+    failures = _integral(v) + _bounds(v, shift, shift + trials)
     if failures:
         return failures
     sd = math.sqrt(trials * prob * (1 - prob))
-    return near("mean", float(v.mean()), trials * prob, Z * sd / math.sqrt(len(v))) + _discrete(
-        v, lambda k: binomial_logpmf(k, trials, prob), 0, trials
+    return near("mean", float(v.mean()), shift + trials * prob, Z * sd / math.sqrt(len(v))) + _discrete(
+        v, lambda k: binomial_logpmf(k, trials, prob), shift, shift + trials
     )
 
 

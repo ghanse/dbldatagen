@@ -57,7 +57,7 @@ def sizes(n: int) -> dict[str, float]:
     return {"edge_cases": n, "empty": 0}
 
 
-def build(n: int, rng: Rng) -> Build:
+def build(n: int, rng: Rng, structure: Rng) -> Build:
     """Generates the `edge_cases` table with `n` rows and the zero-row `empty` table."""
     int_digits = DECIMAL_SCALED[0] - DECIMAL_SCALED[1]
     scaled = gen.join(
@@ -84,7 +84,7 @@ def build(n: int, rng: Rng) -> Build:
     wide_range = np.where(rng("wide_range.sign").random(n) < 0.5, -magnitude, magnitude)
 
     blank_kind = rng("blank.kind").random(n)
-    vocabulary = gen.words(rng("blank.vocabulary"), 200)
+    vocabulary = gen.words(structure("blank.vocabulary"), 200)
     blank = pc.if_else(
         pa.array(blank_kind < BLANK_EMPTY_RATE),
         "",

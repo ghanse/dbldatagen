@@ -66,14 +66,14 @@ def cramers_v(marginal: list[float], conditional: list[list[float]]) -> float:
     return math.sqrt(phi2 / (min(joint.shape) - 1))
 
 
-def build(n: int, rng: Rng) -> Build:
+def build(n: int, rng: Rng, structure: Rng) -> Build:
     """Generates the `contacts` table with `n` rows."""
-    names = gen.words(rng("names"), 300)
-    vocabulary = gen.words(rng("vocabulary"), VOCABULARY_SIZE, 1, 3)
-    cities = [w.capitalize() for w in gen.words(rng("cities"), N_CITIES, 2, 4)]
-    states = gen.indexed_strings(rng("states").choice(26**2, N_STATES, replace=False), [UPPER, UPPER]).to_pylist()
-    city_state = rng("city_state").integers(0, N_STATES, N_CITIES)
-    home_zips = gen.indexed_strings(rng("home_zips").choice(10**5, N_HOME_ZIPS, replace=False), [DIGITS] * 5)
+    names = gen.words(structure("names"), 300)
+    vocabulary = gen.words(structure("vocabulary"), VOCABULARY_SIZE, 1, 3)
+    cities = [w.capitalize() for w in gen.words(structure("cities"), N_CITIES, 2, 4)]
+    states = gen.indexed_strings(structure("states").choice(26**2, N_STATES, replace=False), [UPPER, UPPER]).to_pylist()
+    city_state = structure("city_state").integers(0, N_STATES, N_CITIES)
+    home_zips = gen.indexed_strings(structure("home_zips").choice(10**5, N_HOME_ZIPS, replace=False), [DIGITS] * 5)
 
     phone_us = rng("phone.format").random(n) < PHONE_US_SHARE
     digits = [DIGITS] * 3
@@ -91,7 +91,7 @@ def build(n: int, rng: Rng) -> Build:
         [HEX] * 8 + ["-"] + [HEX] * 4 + ["-", "4"] + [HEX] * 3 + ["-", "89ab"] + [HEX] * 3 + ["-"] + [HEX] * 12,
     )
     comment_lengths = 1 + rng("comment.length").poisson(COMMENT_WORDS_LAM, n)
-    city = gen.zipf_choice(rng("city"), n, N_CITIES, CITY_ZIPF_S)
+    city = gen.zipf_choice(rng("city"), n, N_CITIES, CITY_ZIPF_S, structure("city.order"))
     tier = gen.choice(rng("tier"), n, TIER_PROBABILITIES)
     channel_cdf = np.cumsum(np.asarray(CHANNEL_GIVEN_TIER), axis=1)[tier]
     channel = np.minimum((rng("channel").random(n)[:, None] > channel_cdf).sum(axis=1), len(CHANNELS) - 1)

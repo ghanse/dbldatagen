@@ -17,24 +17,29 @@ DIGITS = "0123456789"
 HEX = "0123456789abcdef"
 
 Rng = Callable[[str], np.random.Generator]
+STRUCTURE = "structure"
 
 _CONSONANTS = "bcdfghjklmnprstvz"
 _VOWELS = "aeiou"
 
 
-def rng_factory(seed: int, dataset: str) -> Rng:
+def rng_factory(seed: int, dataset: str, namespace: str = "") -> Rng:
     """Returns a function that maps a stream key to an independent, reproducible generator.
 
-    Each key gets its own stream derived from the seed, the dataset name, and the key, so adding
-    or reordering columns does not change the values of other columns.
+    Each key gets its own stream derived from the seed, the dataset name, the namespace, and the key,
+    so adding or reordering columns does not change the values of other columns. Generators use the
+    empty namespace with the sample seed for rows, and `STRUCTURE` with the structure seed for
+    generating parameters and vocabularies.
 
     Args:
-        seed: Dataset seed.
+        seed: Sample or structure seed.
         dataset: Dataset name.
+        namespace: Stream namespace.
     """
+    prefix = [seed, _stable_int(dataset)] + ([_stable_int(namespace)] if namespace else [])
 
     def rng(key: str) -> np.random.Generator:
-        return np.random.default_rng([seed, _stable_int(dataset), _stable_int(key)])
+        return np.random.default_rng([*prefix, _stable_int(key)])
 
     return rng
 
@@ -121,10 +126,21 @@ def zipf_probabilities(n_values: int, s: float) -> np.ndarray:
     return np.asarray(weights / weights.sum())
 
 
-def zipf_choice(rng: np.random.Generator, n: int, n_values: int, s: float) -> np.ndarray:
-    """Returns `n` indexes in `[0, n_values)` drawn by Zipf rank, with ranks assigned in random order."""
+def zipf_choice(
+    rng: np.random.Generator, n: int, n_values: int, s: float, order: np.random.Generator | None = None
+) -> np.ndarray:
+    """Returns `n` indexes in `[0, n_values)` drawn by Zipf rank, with ranks assigned in random order.
+
+    Args:
+        rng: Generator for the draws.
+        n: Number of draws.
+        n_values: Number of values.
+        s: Zipf exponent.
+        order: Generator for the rank order of the values; `rng` when None. Pass a structure stream
+            when the values are a fixed vocabulary, so which value is most frequent is structure.
+    """
     ranks = rng.choice(n_values, size=n, p=zipf_probabilities(n_values, s))
-    return rng.permutation(n_values)[ranks]
+    return (order or rng).permutation(n_values)[ranks]
 
 
 def words(rng: np.random.Generator, count: int, min_syllables: int = 2, max_syllables: int = 3) -> list[str]:

@@ -17,6 +17,14 @@ def test_manifest_is_true_of_its_data(name: str, spark: SparkSession) -> None:
     assert verify(truth, load(name, "xs", 0, spark)) == []
 
 
+@pytest.mark.parametrize("sample_seed", [1, 2])
+@pytest.mark.parametrize("name", sorted(DATASETS))
+def test_manifest_is_true_for_other_sample_seeds(name: str, sample_seed: int, spark: SparkSession) -> None:
+    truth = materialize(name, "xs", 0, sample_seed=sample_seed).manifest
+    assert truth == materialize(name, "xs", 0).manifest
+    assert verify(truth, load(name, "xs", 0, spark, sample_seed=sample_seed)) == []
+
+
 def test_load_reads_both_timestamp_kinds(spark: SparkSession) -> None:
     events = load("temporal", "xs", 0, spark)["events"]
     types = {f.name: f.dataType.simpleString() for f in events.schema.fields}

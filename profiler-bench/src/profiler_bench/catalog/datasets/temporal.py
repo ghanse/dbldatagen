@@ -41,7 +41,7 @@ def sizes(n: int) -> dict[str, float]:
     return {"events": n}
 
 
-def build(n: int, rng: Rng) -> Build:
+def build(n: int, rng: Rng, structure: Rng) -> Build:
     """Generates the `events` table with `n` rows in timestamp order."""
     start = gen.micros(START)
     day_weights = np.tile(WEEKDAY_WEIGHTS, WEEKS)

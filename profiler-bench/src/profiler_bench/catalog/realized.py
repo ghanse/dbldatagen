@@ -106,22 +106,25 @@ class Realized(_Model):
 
     dataset: str
     tier: str
-    seed: int
+    structure_seed: int
+    sample_seed: int | None
     tables: tuple[RealizedTable, ...]
     foreign_keys: tuple[RealizedForeignKey, ...] = ()
 
 
-def realized(truth: Manifest, frames: Mapping[str, DataFrame]) -> Realized:
+def realized(truth: Manifest, frames: Mapping[str, DataFrame], sample_seed: int | None = None) -> Realized:
     """Returns the realized statistics of the data in `frames` for the claims declared in `truth`.
 
     Args:
         truth: Ground-truth manifest of the instance.
         frames: DataFrames by table name, as returned by `load`.
+        sample_seed: Sample seed of the instance, recorded in the result when known.
     """
     return Realized(
         dataset=truth.dataset,
         tier=truth.tier,
-        seed=truth.seed,
+        structure_seed=truth.structure_seed,
+        sample_seed=sample_seed,
         tables=tuple(_table(t, frames[t.name]) for t in truth.tables),
         foreign_keys=tuple(
             _foreign_key(fk.child_table, fk.child_columns, fk.parent_table, fk.parent_columns, frames)
@@ -131,10 +134,16 @@ def realized(truth: Manifest, frames: Mapping[str, DataFrame]) -> Realized:
 
 
 def realized_statistics(
-    name: str, tier: str = DEFAULT_TIER, seed: int = 0, spark: SparkSession | None = None
+    name: str,
+    tier: str = DEFAULT_TIER,
+    seed: int = 0,
+    spark: SparkSession | None = None,
+    sample_seed: int | None = None,
 ) -> Realized:
     """Returns the realized statistics of a catalog dataset instance, materializing it if needed."""
-    return realized(materialize(name, tier, seed).manifest, load(name, tier, seed, spark))
+    instance = materialize(name, tier, seed, sample_seed=sample_seed)
+    frames = load(name, tier, seed, spark, sample_seed=sample_seed)
+    return realized(instance.manifest, frames, instance.sample_seed)
 
 
 def _table(table: Table, df: DataFrame) -> RealizedTable:

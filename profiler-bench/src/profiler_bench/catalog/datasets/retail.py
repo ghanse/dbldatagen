@@ -67,6 +67,10 @@ def _counts(n: int) -> tuple[int, int, int]:
     return max(100, n // 200), max(200, n // 20), n // 4
 
 
+def _extra_items(n_orders: int) -> int:
+    return round(ITEMS_LAM * n_orders)
+
+
 def sizes(n: int) -> dict[str, float]:
     """Returns the expected row count of each retail table for base row count `n`."""
     n_products, n_customers, n_orders = _counts(n)
@@ -74,11 +78,11 @@ def sizes(n: int) -> dict[str, float]:
         "customers": n_customers,
         "products": n_products,
         "orders": n_orders,
-        "order_items": n_orders * (1 + ITEMS_LAM),
+        "order_items": n_orders + _extra_items(n_orders),
     }
 
 
-def build(n: int, rng: Rng) -> Build:
+def build(n: int, rng: Rng, structure: Rng) -> Build:
     """Generates the retail tables for base row count `n` (about `n` order items), each in shuffled row order."""
     n_products, n_customers, n_orders = _counts(n)
 
@@ -99,7 +103,7 @@ def build(n: int, rng: Rng) -> Build:
     country = gen.choice(rng("customers.country"), n_customers, COUNTRY_PROBABILITIES)
     customer_number = np.arange(1, n_customers + 1)
     customer_id = gen.hashed_ids(customer_number, int(rng("customers.customer_id").integers(0, 2**62)))
-    names = gen.words(rng("customers.names"), 400)
+    names = gen.words(structure("customers.names"), 400)
     customers = pa.table(
         {
             "customer_id": pa.array(customer_id, pa.int64()),
@@ -135,7 +139,8 @@ def build(n: int, rng: Rng) -> Build:
         }
     )
 
-    items_per_order = 1 + rng("order_items.count").poisson(ITEMS_LAM, n_orders)
+    extra = _extra_items(n_orders)
+    items_per_order = 1 + rng("order_items.count").multinomial(extra, np.full(n_orders, 1 / n_orders))
     n_items = int(items_per_order.sum())
     starts = np.repeat(np.cumsum(items_per_order) - items_per_order, items_per_order)
     product = gen.zipf_choice(rng("order_items.product_id"), n_items, n_products, PRODUCT_ZIPF_S)
@@ -153,7 +158,7 @@ def build(n: int, rng: Rng) -> Build:
 
     ordered = {"customers": customers, "products": products, "orders": orders, "order_items": order_items}
     tables = {name: gen.shuffle(table, rng(f"{name}.row_order")) for name, table in ordered.items()}
-    return Build(tables, _truth(n_products, n_customers, n_orders), _foreign_keys(n_customers, n_products))
+    return Build(tables, _truth(n_products, n_customers, n_orders), _foreign_keys(n_customers, n_products, n_orders))
 
 
 def _truth(n_products: int, n_customers: int, n_orders: int) -> list[Table]:
@@ -280,7 +285,7 @@ def _truth(n_products: int, n_customers: int, n_orders: int) -> list[Table]:
     return [customers, products, orders, order_items]
 
 
-def _foreign_keys(n_customers: int, n_products: int) -> list[ForeignKey]:
+def _foreign_keys(n_customers: int, n_products: int, n_orders: int) -> list[ForeignKey]:
     return [
         ForeignKey(
             child_table="orders",
@@ -294,7 +299,10 @@ def _foreign_keys(n_customers: int, n_products: int) -> list[ForeignKey]:
             child_columns=("order_id",),
             parent_table="orders",
             parent_columns=("order_id",),
-            fanout=Distribution(family=Family.POISSON, params={"lam": ITEMS_LAM, "shift": 1}),
+            fanout=Distribution(
+                family=Family.BINOMIAL,
+                params={"n": _extra_items(n_orders), "p": 1 / n_orders, "shift": 1},
+            ),
         ),
         ForeignKey(
             child_table="order_items",

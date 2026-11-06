@@ -63,7 +63,7 @@ def sizes(n: int) -> dict[str, float]:
     return {"measurements": n}
 
 
-def build(n: int, rng: Rng) -> Build:
+def build(n: int, rng: Rng, structure: Rng) -> Build:
     """Generates the `measurements` table with `n` rows."""
     mixture = rng("mixture")
     component = mixture.random(n) < MIXTURE[0]["weight"]
