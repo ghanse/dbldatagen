@@ -12,6 +12,12 @@ resolution-markers = [
 [options.exclude-newer-package]
 databricks-sdk = false
 
+[manifest]
+members = [
+    "dbldatagen",
+    "dbldatagen-profiler",
+]
+
 [[package]]
 name = "alabaster"
 version = "0.7.16"
@@ -712,6 +718,65 @@ test = [
     { name = "six", specifier = "~=1.16.0" },
 ]
 yq = [{ name = "yq", specifier = "~=3.4.3" }]
+
+[[package]]
+name = "dbldatagen-profiler"
+source = { editable = "profiler" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.optional-dependencies]
+spark = [
+    { name = "pyspark", extra = ["sql"] },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "black" },
+    { name = "jsonschema" },
+    { name = "mypy" },
+    { name = "pyspark", extra = ["sql"] },
+    { name = "pytest" },
+    { name = "ruff" },
+]
+lint = [
+    { name = "black" },
+    { name = "mypy" },
+    { name = "ruff" },
+]
+test = [
+    { name = "jsonschema" },
+    { name = "pyspark", extra = ["sql"] },
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pydantic", specifier = ">=2.0,<3" },
+    { name = "pyspark", extras = ["sql"], marker = "extra == 'spark'", specifier = ">=3.4.1,<4.2" },
+]
+provides-extras = ["spark"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "black", specifier = "~=25.12.0" },
+    { name = "jsonschema", specifier = ">=4.0,<5" },
+    { name = "mypy", specifier = "~=1.9.0" },
+    { name = "pyspark", extras = ["sql"], specifier = ">=3.4.1,<4.2" },
+    { name = "pytest", specifier = "~=8.3.3" },
+    { name = "ruff", specifier = "~=0.13.0" },
+]
+lint = [
+    { name = "black", specifier = "~=25.12.0" },
+    { name = "mypy", specifier = "~=1.9.0" },
+    { name = "ruff", specifier = "~=0.13.0" },
+]
+test = [
+    { name = "jsonschema", specifier = ">=4.0,<5" },
+    { name = "pyspark", extras = ["sql"], specifier = ">=3.4.1,<4.2" },
+    { name = "pytest", specifier = "~=8.3.3" },
+]
 
 [[package]]
 name = "decorator"

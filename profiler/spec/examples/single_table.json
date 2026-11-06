@@ -1,0 +1,251 @@
+{
+  "spec_version": "0.1.0",
+  "created_at": "2026-11-06T12:00:00Z",
+  "engine": {
+    "name": "hand-written",
+    "version": "0.1.0"
+  },
+  "privacy": {
+    "min_value_count": 10,
+    "extremes": "exact",
+    "enumerations": "exact",
+    "allow_expression_constraints": true
+  },
+  "source": {
+    "name": "crm",
+    "format": "delta",
+    "location": "main.crm.customers",
+    "sampling": {
+      "fraction": 1.0,
+      "seed": 42
+    }
+  },
+  "tables": [
+    {
+      "name": "customers",
+      "row_count": 10000,
+      "columns": [
+        {
+          "name": "customer_id",
+          "logical_type": "int64",
+          "source_type": "bigint",
+          "nullable": false,
+          "null_fraction": 0.0,
+          "distinct_count": {
+            "value": 10000,
+            "exact": true
+          },
+          "cardinality": "unique",
+          "numeric": {
+            "min": "1",
+            "max": "10000",
+            "mean": 5000.5,
+            "stddev": 2886.9
+          }
+        },
+        {
+          "name": "email",
+          "logical_type": "string",
+          "source_type": "string",
+          "nullable": true,
+          "null_fraction": 0.02,
+          "distinct_count": {
+            "value": 9800,
+            "exact": false
+          },
+          "cardinality": "unique",
+          "string": {
+            "length": {
+              "min": 11,
+              "max": 38,
+              "mean": 21.4
+            },
+            "patterns": [
+              {
+                "regex": "[a-z]+\\.[a-z]+@example\\.(com|org)",
+                "coverage": 0.97
+              }
+            ]
+          }
+        },
+        {
+          "name": "tier",
+          "logical_type": "string",
+          "source_type": "string",
+          "nullable": false,
+          "null_fraction": 0.0,
+          "distinct_count": {
+            "value": 3,
+            "exact": true
+          },
+          "cardinality": "low",
+          "string": {
+            "length": {
+              "min": 4,
+              "max": 6
+            },
+            "top_values": [
+              {
+                "value": "bronze",
+                "frequency": 0.6
+              },
+              {
+                "value": "silver",
+                "frequency": 0.3
+              },
+              {
+                "value": "gold",
+                "frequency": 0.1
+              }
+            ]
+          }
+        },
+        {
+          "name": "balance",
+          "logical_type": "decimal",
+          "source_type": "decimal(12,2)",
+          "nullable": true,
+          "null_fraction": 0.05,
+          "precision": 12,
+          "scale": 2,
+          "numeric": {
+            "min": "0.00",
+            "max": "25000.00",
+            "mean": 1830.25,
+            "quantiles": [
+              {
+                "q": 0.5,
+                "value": "950.00"
+              },
+              {
+                "q": 0.99,
+                "value": "18000.00"
+              }
+            ],
+            "histogram": {
+              "edges": [
+                "0.00",
+                "1000.00",
+                "5000.00",
+                "25000.00"
+              ],
+              "counts": [
+                5000,
+                3500,
+                1000
+              ],
+              "sampled": false
+            }
+          }
+        },
+        {
+          "name": "signup_ts",
+          "logical_type": "timestamp",
+          "source_type": "timestamp",
+          "nullable": false,
+          "null_fraction": 0.0,
+          "temporal": {
+            "min": "2020-01-01T00:00:00Z",
+            "max": "2026-10-31T23:59:59Z",
+            "quantiles": [
+              {
+                "q": 0.5,
+                "value": "2024-03-15T08:30:00Z"
+              }
+            ]
+          }
+        },
+        {
+          "name": "is_active",
+          "logical_type": "boolean",
+          "source_type": "boolean",
+          "nullable": false,
+          "null_fraction": 0.0,
+          "boolean": {
+            "true_fraction": 0.82
+          }
+        },
+        {
+          "name": "tags",
+          "logical_type": "array",
+          "source_type": "array<string>",
+          "nullable": true,
+          "null_fraction": 0.1,
+          "children": [
+            {
+              "name": "element",
+              "logical_type": "string",
+              "source_type": "string",
+              "nullable": false,
+              "null_fraction": 0.0,
+              "cardinality": "low",
+              "value_count": 16200
+            }
+          ],
+          "collection_length": {
+            "min": 0,
+            "max": 5,
+            "mean": 1.8
+          }
+        }
+      ],
+      "primary_key": {
+        "columns": [
+          "customer_id"
+        ],
+        "confidence": 1.0
+      },
+      "unique_keys": [
+        {
+          "columns": [
+            "email"
+          ],
+          "confidence": 0.9
+        }
+      ],
+      "check_constraints": [
+        {
+          "kind": "range",
+          "column": "balance",
+          "min": "0.00",
+          "satisfied_fraction": 1.0
+        },
+        {
+          "kind": "enumeration",
+          "column": "tier",
+          "values": [
+            "bronze",
+            "silver",
+            "gold"
+          ],
+          "satisfied_fraction": 1.0,
+          "min_value_count": 1000
+        },
+        {
+          "kind": "expression",
+          "expression": "is_active OR balance = 0",
+          "satisfied_fraction": 0.99,
+          "dialect": "spark"
+        }
+      ],
+      "dependencies": [
+        {
+          "columns": [
+            "tier",
+            "balance"
+          ],
+          "method": "correlation_ratio",
+          "value": 0.64
+        },
+        {
+          "columns": [
+            "tier",
+            "is_active"
+          ],
+          "method": "cramers_v",
+          "value": 0.21
+        }
+      ]
+    }
+  ]
+}

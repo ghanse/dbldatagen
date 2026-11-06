@@ -1,0 +1,1367 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "dbldatagen profile spec 0.1.0. Generated from dbldatagen_profiler.model; do not edit.",
+  "$defs": {
+    "BooleanStats": {
+      "description": "Statistics for a boolean column.\n\nAttributes:\n    true_fraction: Fraction of non-null values that are true.",
+      "properties": {
+        "true_fraction": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "True Fraction",
+          "type": "number"
+        }
+      },
+      "required": [
+        "true_fraction"
+      ],
+      "title": "BooleanStats",
+      "type": "object"
+    },
+    "Cardinality": {
+      "description": "Bucket for the number of distinct non-null values in a column.\n\nBuckets are checked in this order: `unique` when every non-null value is\ndistinct, `constant` for exactly one distinct value, `low` for at most 100\ndistinct values, `high` when distinct values exceed 10% of non-null rows, and\n`medium` otherwise.",
+      "enum": [
+        "constant",
+        "low",
+        "medium",
+        "high",
+        "unique"
+      ],
+      "title": "Cardinality",
+      "type": "string"
+    },
+    "ColumnProfile": {
+      "description": "Profile of a single column, or of a field nested inside a complex column.\n\nNested types use `children`: a struct lists its fields, an array has one child\nnamed \"element\", and a map has two children named \"key\" and \"value\". Child\nstatistics are computed over all nested values, not over rows.\n\nAttributes:\n    name: Column or field name.\n    logical_type: Engine-neutral logical type.\n    source_type: Type name as reported by the source system, e.g. \"decimal(10,2)\".\n    nullable: Whether the schema allows nulls.\n    null_fraction: Fraction of values that are null.\n    precision: Total digits; required for `decimal` and absent otherwise.\n    scale: Digits after the decimal point; required for `decimal` and absent otherwise.\n    children: Nested field profiles; required for `struct`, `array`, and `map`, absent otherwise.\n    distinct_count: Optional number of distinct non-null values.\n    cardinality: Optional cardinality bucket.\n    numeric: Optional statistics for numeric types.\n    string: Optional statistics for `string`.\n    temporal: Optional statistics for `date`, `time`, `timestamp`, and `timestamp_ntz`.\n    boolean: Optional statistics for `boolean`.\n    collection_length: Optional distribution of entry counts for non-null `array` and `map` values.\n    value_count: Optional number of values, including nulls, that a nested column's statistics cover. Only valid\n        on nested columns; required on `array` and `map` children, and on their descendants, that carry\n        `patterns` or `top_values`. Struct fields without it inherit their parent's count.",
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "logical_type": {
+          "$ref": "#/$defs/LogicalType"
+        },
+        "source_type": {
+          "title": "Source Type",
+          "type": "string"
+        },
+        "nullable": {
+          "title": "Nullable",
+          "type": "boolean"
+        },
+        "null_fraction": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Null Fraction",
+          "type": "number"
+        },
+        "precision": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Precision"
+        },
+        "scale": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Scale"
+        },
+        "children": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ColumnProfile"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Children"
+        },
+        "distinct_count": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DistinctCount"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "cardinality": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Cardinality"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "numeric": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NumericStats"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "string": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StringStats"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "temporal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TemporalStats"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "boolean": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BooleanStats"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "collection_length": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LengthStats"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "value_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value Count"
+        }
+      },
+      "required": [
+        "name",
+        "logical_type",
+        "source_type",
+        "nullable",
+        "null_fraction"
+      ],
+      "title": "ColumnProfile",
+      "type": "object"
+    },
+    "ComparisonConstraint": {
+      "description": "Compares two columns of the same row, as `left <operator> right`.\n\nAttributes:\n    kind: Discriminator; always \"comparison\".\n    left: Left-hand column.\n    operator: Comparison operator.\n    right: Right-hand column.\n    satisfied_fraction: Fraction of rows that satisfy the constraint.",
+      "properties": {
+        "satisfied_fraction": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Satisfied Fraction",
+          "type": "number"
+        },
+        "kind": {
+          "const": "comparison",
+          "default": "comparison",
+          "title": "Kind",
+          "type": "string"
+        },
+        "left": {
+          "title": "Left",
+          "type": "string"
+        },
+        "operator": {
+          "enum": [
+            "<",
+            "<=",
+            "=",
+            "!=",
+            ">=",
+            ">"
+          ],
+          "title": "Operator",
+          "type": "string"
+        },
+        "right": {
+          "title": "Right",
+          "type": "string"
+        }
+      },
+      "required": [
+        "satisfied_fraction",
+        "left",
+        "operator",
+        "right"
+      ],
+      "title": "ComparisonConstraint",
+      "type": "object"
+    },
+    "DependenceMethod": {
+      "description": "Measure used to quantify the dependence between two columns.",
+      "enum": [
+        "pearson",
+        "spearman",
+        "cramers_v",
+        "correlation_ratio"
+      ],
+      "title": "DependenceMethod",
+      "type": "string"
+    },
+    "Dependency": {
+      "description": "Measured dependence between two columns of a table.\n\nAttributes:\n    columns: The two column names.\n    method: Dependence measure.\n    value: Measured value; in [-1, 1] for `pearson` and `spearman` and in [0, 1] otherwise.",
+      "properties": {
+        "columns": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Columns",
+          "type": "array"
+        },
+        "method": {
+          "$ref": "#/$defs/DependenceMethod"
+        },
+        "value": {
+          "title": "Value",
+          "type": "number"
+        }
+      },
+      "required": [
+        "columns",
+        "method",
+        "value"
+      ],
+      "title": "Dependency",
+      "type": "object"
+    },
+    "DistinctCount": {
+      "description": "Number of distinct non-null values in a column.\n\nAttributes:\n    value: Distinct value count.\n    exact: Whether the count is exact (true) or an approximation such as HyperLogLog (false).",
+      "properties": {
+        "value": {
+          "minimum": 0,
+          "title": "Value",
+          "type": "integer"
+        },
+        "exact": {
+          "title": "Exact",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "value",
+        "exact"
+      ],
+      "title": "DistinctCount",
+      "type": "object"
+    },
+    "EngineInfo": {
+      "description": "Engine that produced the profile.\n\nAttributes:\n    name: Engine name, e.g. \"pyspark\".\n    version: Engine version.",
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "version": {
+          "minLength": 1,
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "title": "EngineInfo",
+      "type": "object"
+    },
+    "EnumerationConstraint": {
+      "description": "Limits a column to a fixed set of values.\n\nAttributes:\n    kind: Discriminator; always \"enumeration\".\n    column: Constrained column.\n    values: Allowed values, encoded by the column's logical type.\n    min_value_count: Number of rows holding the least frequent listed value; must be at least\n        `privacy.min_value_count`.\n    satisfied_fraction: Fraction of rows that satisfy the constraint.",
+      "properties": {
+        "satisfied_fraction": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Satisfied Fraction",
+          "type": "number"
+        },
+        "kind": {
+          "const": "enumeration",
+          "default": "enumeration",
+          "title": "Kind",
+          "type": "string"
+        },
+        "column": {
+          "title": "Column",
+          "type": "string"
+        },
+        "values": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "minItems": 1,
+          "title": "Values",
+          "type": "array"
+        },
+        "min_value_count": {
+          "minimum": 0,
+          "title": "Min Value Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "satisfied_fraction",
+        "column",
+        "values",
+        "min_value_count"
+      ],
+      "title": "EnumerationConstraint",
+      "type": "object"
+    },
+    "ExpressionConstraint": {
+      "description": "Boolean SQL expression that rows satisfy.\n\nAttributes:\n    kind: Discriminator; always \"expression\".\n    expression: Boolean SQL expression over the table's columns.\n    dialect: SQL dialect of `expression` (default \"spark\").\n    satisfied_fraction: Fraction of rows that satisfy the constraint.",
+      "properties": {
+        "satisfied_fraction": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Satisfied Fraction",
+          "type": "number"
+        },
+        "kind": {
+          "const": "expression",
+          "default": "expression",
+          "title": "Kind",
+          "type": "string"
+        },
+        "expression": {
+          "minLength": 1,
+          "title": "Expression",
+          "type": "string"
+        },
+        "dialect": {
+          "default": "spark",
+          "title": "Dialect",
+          "type": "string"
+        }
+      },
+      "required": [
+        "satisfied_fraction",
+        "expression"
+      ],
+      "title": "ExpressionConstraint",
+      "type": "object"
+    },
+    "FanOutStats": {
+      "description": "Distribution of the number of child rows per parent key.\n\nEvery parent key counts, including keys with no child rows. Child rows whose\nkey matches no parent are left out; `Relationship.coverage` accounts for them.\nQuantile values are integer row counts.\n\nAttributes:\n    min: Fewest child rows for a parent key.\n    max: Most child rows for a parent key.\n    mean: Mean child rows per parent key.\n    stddev: Optional sample standard deviation.\n    quantiles: Optional list of quantiles.",
+      "properties": {
+        "min": {
+          "minimum": 0,
+          "title": "Min",
+          "type": "integer"
+        },
+        "max": {
+          "minimum": 0,
+          "title": "Max",
+          "type": "integer"
+        },
+        "mean": {
+          "minimum": 0.0,
+          "title": "Mean",
+          "type": "number"
+        },
+        "stddev": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stddev"
+        },
+        "quantiles": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Quantile"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Quantiles"
+        }
+      },
+      "required": [
+        "min",
+        "max",
+        "mean"
+      ],
+      "title": "FanOutStats",
+      "type": "object"
+    },
+    "Histogram": {
+      "description": "Histogram over the non-null values of a numeric column.\n\nBin `i` holds values in `[edges[i], edges[i + 1])`; the last bin also holds\n`edges[-1]`. The edges span every profiled value, so no value falls outside\nthe bins and the counts add up to the number of non-null values profiled.\n\nAttributes:\n    edges: Non-decreasing bin edges, encoded by the column's logical type; one more than the number of bins.\n    counts: Number of values in each bin.\n    sampled: Whether the counts come from a sample rather than every row (default false).\n    generalized_outer_edges: Whether the first and last edges were rounded or widened rather than being the exact\n        data extremes (default false). Must be true when `privacy.extremes` is \"suppressed\".",
+      "properties": {
+        "edges": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "minItems": 2,
+          "title": "Edges",
+          "type": "array"
+        },
+        "counts": {
+          "items": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "title": "Counts",
+          "type": "array"
+        },
+        "sampled": {
+          "default": false,
+          "title": "Sampled",
+          "type": "boolean"
+        },
+        "generalized_outer_edges": {
+          "default": false,
+          "title": "Generalized Outer Edges",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "edges",
+        "counts"
+      ],
+      "title": "Histogram",
+      "type": "object"
+    },
+    "KeyCandidate": {
+      "description": "Set of columns that is likely unique across the table.\n\nAttributes:\n    columns: Distinct column names that form the key, in order.\n    confidence: Confidence that the columns form a key, in [0, 1].",
+      "properties": {
+        "columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Columns",
+          "type": "array"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        }
+      },
+      "required": [
+        "columns",
+        "confidence"
+      ],
+      "title": "KeyCandidate",
+      "type": "object"
+    },
+    "LengthStats": {
+      "description": "Distribution of lengths: characters for strings, entries for arrays and maps.\n\nAttributes:\n    min: Optional shortest length.\n    max: Optional longest length.\n    mean: Optional mean length.\n    stddev: Optional sample standard deviation of the length.\n    quantiles: Optional list of length quantiles.",
+      "properties": {
+        "min": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min"
+        },
+        "max": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max"
+        },
+        "mean": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mean"
+        },
+        "stddev": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stddev"
+        },
+        "quantiles": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Quantile"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Quantiles"
+        }
+      },
+      "title": "LengthStats",
+      "type": "object"
+    },
+    "LogicalType": {
+      "description": "Engine-neutral logical column type covering the Spark and Arrow type families.",
+      "enum": [
+        "null",
+        "boolean",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "float32",
+        "float64",
+        "decimal",
+        "string",
+        "binary",
+        "date",
+        "time",
+        "timestamp",
+        "timestamp_ntz",
+        "interval",
+        "struct",
+        "array",
+        "map",
+        "variant"
+      ],
+      "title": "LogicalType",
+      "type": "string"
+    },
+    "NumericStats": {
+      "description": "Distribution statistics for an integer, floating-point, or decimal column.\n\nAttributes:\n    min: Optional smallest value, encoded by the column's logical type.\n    max: Optional largest value, encoded by the column's logical type.\n    mean: Optional arithmetic mean, as an approximate JSON number.\n    stddev: Optional sample standard deviation, as an approximate JSON number.\n    quantiles: Optional list of quantiles.\n    histogram: Optional histogram.",
+      "properties": {
+        "min": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min"
+        },
+        "max": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max"
+        },
+        "mean": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mean"
+        },
+        "stddev": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stddev"
+        },
+        "quantiles": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Quantile"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Quantiles"
+        },
+        "histogram": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Histogram"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "NumericStats",
+      "type": "object"
+    },
+    "Pattern": {
+      "description": "Regular expression that matches part of a string column.\n\nAttributes:\n    regex: Regular expression that a matching value satisfies in full.\n    coverage: Fraction of non-null values that match the expression; must cover at least\n        `privacy.min_value_count` rows.",
+      "properties": {
+        "regex": {
+          "title": "Regex",
+          "type": "string"
+        },
+        "coverage": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Coverage",
+          "type": "number"
+        }
+      },
+      "required": [
+        "regex",
+        "coverage"
+      ],
+      "title": "Pattern",
+      "type": "object"
+    },
+    "PrivacyPolicy": {
+      "description": "Privacy policy that the producer applied when writing the profile.\n\nAttributes:\n    min_value_count: Fewest rows a literal value must occur in before it may appear in `top_values` or an\n        enumeration constraint, and fewest rows a string pattern must match (default 10). Literals embedded in\n        regexes are checked by the benchmark's privacy guard, not by this model.\n    extremes: Treatment of data extremes (default \"exact\"). When \"suppressed\", numeric and temporal `min` and\n        `max`, quantiles at q=0 and q=1, and range constraint bounds may not appear, and histograms must set\n        `generalized_outer_edges`.\n    enumerations: Treatment of `top_values` and enumeration constraints (default \"exact\"). When \"suppressed\",\n        none of them may appear.\n    allow_expression_constraints: Whether SQL expression constraints, which may embed literal values, may\n        appear (default false).",
+      "properties": {
+        "min_value_count": {
+          "default": 10,
+          "minimum": 1,
+          "title": "Min Value Count",
+          "type": "integer"
+        },
+        "extremes": {
+          "$ref": "#/$defs/ValueTreatment",
+          "default": "exact"
+        },
+        "enumerations": {
+          "$ref": "#/$defs/ValueTreatment",
+          "default": "exact"
+        },
+        "allow_expression_constraints": {
+          "default": false,
+          "title": "Allow Expression Constraints",
+          "type": "boolean"
+        }
+      },
+      "title": "PrivacyPolicy",
+      "type": "object"
+    },
+    "Quantile": {
+      "description": "Value at a given quantile of the non-null values.\n\nAttributes:\n    q: Quantile in [0, 1], e.g. 0.5 for the median.\n    value: Value at the quantile, encoded by the column's logical type.",
+      "properties": {
+        "q": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Q",
+          "type": "number"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Value"
+        }
+      },
+      "required": [
+        "q",
+        "value"
+      ],
+      "title": "Quantile",
+      "type": "object"
+    },
+    "RangeConstraint": {
+      "description": "Bounds a column's values to an inclusive range.\n\nAttributes:\n    kind: Discriminator; always \"range\".\n    column: Constrained column.\n    min: Optional inclusive lower bound, encoded by the column's logical type.\n    max: Optional inclusive upper bound, encoded by the column's logical type.\n    satisfied_fraction: Fraction of rows that satisfy the constraint.",
+      "properties": {
+        "satisfied_fraction": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Satisfied Fraction",
+          "type": "number"
+        },
+        "kind": {
+          "const": "range",
+          "default": "range",
+          "title": "Kind",
+          "type": "string"
+        },
+        "column": {
+          "title": "Column",
+          "type": "string"
+        },
+        "min": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min"
+        },
+        "max": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max"
+        }
+      },
+      "required": [
+        "satisfied_fraction",
+        "column"
+      ],
+      "title": "RangeConstraint",
+      "type": "object"
+    },
+    "Relationship": {
+      "description": "Foreign key from child columns to parent key columns.\n\nAttributes:\n    child_table: Table that holds the foreign key.\n    child_columns: Foreign key columns, in order.\n    parent_table: Referenced table.\n    parent_columns: Referenced key columns, matched to `child_columns` by position.\n    coverage: Fraction of non-null child keys that match a parent key.\n    confidence: Optional confidence that the relationship is a true foreign key, in [0, 1].\n    fan_out: Optional distribution of child rows per parent key.",
+      "properties": {
+        "child_table": {
+          "title": "Child Table",
+          "type": "string"
+        },
+        "child_columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Child Columns",
+          "type": "array"
+        },
+        "parent_table": {
+          "title": "Parent Table",
+          "type": "string"
+        },
+        "parent_columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Parent Columns",
+          "type": "array"
+        },
+        "coverage": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Coverage",
+          "type": "number"
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Confidence"
+        },
+        "fan_out": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FanOutStats"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "child_table",
+        "child_columns",
+        "parent_table",
+        "parent_columns",
+        "coverage"
+      ],
+      "title": "Relationship",
+      "type": "object"
+    },
+    "SamplingInfo": {
+      "description": "How rows were sampled before profiling.\n\nAttributes:\n    fraction: Optional fraction of rows sampled.\n    max_rows: Optional cap on the number of rows sampled.\n    seed: Optional random seed.",
+      "properties": {
+        "fraction": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fraction"
+        },
+        "max_rows": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Rows"
+        },
+        "seed": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Seed"
+        }
+      },
+      "title": "SamplingInfo",
+      "type": "object"
+    },
+    "SourceInfo": {
+      "description": "Metadata about the profiled source. Holds no data values.\n\nAttributes:\n    name: Optional dataset name.\n    format: Optional storage format, e.g. \"delta\" or \"parquet\".\n    location: Optional path, URI, or catalog name of the source.\n    sampling: Optional sampling applied before profiling.",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "format": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Format"
+        },
+        "location": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Location"
+        },
+        "sampling": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SamplingInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "SourceInfo",
+      "type": "object"
+    },
+    "StringStats": {
+      "description": "Statistics for a string column.\n\nAttributes:\n    length: Optional distribution of value lengths.\n    patterns: Optional regular expressions with the fraction of values each one matches.\n    top_values: Optional most frequent values; each value must occur in at\n        least `privacy.min_value_count` rows.",
+      "properties": {
+        "length": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LengthStats"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "patterns": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Pattern"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Patterns"
+        },
+        "top_values": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ValueFrequency"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Top Values"
+        }
+      },
+      "title": "StringStats",
+      "type": "object"
+    },
+    "TableProfile": {
+      "description": "Profile of a single table.\n\nAttributes:\n    name: Table name, unique within the profile.\n    row_count: Number of rows profiled.\n    columns: Top-level column profiles, in schema order; at least one.\n    primary_key: Optional best primary key candidate.\n    unique_keys: Optional other unique key candidates.\n    check_constraints: Optional row-level constraints found in the data.\n    dependencies: Optional pairwise dependence measures between columns.",
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "row_count": {
+          "minimum": 0,
+          "title": "Row Count",
+          "type": "integer"
+        },
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/ColumnProfile"
+          },
+          "minItems": 1,
+          "title": "Columns",
+          "type": "array"
+        },
+        "primary_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeyCandidate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "unique_keys": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/KeyCandidate"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unique Keys"
+        },
+        "check_constraints": {
+          "anyOf": [
+            {
+              "items": {
+                "discriminator": {
+                  "mapping": {
+                    "comparison": "#/$defs/ComparisonConstraint",
+                    "enumeration": "#/$defs/EnumerationConstraint",
+                    "expression": "#/$defs/ExpressionConstraint",
+                    "range": "#/$defs/RangeConstraint"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/RangeConstraint"
+                  },
+                  {
+                    "$ref": "#/$defs/EnumerationConstraint"
+                  },
+                  {
+                    "$ref": "#/$defs/ComparisonConstraint"
+                  },
+                  {
+                    "$ref": "#/$defs/ExpressionConstraint"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Check Constraints"
+        },
+        "dependencies": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Dependency"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dependencies"
+        }
+      },
+      "required": [
+        "name",
+        "row_count",
+        "columns"
+      ],
+      "title": "TableProfile",
+      "type": "object"
+    },
+    "TemporalStats": {
+      "description": "Statistics for a date, time, or timestamp column.\n\nValues are ISO-8601 strings: `YYYY-MM-DD` for `date`, `HH:MM:SS[.f]` for\n`time`, `YYYY-MM-DDTHH:MM:SS[.f]` followed by `Z` or `+HH:MM` for\n`timestamp`, and the same without an offset for `timestamp_ntz`. Fractions\nhave up to nine digits.\n\nAttributes:\n    min: Optional earliest value.\n    max: Optional latest value.\n    quantiles: Optional list of quantiles.",
+      "properties": {
+        "min": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min"
+        },
+        "max": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max"
+        },
+        "quantiles": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Quantile"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Quantiles"
+        }
+      },
+      "title": "TemporalStats",
+      "type": "object"
+    },
+    "ValueFrequency": {
+      "description": "Frequent value and its share of the column.\n\nAttributes:\n    value: The value.\n    frequency: Fraction of non-null values equal to `value`.",
+      "properties": {
+        "value": {
+          "title": "Value",
+          "type": "string"
+        },
+        "frequency": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Frequency",
+          "type": "number"
+        }
+      },
+      "required": [
+        "value",
+        "frequency"
+      ],
+      "title": "ValueFrequency",
+      "type": "object"
+    },
+    "ValueTreatment": {
+      "description": "How a producer handled a class of raw values.",
+      "enum": [
+        "exact",
+        "generalized",
+        "suppressed"
+      ],
+      "title": "ValueTreatment",
+      "type": "string"
+    }
+  },
+  "description": "Profile of one or more tables and the relationships between them.\n\nAttributes:\n    spec_version: Version of this spec that the profile follows, as \"major.minor.patch\". The major version must\n        match the reader's.\n    created_at: Time the profile was created, with a UTC offset.\n    engine: Engine that produced the profile.\n    privacy: Privacy policy the producer applied (default: the `PrivacyPolicy` defaults).\n    source: Optional metadata about the profiled source.\n    tables: Table profiles.\n    relationships: Optional foreign key relationships between tables.",
+  "properties": {
+    "spec_version": {
+      "pattern": "^0\\.\\d+\\.\\d+$",
+      "title": "Spec Version",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "engine": {
+      "$ref": "#/$defs/EngineInfo"
+    },
+    "privacy": {
+      "$ref": "#/$defs/PrivacyPolicy"
+    },
+    "source": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SourceInfo"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "tables": {
+      "items": {
+        "$ref": "#/$defs/TableProfile"
+      },
+      "minItems": 1,
+      "title": "Tables",
+      "type": "array"
+    },
+    "relationships": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/Relationship"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Relationships"
+    }
+  },
+  "required": [
+    "spec_version",
+    "created_at",
+    "engine",
+    "tables"
+  ],
+  "title": "Profile",
+  "type": "object"
+}
