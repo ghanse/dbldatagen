@@ -1,8 +1,8 @@
 # dbldatagen-profiler-bench
 
 Benchmark harness for `dbldatagen-profiler`. It is a separate distribution and a member of the repository's uv
-workspace. This first part is the **dataset catalog**: synthetic datasets with planted, declared ground truth. The
-sampler, fidelity metrics, runner, and evaluator described in `profiler/PLAN.md` will live here as well.
+workspace. It holds the **dataset catalog**, the **reference sampler**, the **RSI runner / evaluator**, and (once
+merged) the fidelity metrics described in `profiler/PLAN.md`.
 
 ## The catalog
 
@@ -220,6 +220,38 @@ than failing the sample.
 
 The reference sampler is designed for benchmark tiers up to `s` (about 100,000 rows and the catalog's roughly
 200-column wide table). Tier `m` measures profiler speed and is not a supported fidelity-sampling workload.
+
+## RSI runner and evaluator
+
+`profiler_bench.runner` compares a frozen **baseline** profiler build with a **candidate** build under a frozen
+harness. Each build is a git worktree plus commit; the worker imports `profiler/src` from that worktree via
+`PYTHONPATH` in a **fresh subprocess**. Speed samples time `profile_tables` (driver wall, process CPU, peak RSS)
+after an untimed warmup, rotate baseline/candidate order across cases, and record profile hashes. Fidelity samples
+take one profile per build/dataset at the fidelity tier and score it with a `Scorer` for K **paired** sampler seeds.
+`--control` runs the baseline against itself. Fidelity metrics are not on this branch yet; inject a `Scorer`
+(tests use `FakeScorer`). `try_real_scorer()` wires to sampler + fidelity when both import.
+
+`profiler_bench.evaluate` applies `profiler-bench/policies/default.json`. The accuracy mean estimand is the equally
+weighted mean across datasets of each dataset's mean paired-seed difference; its CI uses a **stratified bootstrap**
+that resamples seeds within each dataset (datasets are fixed strata). A hierarchical bootstrap that also resamples
+datasets is a documented alternative and is not used. Per-dataset regression gates keep a within-dataset bootstrap.
+Each gate reports a two-sided 95% percentile interval with **no family-wise guarantee** across gates. Privacy is a
+hard guard (not policy-disableable). Completeness is checked against the expected matrix from `run.json`. Control runs
+and identical `profiler_src_hash` builds can never be `accepted`. Results land in `profiler/rsi/experiments/<id>/` as
+`run.json`, `samples/*.json`, `summary.json`, `verdict.json`, `REPORT.md`, and `benchmark_entry.json` (shaped for
+`rsi_log.py append` kind `benchmark`).
+
+```bash
+uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi run \
+  --baseline /path/to/baseline --candidate /path/to/candidate \
+  --policy profiler-bench/policies/default.json --experiment-id demo [--datasets retail numeric] [--control]
+uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi evaluate \
+  profiler/rsi/experiments/demo
+```
+
+**Measured:** driver wall / CPU / peak RSS for `profile_tables`; profile content hash; paired reconstruction,
+structure, and privacy scores. **Not measured:** Spark JVM/executor RSS, GPU time, network/disk IO, cluster-scale
+Spark, and end-to-end dbldatagen generation from the profile (see `not_measured` in the policy and each `REPORT.md`).
 
 ## Development
 

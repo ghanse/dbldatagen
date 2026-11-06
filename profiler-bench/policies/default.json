@@ -1,0 +1,50 @@
+{
+  "version": "1.0.0",
+  "bootstrap": {
+    "samples": 2000,
+    "seed": 0,
+    "confidence": 0.95
+  },
+  "speed_samples": {
+    "xs": 2,
+    "s": 5,
+    "m": 5
+  },
+  "fidelity_seeds": 5,
+  "fidelity_tier": "s",
+  "speed_tiers": ["s", "m"],
+  "dataset_seed": 0,
+  "accuracy": {
+    "min_mean_improvement": 0.005,
+    "ci_lower_must_exceed": 0.0,
+    "max_dataset_regression": 0.01,
+    "max_structure_regression": 0.02
+  },
+  "speed": {
+    "min_target_improvement": 0.05,
+    "max_wall_regression": 0.10,
+    "max_cpu_regression": 0.10,
+    "max_rss_regression_frac": 0.05,
+    "max_rss_regression_abs_mib": 64.0
+  },
+  "privacy": {
+    "hard_guard": true,
+    "note": "Privacy cannot be disabled; every candidate dataset x seed must set privacy_passed=true."
+  },
+  "spark": {
+    "master": "local[2]",
+    "configs": {
+      "spark.sql.shuffle.partitions": "2",
+      "spark.sql.session.timeZone": "UTC",
+      "spark.ui.enabled": "false",
+      "spark.driver.memory": "2g"
+    }
+  },
+  "not_measured": [
+    "Spark executor / JVM heap and RSS (driver process RSS only)",
+    "GPU / accelerator time",
+    "network and disk IO bytes",
+    "cluster-scale Spark (local[*] only)",
+    "end-to-end dbldatagen generation from the profile"
+  ]
+}

@@ -84,7 +84,8 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P1.3 | Dataset catalog: synthetic datasets with known ground truth (relational PK/FK model, skew, correlated columns, regex-shaped strings, check constraints, nested types, wide/tall), deterministic seeds, scale tiers | P1.1 | merged (PR #8) |
 | P1.4 | Reference sampler (profile -> PySpark DataFrames, multi-table, respects keys) | P1.1 | merged (PR #9) |
 | P1.5 | Fidelity metrics: marginals (KS / Wasserstein / TVD), cardinality error, pattern match rate, pairwise dependence error, constraint satisfaction, referential integrity, discriminator AUC, privacy guard (exact-row copy rate, distance to closest record) | P1.1 | review (PR #10, stacked on #8) |
-| P1.6 | Runner + evaluator: fresh-process samples, wall/CPU/RSS, paired bootstrap gate, policy JSON, results layout, noise control (same build vs itself) | P1.3–P1.5 | in-progress (codes against Scorer protocol; wiring after P1.4/P1.5 merge) |
+| P1.6 | Runner + evaluator: fresh-process samples, wall/CPU/RSS, paired bootstrap gate, policy JSON, results layout, noise control (same build vs itself) | P1.3–P1.5 | merged (PR #12); real Scorer wiring after P1.5 (P1.6a) |
+| P1.6a | Wire the runner to the real sampler + fidelity Scorer; end-to-end control run on tier xs | P1.5, P1.6 | todo |
 | P1.7 | RSI log tooling: append-only `log.jsonl` writer/validator + `LOG.md` renderer; `rsi/RSI.md` | P1.1 | merged (PR #4) |
 | P1.7a | Fix: `rsi_log.py append --kind` flag is dropped; add CLI-flag tests | P1.7 | merged (PR #5) |
 | P1.8 | Baseline run: freeze the harness, record the baseline + ceiling for every dataset | P1.2–P1.7 | todo |
