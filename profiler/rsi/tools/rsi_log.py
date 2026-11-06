@@ -10,6 +10,8 @@ import json
 import os
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -85,7 +87,7 @@ def _nonempty_string(entry: dict[str, Any], field: str, line_number: int) -> Non
         raise LogError(f"line {line_number}: {field} must be a non-empty string")
 
 
-def _validate_entry(entry: dict[str, Any], line_number: int) -> None:
+def _validate_common_fields(entry: dict[str, Any], line_number: int) -> None:
     missing_common = COMMON_FIELDS - entry.keys()
     if line_number == 1 and entry.get("seq") == 1:
         missing_common -= {"prev_hash"}
@@ -93,80 +95,158 @@ def _validate_entry(entry: dict[str, Any], line_number: int) -> None:
         raise LogError(f"line {line_number}: missing fields: {', '.join(sorted(missing_common))}")
     if type(entry.get("seq")) is not int or entry["seq"] < 1:
         raise LogError(f"line {line_number}: seq must be a positive integer")
-    kind = entry.get("kind")
-    if kind not in KIND_FIELDS:
-        raise LogError(f"line {line_number}: unknown kind: {kind!r}")
     for field in ("ts", "actor", "work_item", "summary"):
         _nonempty_string(entry, field, line_number)
+
+
+def _validate_timestamp(entry: dict[str, Any], line_number: int) -> None:
     try:
         parsed_ts = datetime.fromisoformat(entry["ts"].replace("Z", "+00:00"))
     except ValueError as error:
         raise LogError(f"line {line_number}: ts must be an ISO 8601 timestamp") from error
     if parsed_ts.tzinfo is None or parsed_ts.utcoffset() != timezone.utc.utcoffset(parsed_ts):
         raise LogError(f"line {line_number}: ts must be UTC")
+
+
+def _validate_kind(entry: dict[str, Any], line_number: int) -> str:
+    kind = entry.get("kind")
+    if kind not in KIND_FIELDS:
+        raise LogError(f"line {line_number}: unknown kind: {kind!r}")
+    return kind
+
+
+def _validate_kind_fields(entry: dict[str, Any], kind: str, line_number: int) -> None:
     required = KIND_FIELDS[kind]
     missing = required - entry.keys()
     if missing:
         raise LogError(f"line {line_number}: missing fields for {kind}: {', '.join(sorted(missing))}")
     for field in required - JSON_FIELDS:
         _nonempty_string(entry, field, line_number)
+
+
+def _validate_verdict(entry: dict[str, Any], kind: str, line_number: int) -> None:
     if kind in VERDICTS and entry["verdict"] not in VERDICTS[kind]:
         choices = ", ".join(sorted(VERDICTS[kind]))
         raise LogError(f"line {line_number}: {kind} verdict must be one of: {choices}")
-    if kind == "proposal" and not isinstance(entry["targets"], (list, dict)):
+
+
+def _validate_proposal_fields(entry: dict[str, Any], line_number: int) -> None:
+    if not isinstance(entry["targets"], (list, dict)):
         raise LogError(f"line {line_number}: targets must be a JSON array or object")
-    if kind == "proposal" and not isinstance(entry["invariants"], list):
+    if not isinstance(entry["invariants"], list):
         raise LogError(f"line {line_number}: invariants must be a JSON array")
-    if kind == "benchmark" and not isinstance(entry["summary_metrics"], dict):
+
+
+def _validate_benchmark_fields(entry: dict[str, Any], line_number: int) -> None:
+    if not isinstance(entry["summary_metrics"], dict):
         raise LogError(f"line {line_number}: summary_metrics must be a JSON object")
-    if kind == "review" and not isinstance(entry["blocking_issues"], list):
+
+
+def _validate_review_fields(entry: dict[str, Any], line_number: int) -> None:
+    if not isinstance(entry["blocking_issues"], list):
         raise LogError(f"line {line_number}: blocking_issues must be a JSON array")
+
+
+KIND_VALIDATORS = {
+    "proposal": _validate_proposal_fields,
+    "benchmark": _validate_benchmark_fields,
+    "review": _validate_review_fields,
+}
+
+
+def _validate_entry(entry: dict[str, Any], line_number: int) -> None:
+    _validate_common_fields(entry, line_number)
+    kind = _validate_kind(entry, line_number)
+    _validate_timestamp(entry, line_number)
+    _validate_kind_fields(entry, kind, line_number)
+    _validate_verdict(entry, kind, line_number)
+    validator = KIND_VALIDATORS.get(kind)
+    if validator is not None:
+        validator(entry, line_number)
+
+
+@dataclass
+class _ReferenceState:
+    proposals: set[str] = dataclass_field(default_factory=set)
+    triage_verdicts: dict[str, str] = dataclass_field(default_factory=dict)
+    implementations: set[str] = dataclass_field(default_factory=set)
+    benchmarks: set[str] = dataclass_field(default_factory=set)
+
+
+def _record_proposal(entry: dict[str, Any], line_number: int, state: _ReferenceState) -> None:
+    proposal_id = entry["proposal_id"]
+    if proposal_id in state.proposals:
+        raise LogError(f"line {line_number}: duplicate proposal_id {proposal_id}")
+    state.proposals.add(proposal_id)
+
+
+def _record_triage(entry: dict[str, Any], line_number: int, state: _ReferenceState) -> None:
+    proposal_id = entry["proposal_id"]
+    if proposal_id not in state.proposals:
+        raise LogError(f"line {line_number}: triage requires a prior proposal")
+    state.triage_verdicts[proposal_id] = entry["verdict"]
+
+
+def _record_implementation(entry: dict[str, Any], line_number: int, state: _ReferenceState) -> None:
+    proposal_id = entry["proposal_id"]
+    if state.triage_verdicts.get(proposal_id) != "accepted":
+        raise LogError(f"line {line_number}: implementation requires a prior accepted triage")
+    state.implementations.add(proposal_id)
+
+
+def _record_benchmark(entry: dict[str, Any], line_number: int, state: _ReferenceState) -> None:
+    proposal_id = entry["proposal_id"]
+    if proposal_id not in state.implementations:
+        raise LogError(f"line {line_number}: benchmark requires a prior implementation")
+    state.benchmarks.add(proposal_id)
+
+
+def _validate_disposition_reference(entry: dict[str, Any], line_number: int, state: _ReferenceState) -> None:
+    if entry["proposal_id"] not in state.benchmarks:
+        raise LogError(f"line {line_number}: disposition requires a prior benchmark")
+
+
+def _validate_review_references(entry: dict[str, Any], line_number: int, state: _ReferenceState) -> None:
+    proposal_id = entry["proposal_id"]
+    if proposal_id not in state.proposals:
+        raise LogError(f"line {line_number}: review requires a prior proposal")
+    if proposal_id not in state.implementations:
+        raise LogError(f"line {line_number}: review requires a prior implementation")
+
+
+REFERENCE_VALIDATORS = {
+    "proposal": _record_proposal,
+    "triage": _record_triage,
+    "implementation": _record_implementation,
+    "benchmark": _record_benchmark,
+    "disposition": _validate_disposition_reference,
+    "review": _validate_review_references,
+}
+
+
+def _validate_chain_entry(entry: dict[str, Any], lines: list[bytes], index: int) -> None:
+    line_number = index + 1
+    if entry["seq"] != line_number:
+        raise LogError(f"line {line_number}: expected seq {line_number}, found {entry['seq']}")
+    if index == 0:
+        if entry.get("prev_hash") is not None:
+            raise LogError("line 1: genesis prev_hash must be null or absent")
+        return
+    expected_hash = hashlib.sha256(lines[index - 1]).hexdigest()
+    if entry.get("prev_hash") != expected_hash:
+        raise LogError(f"line {line_number}: prev_hash does not match line {line_number - 1}")
 
 
 def validate(entries: list[dict[str, Any]], lines: list[bytes]) -> None:
     """Validates entry schemas, ordering, hashes, and references."""
-    proposals: set[str] = set()
-    triage_verdicts: dict[str, str] = {}
-    implementations: set[str] = set()
-    benchmarks: set[str] = set()
+    state = _ReferenceState()
     for index, entry in enumerate(entries):
         line_number = index + 1
         _validate_entry(entry, line_number)
-        expected_seq = line_number
-        if entry["seq"] != expected_seq:
-            raise LogError(f"line {line_number}: expected seq {expected_seq}, found {entry['seq']}")
-        if index == 0:
-            if entry.get("prev_hash") is not None:
-                raise LogError("line 1: genesis prev_hash must be null or absent")
-        else:
-            expected_hash = hashlib.sha256(lines[index - 1]).hexdigest()
-            if entry.get("prev_hash") != expected_hash:
-                raise LogError(f"line {line_number}: prev_hash does not match line {line_number - 1}")
-        kind = entry["kind"]
-        proposal_id = entry.get("proposal_id")
-        if kind == "proposal":
-            if proposal_id in proposals:
-                raise LogError(f"line {line_number}: duplicate proposal_id {proposal_id}")
-            proposals.add(proposal_id)
-        elif kind == "triage":
-            if proposal_id not in proposals:
-                raise LogError(f"line {line_number}: triage requires a prior proposal")
-            triage_verdicts[proposal_id] = entry["verdict"]
-        elif kind == "implementation":
-            if triage_verdicts.get(proposal_id) != "accepted":
-                raise LogError(f"line {line_number}: implementation requires a prior accepted triage")
-            implementations.add(proposal_id)
-        elif kind == "benchmark":
-            if proposal_id not in implementations:
-                raise LogError(f"line {line_number}: benchmark requires a prior implementation")
-            benchmarks.add(proposal_id)
-        elif kind == "disposition" and proposal_id not in benchmarks:
-            raise LogError(f"line {line_number}: disposition requires a prior benchmark")
-        elif kind == "review":
-            if proposal_id not in proposals:
-                raise LogError(f"line {line_number}: review requires a prior proposal")
-            if proposal_id not in implementations:
-                raise LogError(f"line {line_number}: review requires a prior implementation")
+        _validate_chain_entry(entry, lines, index)
+        validator = REFERENCE_VALIDATORS.get(entry["kind"])
+        if validator is not None:
+            validator(entry, line_number, state)
 
 
 def verify(path: Path) -> list[dict[str, Any]]:

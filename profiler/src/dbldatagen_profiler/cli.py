@@ -1,8 +1,7 @@
 """Command-line interface for the dbldatagen profiler.
 
-Provides the `dbldatagen-profile` command with `validate` and `schema`
-subcommands. The `profile` subcommand is reserved for the profiling engine and
-is not implemented yet.
+Provides commands for profiling datasets, validating profiles, and rendering
+the profile JSON Schema.
 """
 
 from __future__ import annotations
@@ -10,9 +9,10 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from importlib import import_module
 from pathlib import Path
 
-from dbldatagen_profiler.model import load_profile, render_json_schema
+from dbldatagen_profiler.model import SourceInfo, dump_profile, load_profile, render_json_schema
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -22,7 +22,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Optional command-line arguments (default `sys.argv[1:]`).
 
     Returns:
-        Process exit code: 0 on success, 1 for an invalid profile, 2 for usage errors and unimplemented commands.
+        Process exit code: 0 on success, 1 for an invalid profile or profiling failure, and 2 for usage errors.
     """
     args = _build_parser().parse_args(argv)
     return int(args.handler(args))
@@ -42,7 +42,16 @@ def _build_parser() -> argparse.ArgumentParser:
     schema.add_argument("-o", "--output", type=Path, help="Write the schema to this file instead of stdout.")
     schema.set_defaults(handler=_schema)
 
-    profile = commands.add_parser("profile", help="Profile a dataset (not implemented yet).")
+    profile = commands.add_parser("profile", help="Profile one or more datasets with local Spark.")
+    profile.add_argument(
+        "--table",
+        action="append",
+        required=True,
+        metavar="NAME=PATH",
+        help="Named input table; repeat for multiple tables.",
+    )
+    profile.add_argument("--format", choices=("parquet", "csv", "delta"), default="parquet", help="Input format.")
+    profile.add_argument("-o", "--output", type=Path, required=True, help="Output profile JSON file.")
     profile.set_defaults(handler=_profile)
     return parser
 
@@ -72,6 +81,36 @@ def _schema(args: argparse.Namespace) -> int:
 
 
 def _profile(args: argparse.Namespace) -> int:
-    """Reports that profiling is not implemented yet."""
-    print("dbldatagen-profile profile: not implemented yet", file=sys.stderr)
-    return 2
+    """Profiles the input tables and writes a validated JSON profile."""
+    spark_errors = import_module("pyspark.errors")
+    py4j_errors = import_module("py4j.protocol")
+    try:
+        parsed = [_parse_table(value) for value in args.table]
+        inputs = dict(parsed)
+        if len(inputs) != len(parsed):
+            raise ValueError("duplicate table name")
+        SparkSession = import_module("pyspark.sql").SparkSession
+        profile_tables = import_module("dbldatagen_profiler.engines.spark").profile_tables
+        spark = (
+            SparkSession.builder.master("local[*]")
+            .appName("dbldatagen-profiler")
+            .config("spark.sql.session.timeZone", "UTC")
+            .getOrCreate()
+        )
+        tables = {name: spark.read.format(args.format).load(path) for name, path in inputs.items()}
+        profile = profile_tables(tables)
+        profile.source = SourceInfo(name=", ".join(inputs), format=args.format)
+        load_profile(profile.model_dump(mode="json"), strict=True)
+        args.output.write_text(dump_profile(profile) + "\n", encoding="utf-8")
+    except (OSError, ValueError, spark_errors.PySparkException, py4j_errors.Py4JError) as error:
+        print(f"dbldatagen-profile profile: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _parse_table(value: str) -> tuple[str, str]:
+    """Parses one `NAME=PATH` table argument."""
+    name, separator, path = value.partition("=")
+    if not separator or not name or not path:
+        raise ValueError(f"invalid --table {value!r}; expected NAME=PATH")
+    return name, path
