@@ -130,10 +130,15 @@ take one profile per build/dataset at the fidelity tier and score it with a `Sco
 `--control` runs the baseline against itself. Fidelity metrics are not on this branch yet; inject a `Scorer`
 (tests use `FakeScorer`). `try_real_scorer()` wires to sampler + fidelity when both import.
 
-`profiler_bench.evaluate` applies `profiler-bench/policies/default.json`: paired bootstrap CIs (default B=2000),
-accuracy-then-speed gates, and a hard privacy guard. Failed or missing samples block acceptance; a crossing interval
-is `inconclusive`. Results land in `profiler/rsi/experiments/<id>/` as `run.json`, `samples/*.json`, `summary.json`,
-`verdict.json`, `REPORT.md`, and `benchmark_entry.json` (shaped for `rsi_log.py append` kind `benchmark`).
+`profiler_bench.evaluate` applies `profiler-bench/policies/default.json`. The accuracy mean estimand is the equally
+weighted mean across datasets of each dataset's mean paired-seed difference; its CI uses a **stratified bootstrap**
+that resamples seeds within each dataset (datasets are fixed strata). A hierarchical bootstrap that also resamples
+datasets is a documented alternative and is not used. Per-dataset regression gates keep a within-dataset bootstrap.
+Each gate reports a two-sided 95% percentile interval with **no family-wise guarantee** across gates. Privacy is a
+hard guard (not policy-disableable). Completeness is checked against the expected matrix from `run.json`. Control runs
+and identical `profiler_src_hash` builds can never be `accepted`. Results land in `profiler/rsi/experiments/<id>/` as
+`run.json`, `samples/*.json`, `summary.json`, `verdict.json`, `REPORT.md`, and `benchmark_entry.json` (shaped for
+`rsi_log.py append` kind `benchmark`).
 
 ```bash
 uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi run \

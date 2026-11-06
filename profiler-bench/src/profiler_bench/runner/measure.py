@@ -128,6 +128,7 @@ def _one_sample(
         "jvm_rss_bytes": payload.get("jvm_rss_bytes"),
         "profile_hash": payload.get("profile_hash"),
         "profile": payload.get("profile"),
+        "profiler_module_file": payload.get("profiler_module_file"),
         "error": payload.get("error"),
         "returncode": completed.returncode,
         "not_measured": payload.get("not_measured", policy.get("not_measured", [])),

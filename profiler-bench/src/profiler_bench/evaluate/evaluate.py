@@ -25,6 +25,7 @@ def evaluate_experiment(experiment_dir: Path) -> dict[str, Any]:
         fidelity_records=fidelity_records,
         policy=policy,
         proposal=proposal,
+        run=run,
     )
     write_outputs(
         root,

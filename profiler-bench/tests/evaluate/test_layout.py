@@ -24,8 +24,11 @@ def test_results_layout_and_benchmark_entry(tmp_path: Path) -> None:
     run = {
         "experiment_id": "exp-layout",
         "control": True,
-        "baseline": {"commit": "aaa", "worktree": "/tmp/a"},
-        "candidate": {"commit": "aaa", "worktree": "/tmp/a"},
+        "datasets": ["numeric"],
+        "speed_tiers": ["s"],
+        "fidelity_tier": "s",
+        "baseline": {"commit": "aaa", "worktree": "/tmp/a", "profiler_src_hash": "same"},
+        "candidate": {"commit": "aaa", "worktree": "/tmp/a", "profiler_src_hash": "same"},
         "harness": {"commit": "bbb", "harness_hash": "h" * 64, "policy_hash": "p" * 64},
         "policy": _policy(),
         "not_measured": ["Spark JVM RSS"],
@@ -185,6 +188,10 @@ def _assert_appendable(tmp_path: Path, entry: dict[str, Any]) -> None:
 def _policy() -> dict[str, Any]:
     return {
         "bootstrap": {"samples": 200, "seed": 0, "confidence": 0.95},
+        "speed_samples": {"s": 2},
+        "fidelity_seeds": 2,
+        "fidelity_tier": "s",
+        "speed_tiers": ["s"],
         "accuracy": {
             "min_mean_improvement": 0.005,
             "ci_lower_must_exceed": 0.0,
@@ -198,5 +205,5 @@ def _policy() -> dict[str, Any]:
             "max_rss_regression_frac": 0.05,
             "max_rss_regression_abs_mib": 64.0,
         },
-        "privacy": {"require_all_pass": True},
+        "privacy": {"hard_guard": True},
     }

@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import profiler_bench
 from profiler_bench.runner.policy import policy_hash
 
 
@@ -39,14 +40,16 @@ class BuildIdentity:
 
 @dataclass(frozen=True)
 class HarnessIdentity:
-    """Identity of the frozen profiler-bench harness.
+    """Identity of the frozen profiler-bench harness that is executing.
 
     Attributes:
-        commit: Git commit SHA of the harness checkout.
-        dirty: Whether the harness checkout has uncommitted changes.
-        harness_hash: SHA-256 of harness sources and the metrics/policy config digest.
+        commit: Git commit SHA of the executing harness checkout.
+        dirty: Whether that checkout has uncommitted changes.
+        harness_hash: SHA-256 of the listed harness roots and metrics config digest.
         metrics_config_hash: Hash of the metrics configuration when present, else empty.
         policy_hash: Hash of the frozen policy used for this experiment.
+        harness_root: Absolute path of the git checkout that owns the executing package.
+        hashed_roots: Absolute paths whose contents were included in `harness_hash`.
     """
 
     commit: str
@@ -54,6 +57,8 @@ class HarnessIdentity:
     harness_hash: str
     metrics_config_hash: str
     policy_hash: str
+    harness_root: str
+    hashed_roots: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable mapping."""
@@ -75,27 +80,32 @@ def identify_build(role: str, worktree: Path) -> BuildIdentity:
     )
 
 
-def identify_harness(*, policy: dict[str, Any], repo_root: Path | None = None) -> HarnessIdentity:
-    """Returns the identity of the harness that is executing the experiment."""
-    # Harness sources always come from the installed/running checkout, not the experiment output root.
-    harness_root = _repo_root().resolve()
-    git_root = (repo_root or harness_root).resolve()
-    bench_src = harness_root / "profiler-bench" / "src" / "profiler_bench"
-    policies = harness_root / "profiler-bench" / "policies"
-    metrics = bench_src / "fidelity" / "metrics_config.json"
+def identify_harness(*, policy: dict[str, Any]) -> HarnessIdentity:
+    """Returns the identity of the executing harness checkout.
+
+    Commit, dirty flag, and source hashes all come from the same checkout resolved
+    from the installed `profiler_bench` package location. `--repo-root` is never used.
+    """
+    harness_root, package_root, policies_root = _harness_paths()
+    metrics = package_root / "fidelity" / "metrics_config.json"
     metrics_hash = hashlib.sha256(metrics.read_bytes()).hexdigest() if metrics.is_file() else ""
+    hashed_roots: list[Path] = []
     digest = hashlib.sha256()
-    if bench_src.is_dir():
-        digest.update(hash_tree(bench_src).encode())
-    if policies.is_dir():
-        digest.update(hash_tree(policies).encode())
+    if package_root.is_dir():
+        hashed_roots.append(package_root)
+        digest.update(hash_tree(package_root).encode())
+    if policies_root.is_dir():
+        hashed_roots.append(policies_root)
+        digest.update(hash_tree(policies_root).encode())
     digest.update(metrics_hash.encode())
     return HarnessIdentity(
-        commit=_git_commit(git_root if (git_root / ".git").exists() or (git_root / ".git").is_file() else harness_root),
-        dirty=_git_dirty(git_root if (git_root / ".git").exists() or (git_root / ".git").is_file() else harness_root),
+        commit=_git_commit(harness_root),
+        dirty=_git_dirty(harness_root),
         harness_hash=digest.hexdigest(),
         metrics_config_hash=metrics_hash,
         policy_hash=policy_hash(policy),
+        harness_root=str(harness_root),
+        hashed_roots=tuple(str(path) for path in hashed_roots),
     )
 
 
@@ -131,8 +141,12 @@ def profile_content_hash(profile: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[4]
+def _harness_paths() -> tuple[Path, Path, Path]:
+    """Returns `(harness_git_root, package_root, policies_root)` for the executing package."""
+    package_root = Path(profiler_bench.__file__).resolve().parent
+    bench_dist_root = package_root.parents[1]  # .../profiler-bench
+    harness_root = package_root.parents[2]  # repository checkout that owns profiler-bench
+    return harness_root, package_root, bench_dist_root / "policies"
 
 
 def _git_commit(root: Path) -> str:

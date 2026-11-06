@@ -1,14 +1,18 @@
-"""Policy gates over paired fidelity and speed differences."""
+"""Policy gates over paired fidelity and speed differences.
+
+Each gate reports a two-sided percentile confidence interval at the policy confidence
+level (default 95%). Intervals are not adjusted for multiplicity: there is no
+family-wise or simultaneous coverage guarantee across gates or datasets.
+"""
 
 from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from statistics import median
 from typing import Any, Literal
 
-from profiler_bench.evaluate.bootstrap import BootstrapCI, paired_bootstrap_ci
+from profiler_bench.evaluate.bootstrap import BootstrapCI, paired_bootstrap_ci, stratified_dataset_mean_ci
 
 
 Verdict = Literal["accepted", "rejected", "inconclusive"]
@@ -49,14 +53,14 @@ def evaluate_gates(
     fidelity_records: Sequence[dict[str, Any]],
     policy: dict[str, Any],
     proposal: dict[str, Any],
+    run: dict[str, Any],
 ) -> dict[str, Any]:
     """Applies the frozen policy and returns a verdict with per-gate reasons."""
     gates: list[GateResult] = []
-    missing = _missing_or_failed(speed_records, fidelity_records)
-    gates.append(missing)
-
-    privacy = _privacy_guard(fidelity_records, policy)
-    gates.append(privacy)
+    expected = expected_sample_keys(run)
+    gates.append(_sample_completeness(speed_records, fidelity_records, expected))
+    gates.append(_privacy_guard(fidelity_records, expected))
+    gates.append(_control_guard(run))
 
     proposal_type = str(proposal.get("type", "accuracy"))
     if proposal_type == "accuracy":
@@ -81,38 +85,78 @@ def evaluate_gates(
         "proposal_type": proposal_type,
         "gates": [gate.to_dict() for gate in gates],
         "reasons": [gate.reason for gate in gates if gate.status != "pass"],
+        "interval_note": (
+            "Each gate uses a two-sided percentile CI at the policy confidence level; "
+            "there is no family-wise coverage guarantee across gates."
+        ),
     }
 
 
-def _missing_or_failed(
+def expected_sample_keys(run: dict[str, Any]) -> dict[str, set[str]]:
+    """Derives the expected speed and fidelity sample keys from `run.json`."""
+    policy = run.get("policy") or {}
+    datasets = [str(name) for name in run.get("datasets") or []]
+    speed_tiers = [str(tier) for tier in run.get("speed_tiers") or policy.get("speed_tiers") or ["s"]]
+    fidelity_tier = str(run.get("fidelity_tier") or policy.get("fidelity_tier") or "s")
+    speed_n = policy.get("speed_samples") or {}
+    fidelity_k = int(policy.get("fidelity_seeds", 5))
+    roles = ("baseline", "candidate")
+    speed: set[str] = set()
+    for dataset in datasets:
+        for tier in speed_tiers:
+            n = int(speed_n.get(tier, speed_n.get("s", 5)))
+            for role in roles:
+                for sample_index in range(n):
+                    speed.add(f"speed/{role}/{dataset}/{tier}/{sample_index}")
+    fidelity: set[str] = set()
+    for dataset in datasets:
+        for role in roles:
+            for seed in range(fidelity_k):
+                fidelity.add(f"fidelity/{role}/{dataset}/{fidelity_tier}/seed-{seed}")
+    return {"speed": speed, "fidelity": fidelity}
+
+
+def _sample_completeness(
     speed_records: Sequence[dict[str, Any]],
     fidelity_records: Sequence[dict[str, Any]],
+    expected: dict[str, set[str]],
 ) -> GateResult:
-    failed = [_sample_key(record) for record in [*speed_records, *fidelity_records] if not record.get("ok")]
-    if failed:
+    present = {_sample_key(record): record for record in [*speed_records, *fidelity_records]}
+    missing: list[str] = []
+    failed: list[str] = []
+    for key in sorted(expected["speed"] | expected["fidelity"]):
+        record = present.get(key)
+        if record is None:
+            missing.append(key)
+        elif not record.get("ok"):
+            failed.append(key)
+    if missing or failed:
         return GateResult(
             name="sample_completeness",
             passed=False,
             status="fail",
             reason="failed_or_missing_samples",
-            detail={"failed": failed},
+            detail={"missing": missing, "failed": failed},
         )
     return GateResult(
         name="sample_completeness",
         passed=True,
         status="pass",
         reason="all_samples_ok",
+        detail={"expected_speed": len(expected["speed"]), "expected_fidelity": len(expected["fidelity"])},
     )
 
 
-def _privacy_guard(fidelity_records: Sequence[dict[str, Any]], policy: dict[str, Any]) -> GateResult:
-    if not policy.get("privacy", {}).get("require_all_pass", True):
-        return GateResult(name="privacy", passed=True, status="pass", reason="privacy_disabled")
-    failures = [
-        _sample_key(record)
-        for record in fidelity_records
-        if record.get("role") == "candidate" and record.get("ok") and record.get("privacy_passed") is False
-    ]
+def _privacy_guard(fidelity_records: Sequence[dict[str, Any]], expected: dict[str, set[str]]) -> GateResult:
+    """Hard privacy guard: every expected candidate fidelity cell must explicitly pass."""
+    by_key = {_sample_key(record): record for record in fidelity_records}
+    failures: list[str] = []
+    for key in sorted(expected["fidelity"]):
+        if "/candidate/" not in key:
+            continue
+        record = by_key.get(key)
+        if record is None or not record.get("ok") or record.get("privacy_passed") is not True:
+            failures.append(key)
     if failures:
         return GateResult(
             name="privacy",
@@ -122,6 +166,29 @@ def _privacy_guard(fidelity_records: Sequence[dict[str, Any]], policy: dict[str,
             detail={"failed": failures},
         )
     return GateResult(name="privacy", passed=True, status="pass", reason="privacy_passed")
+
+
+def _control_guard(run: dict[str, Any]) -> GateResult:
+    """Control runs and identical profiler builds can never be accepted."""
+    baseline = run.get("baseline") or {}
+    candidate = run.get("candidate") or {}
+    same_hash = baseline.get("profiler_src_hash") is not None and baseline.get("profiler_src_hash") == candidate.get(
+        "profiler_src_hash"
+    )
+    if run.get("control") or same_hash:
+        return GateResult(
+            name="control",
+            passed=False,
+            status="inconclusive",
+            reason="control",
+            detail={
+                "control": bool(run.get("control")),
+                "same_profiler_src_hash": bool(same_hash),
+                "baseline_hash": baseline.get("profiler_src_hash"),
+                "candidate_hash": candidate.get("profiler_src_hash"),
+            },
+        )
+    return GateResult(name="control", passed=True, status="pass", reason="distinct_builds")
 
 
 def _accuracy_gates(fidelity_records: Sequence[dict[str, Any]], policy: dict[str, Any]) -> list[GateResult]:
@@ -137,14 +204,9 @@ def _accuracy_gates(fidelity_records: Sequence[dict[str, Any]], policy: dict[str
                 reason="no_fidelity_pairs",
             )
         ]
-    # Mean improvement across datasets: average per-dataset mean seed improvement.
     per_dataset_means = {dataset: float(sum(diffs) / len(diffs)) for dataset, diffs in paired.items()}
-    dataset_improvements = list(per_dataset_means.values())
-    # Bootstrap over all paired seed differences pooled, and also check per-dataset.
-    all_diffs = [diff for diffs in paired.values() for diff in diffs]
-    mean_ci = paired_bootstrap_ci(
-        all_diffs,
-        statistic="mean",
+    mean_ci = stratified_dataset_mean_ci(
+        paired,
         n_bootstrap=int(boot.get("samples", 2000)),
         seed=int(boot.get("seed", 0)),
         confidence=float(boot.get("confidence", 0.95)),
@@ -152,13 +214,19 @@ def _accuracy_gates(fidelity_records: Sequence[dict[str, Any]], policy: dict[str
     min_improvement = float(cfg.get("min_mean_improvement", 0.005))
     ci_floor = float(cfg.get("ci_lower_must_exceed", 0.0))
     gates = [_improvement_gate("accuracy_mean", mean_ci, min_improvement, ci_floor)]
+    gates[0].detail["estimand"] = (
+        "equally weighted mean across datasets of per-dataset mean paired differences; "
+        "stratified bootstrap resamples seeds within each dataset (datasets are fixed strata). "
+        "A hierarchical bootstrap that also resamples datasets is an unused alternative."
+    )
+    gates[0].detail["per_dataset_mean_improvement"] = per_dataset_means
+    gates[0].detail["mean_across_datasets"] = float(sum(per_dataset_means.values()) / len(per_dataset_means))
 
     max_reg = float(cfg.get("max_dataset_regression", 0.01))
     reg_details = {}
     reg_status: Literal["pass", "fail", "inconclusive"] = "pass"
     reg_reason = "no_reconstruction_regression"
     for dataset, diffs in paired.items():
-        # Regression of reconstruction: baseline - candidate = -improvement.
         regressions = [-diff for diff in diffs]
         ci = paired_bootstrap_ci(
             regressions,
@@ -168,9 +236,8 @@ def _accuracy_gates(fidelity_records: Sequence[dict[str, Any]], policy: dict[str
             confidence=float(boot.get("confidence", 0.95)),
         )
         reg_details[dataset] = ci.to_dict()
-        # Acceptable if CI upper bound of regression < max_reg.
         if ci.high >= max_reg:
-            if ci.low < max_reg < ci.high or (ci.low < max_reg and ci.point < max_reg < ci.high):
+            if ci.low < max_reg:
                 reg_status = "inconclusive" if reg_status != "fail" else reg_status
                 reg_reason = "reconstruction_regression_inconclusive"
             else:
@@ -216,10 +283,6 @@ def _accuracy_gates(fidelity_records: Sequence[dict[str, Any]], policy: dict[str
             reason=struct_reason,
             detail={"datasets": struct_details, "max_regression": max_struct},
         )
-    )
-    gates[0].detail["per_dataset_mean_improvement"] = per_dataset_means
-    gates[0].detail["mean_across_datasets"] = (
-        float(sum(dataset_improvements) / len(dataset_improvements)) if dataset_improvements else 0.0
     )
     return gates
 
@@ -328,6 +391,7 @@ def _regression_guard(
     detail: dict[str, Any] = {}
     status: Literal["pass", "fail", "inconclusive"] = "pass"
     reason = "no_speed_regression"
+    # RSS bound is max(frac * baseline, abs_bytes): compare (cand-base) / max(base, abs/frac) to frac.
     for key, pairs in paired_wall.items():
         case_id = f"{key[0]}@{key[1]}"
         wall_reg = [(cand - base) / base for base, cand in pairs if base > 0]
@@ -355,6 +419,8 @@ def _regression_guard(
                 confidence=float(boot.get("confidence", 0.95)),
             )
             case_detail[name] = ci.to_dict()
+            if name == "rss":
+                case_detail["rss_bound"] = "max(frac * baseline_rss, abs_mib)"
             if ci.high > limit:
                 if ci.low < limit:
                     status = "inconclusive" if status != "fail" else status
@@ -362,12 +428,6 @@ def _regression_guard(
                 else:
                     status = "fail"
                     reason = f"{name}_regression"
-        if rss_pairs:
-            abs_deltas = [cand - base for base, cand in rss_pairs]
-            if median(abs_deltas) > max_rss_abs and status != "fail":
-                status = "fail"
-                reason = "rss_absolute_regression"
-                case_detail["rss_abs_median"] = float(median(abs_deltas))
         detail[case_id] = case_detail
     return GateResult(
         name="speed_guards",
@@ -380,7 +440,6 @@ def _regression_guard(
 
 def _improvement_gate(name: str, ci: BootstrapCI, min_improvement: float, ci_floor: float) -> GateResult:
     detail = {"ci": ci.to_dict(), "min_improvement": min_improvement, "ci_floor": ci_floor}
-    # Accept when mean improvement >= threshold and the CI lower bound clears the floor.
     if ci.point >= min_improvement and ci.low > ci_floor:
         return GateResult(name=name, passed=True, status="pass", reason="accuracy_improved", detail=detail)
     if ci.crosses_zero() or ci.low <= ci_floor < ci.high:

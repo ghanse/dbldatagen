@@ -71,7 +71,7 @@ def run_experiment(config: ExperimentConfig) -> Path:
     baseline = identify_build("baseline", config.baseline_worktree)
     candidate_path = config.baseline_worktree if config.control else config.candidate_worktree
     candidate = identify_build("candidate", candidate_path)
-    harness = identify_harness(policy=policy, repo_root=repo_root)
+    harness = identify_harness(policy=policy)
 
     datasets = list(config.datasets) if config.datasets is not None else sorted(DATASETS)
     speed_tiers = (

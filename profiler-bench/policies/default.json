@@ -28,7 +28,8 @@
     "max_rss_regression_abs_mib": 64.0
   },
   "privacy": {
-    "require_all_pass": true
+    "hard_guard": true,
+    "note": "Privacy cannot be disabled; every candidate dataset x seed must set privacy_passed=true."
   },
   "spark": {
     "master": "local[2]",

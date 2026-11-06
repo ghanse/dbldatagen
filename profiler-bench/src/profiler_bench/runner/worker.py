@@ -50,12 +50,14 @@ def main(argv: list[str] | None = None) -> int:
 
 def _profile_once(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str, Any]:
     """Runs warmup + timed profile after the profiler import path is prepared."""
+    import dbldatagen_profiler  # noqa: PLC0415
     from dbldatagen_profiler.engines.spark.engine import profile_tables  # noqa: PLC0415
     from dbldatagen_profiler.model import dump_profile, load_profile  # noqa: PLC0415
     from profiler_bench.catalog import load  # noqa: PLC0415
     from profiler_bench.runner.identity import profile_content_hash  # noqa: PLC0415
     from profiler_bench.runner.spark_conf import build_spark  # noqa: PLC0415
 
+    profiler_module_file = str(Path(dbldatagen_profiler.__file__).resolve())
     spark = build_spark(policy, app_name=f"rsi-{args.dataset}-{args.tier}")
     tables = load(
         args.dataset,
@@ -84,6 +86,7 @@ def _profile_once(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str,
         "jvm_rss_bytes": None,
         "profile": profile_obj,
         "profile_hash": profile_content_hash(profile_obj),
+        "profiler_module_file": profiler_module_file,
         "not_measured": policy.get("not_measured", []),
     }
 
