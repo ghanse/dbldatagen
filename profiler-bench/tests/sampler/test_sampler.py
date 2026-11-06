@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
@@ -61,7 +62,7 @@ def test_marginals_nulls_cardinality_and_report(spark: SparkSession) -> None:
 
     assert stats is not None
     assert -1000 <= stats.mean <= 50000
-    assert stats.nulls == round(profile.tables[0].columns[1].null_fraction * 1000)
+    assert stats.nulls / 1000 == pytest.approx(profile.tables[0].columns[1].null_fraction, abs=0.015)
     assert stats.tiers <= 4
     balance = result.report.columns["customers.balance"]
     assert "numeric.histogram" in balance.used

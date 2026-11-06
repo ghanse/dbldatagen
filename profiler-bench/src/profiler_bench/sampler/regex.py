@@ -22,10 +22,11 @@ class UnsupportedRegex(ValueError):
 def generate_regex(pattern: str, rng: np.random.Generator, *, max_length: int = 32) -> str:
     """Generates a full-matching string for the supported regex subset."""
     parsed = sre_parse.parse(pattern)
-    value = _emit(parsed, rng, max(1, max_length))
-    if re.fullmatch(pattern, value) is None:
-        raise UnsupportedRegex(pattern)
-    return value
+    for _attempt in range(32):
+        value = _emit(parsed, rng, max(1, max_length))
+        if len(value) <= max_length and re.fullmatch(pattern, value) is not None:
+            return value
+    raise UnsupportedRegex(pattern)
 
 
 def _emit(tokens: Any, rng: np.random.Generator, budget: int) -> str:  # noqa: ANN401

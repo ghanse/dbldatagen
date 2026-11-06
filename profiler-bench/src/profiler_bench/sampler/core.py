@@ -132,12 +132,14 @@ def _generate_table(table: TableProfile, count: int, seed: int, report: ReportBu
             if dependency.method == DependenceMethod.SPEARMAN:
                 rho = 2 * math.sin(math.pi * rho / 6)
             matrix[left, right] = matrix[right, left] = rho
-        matrix = _nearest_psd(matrix)
+        matrix, repaired = _nearest_psd(matrix)
         normals = _rng(seed, table.name, "copula").multivariate_normal(np.zeros(len(involved)), matrix, count)
         for index, name in enumerate(involved):
             uniforms[name] = _normal_cdf(normals[:, index])
             report.add(f"{table.name}.{name}", "used", "dependencies")
             report.add(f"{table.name}.{name}", "approximated", "dependencies.gaussian_copula")
+            if repaired:
+                report.add(f"{table.name}.{name}", "approximated", "dependencies.nearest_psd")
     for column in table.columns:
         path = f"{table.name}.{column.name}"
         columns[column.name] = _generate_column(
@@ -300,13 +302,22 @@ def _string_values(
         if patterns:
             pattern = patterns[int(rng.choice(len(patterns), p=weights))].regex
             try:
-                result.append(generate_regex(pattern, rng, max_length=max(target_length, 1)))
+                max_length = length.max if length and length.max is not None else target_length
+                result.append(generate_regex(pattern, rng, max_length=max(max_length, 1)))
                 continue
             except (UnsupportedRegex, re.error):
                 report.add(path, "unmet", f"string.patterns:{pattern}")
         result.append("".join(rng.choice(list(string.ascii_lowercase), max(target_length, 1))))
     if remaining and not patterns:
         report.add(path, "approximated", "string.random_fallback")
+    if column.distinct_count and remaining:
+        target_other = max(1, min(remaining, column.distinct_count.value - len(top_values)))
+        generated = result[len(result) - remaining :]
+        pool = list(dict.fromkeys(generated))[:target_other]
+        while len(pool) < target_other:
+            pool.append(f"synthetic_{len(pool)}")
+        result[len(result) - remaining :] = [pool[int(index)] for index in rng.integers(0, len(pool), remaining)]
+        report.add(path, "used", "distinct_count")
     rng.shuffle(result)
     return result[:count]
 
@@ -402,6 +413,26 @@ def _apply_relationships(
             if relationship.fan_out:
                 report.add(path, "used", "relationship.fan_out")
                 report.add(path, "approximated", "relationship.fan_out.weighted")
+        _exclude_parent_keys(table, columns, relationship, parents, covered)
+
+
+def _exclude_parent_keys(
+    table: TableProfile,
+    columns: dict[str, list[Any]],
+    relationship: Relationship,
+    parents: list[tuple[Any, ...]],
+    covered: int,
+) -> None:
+    parent_set = set(parents)
+    count = len(next(iter(columns.values()), []))
+    last_name = relationship.child_columns[-1]
+    last_column = next(column for column in table.columns if column.name == last_name)
+    for index in range(covered, count):
+        key = tuple(columns[name][index] for name in relationship.child_columns)
+        if key in parent_set:
+            columns[last_name][index] = _unique_value(
+                columns[last_name][index], index + count, last_column, columns[last_name]
+            )
 
 
 def _fanout_indexes(count: int, parent_count: int, relationship: Relationship, rng: np.random.Generator) -> np.ndarray:
@@ -581,8 +612,8 @@ def _apply_categorical_dependencies(
         strength = dependency.value
         mapping: dict[Any, Any] = {}
         right_pool = list(dict.fromkeys(columns[right]))
-        for value in dict.fromkeys(columns[left]):
-            mapping[value] = right_pool[int(rng.integers(len(right_pool)))]
+        for index, value in enumerate(dict.fromkeys(columns[left])):
+            mapping[value] = right_pool[index % len(right_pool)]
         for index, value in enumerate(columns[left]):
             if rng.random() < strength:
                 columns[right][index] = mapping[value]
@@ -591,11 +622,12 @@ def _apply_categorical_dependencies(
         report.add(f"{table.name}.{right}", "approximated", "dependencies.cramers_v.mixture")
 
 
-def _nearest_psd(matrix: np.ndarray) -> np.ndarray:
+def _nearest_psd(matrix: np.ndarray) -> tuple[np.ndarray, bool]:
     values, vectors = np.linalg.eigh((matrix + matrix.T) / 2)
+    repaired = bool(np.any(values < 0))
     result = vectors @ np.diag(np.maximum(values, 1e-8)) @ vectors.T
     diagonal = np.sqrt(np.diag(result))
-    return np.asarray(result / np.outer(diagonal, diagonal))
+    return np.asarray(result / np.outer(diagonal, diagonal)), repaired
 
 
 def _normal_cdf(values: np.ndarray) -> np.ndarray:
