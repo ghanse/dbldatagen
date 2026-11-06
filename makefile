@@ -62,6 +62,17 @@ profiler-lint:
 	$(PROFILER_RUN) ruff check profiler
 	$(PROFILER_RUN) mypy --config-file profiler/pyproject.toml profiler/src profiler/tests
 
+# bench-test / bench-lint: the dbldatagen-profiler-bench workspace member (profiler-bench/).
+BENCH_RUN := uv run --exact --package dbldatagen-profiler-bench --all-extras --all-groups
+
+bench-test:
+	$(BENCH_RUN) pytest profiler-bench/tests
+
+bench-lint:
+	$(BENCH_RUN) black --check profiler-bench
+	$(BENCH_RUN) ruff check profiler-bench
+	$(BENCH_RUN) mypy --config-file profiler-bench/pyproject.toml profiler-bench/src profiler-bench/tests
+
 # test-coverage: same as test, then open HTML report.
 test-coverage: test
 	open htmlcov/index.html
@@ -96,4 +107,4 @@ docs-api-core:
 	$(UV_RUN) --group docs pydoc-markdown
 
 .DEFAULT: all
-.PHONY: all clean dev lint fmt test test-fast test-coverage build lock-dependencies docs-build docs-clean docs-serve docs-api-core profiler-test profiler-lint
+.PHONY: all clean dev lint fmt test test-fast test-coverage build lock-dependencies docs-build docs-clean docs-serve docs-api-core profiler-test profiler-lint bench-test bench-lint

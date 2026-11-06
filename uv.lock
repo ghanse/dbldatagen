@@ -16,6 +16,7 @@ databricks-sdk = false
 members = [
     "dbldatagen",
     "dbldatagen-profiler",
+    "dbldatagen-profiler-bench",
 ]
 
 [[package]]
@@ -777,6 +778,57 @@ test = [
     { name = "pyspark", extras = ["sql"], specifier = ">=3.4.1,<4.2" },
     { name = "pytest", specifier = "~=8.3.3" },
 ]
+
+[[package]]
+name = "dbldatagen-profiler-bench"
+source = { editable = "profiler-bench" }
+dependencies = [
+    { name = "dbldatagen-profiler" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+    { name = "pyspark", extra = ["sql"] },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "black" },
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "ruff" },
+]
+lint = [
+    { name = "black" },
+    { name = "mypy" },
+    { name = "ruff" },
+]
+test = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "dbldatagen-profiler", editable = "profiler" },
+    { name = "numpy", specifier = ">=1.21.5,<2.4" },
+    { name = "pandas", specifier = ">=1.4.4,<3" },
+    { name = "pyarrow", specifier = ">=8.0.0,<23.0.0" },
+    { name = "pyspark", extras = ["sql"], specifier = ">=3.4.1,<4.2" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "black", specifier = "~=25.12.0" },
+    { name = "mypy", specifier = "~=1.9.0" },
+    { name = "pytest", specifier = "~=8.3.3" },
+    { name = "ruff", specifier = "~=0.13.0" },
+]
+lint = [
+    { name = "black", specifier = "~=25.12.0" },
+    { name = "mypy", specifier = "~=1.9.0" },
+    { name = "ruff", specifier = "~=0.13.0" },
+]
+test = [{ name = "pytest", specifier = "~=8.3.3" }]
 
 [[package]]
 name = "decorator"
