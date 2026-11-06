@@ -48,15 +48,21 @@ def test_auc_counts_ties_as_half() -> None:
     assert stats.auc(np.array([0.1, 0.9]), np.array([0, 1])) == 1.0
 
 
-def test_knn_cannot_tell_identical_samples_apart() -> None:
-    x = np.random.default_rng(0).normal(size=(200, 3))
-    assert stats.knn_auc(x[:100], x[:100], x[100:], x[100:], 10) == 0.5
+def test_discriminator_cannot_tell_identical_samples_apart() -> None:
+    x = np.random.default_rng(0).normal(size=(400, 3))
+    assert stats.discriminator_auc(x, x.copy(), np.zeros(3, dtype=bool), 0, 50) == 0.5
 
 
-def test_knn_separates_shifted_samples() -> None:
+def test_discriminator_separates_shifted_samples() -> None:
     rng = np.random.default_rng(0)
-    real, synth = rng.normal(size=(200, 2)), rng.normal(size=(200, 2)) + 3
-    assert stats.knn_auc(real[:100], synth[:100], real[100:], synth[100:], 10) > 0.95
+    real, synth = rng.normal(size=(400, 2)), rng.normal(size=(400, 2)) + 3
+    assert stats.discriminator_auc(real, synth, np.zeros(2, dtype=bool), 0, 50) > 0.95
+
+
+def test_discriminator_uses_categorical_codes() -> None:
+    rng = np.random.default_rng(0)
+    real, synth = rng.integers(0, 3, (400, 1)).astype(float), rng.integers(3, 6, (400, 1)).astype(float)
+    assert stats.discriminator_auc(real, synth, np.ones(1, dtype=bool), 0, 50) > 0.95
 
 
 def test_generated_strings_match_their_regex() -> None:

@@ -1,4 +1,4 @@
-"""Bounded two-sample distances, dependence measures, and the nearest-neighbour discriminator.
+"""Bounded two-sample distances, dependence measures, and the gradient-boosted discriminator.
 
 Every function here works on driver-side numpy or pandas samples and is deterministic for a given input.
 """
@@ -11,6 +11,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
+from threadpoolctl import threadpool_limits
 
 from profiler_bench.catalog.verification import _cramers_v
 
@@ -152,6 +154,30 @@ class Encoder:
                 blocks.append(_rank_block(values.dropna().map(len).reindex(values.index), self.lengths[column]))
         return np.hstack(blocks)
 
+    def tree_features(self, frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        """Returns features for a tree model and which of them are categorical.
+
+        Numeric columns become their real rank, categorical and string columns the index of their top-value bucket
+        (`other` last), and string columns also their length rank; nulls are NaN.
+        """
+        blocks: list[np.ndarray] = []
+        categorical: list[bool] = []
+        for column, kind in self.kinds.items():
+            values = frame[column]
+            if kind == "numeric":
+                blocks.append(_ranks(values, self.sorted[column]))
+                categorical.append(False)
+                continue
+            index = {b: i for i, b in enumerate(self.buckets[column])}
+            other = float(len(index))
+            blocks.append(np.array([np.nan if pd.isna(v) else index.get(v, other) for v in values], dtype=np.float64))
+            categorical.append(True)
+            if kind == "string":
+                blocks.append(_ranks(values.dropna().map(len).reindex(values.index), self.lengths[column]))
+                categorical.append(False)
+        matrix = np.column_stack(blocks) if blocks else np.zeros((len(frame), 0))
+        return matrix, np.array(categorical, dtype=bool)
+
     def codes(self, *frames: pd.DataFrame) -> list[list[np.ndarray]]:
         """Returns, for each string column, the factorized values of each frame over a shared code book."""
         columns = [c for c, k in self.kinds.items() if k == "string"]
@@ -174,6 +200,12 @@ def finite(values: pd.Series) -> np.ndarray:
 def _lengths(values: pd.Series) -> np.ndarray:
     lengths: np.ndarray = values.map(len).to_numpy(dtype=np.float64)
     return lengths
+
+
+def _ranks(values: pd.Series, reference: np.ndarray) -> np.ndarray:
+    numbers = pd.to_numeric(values, errors="coerce").to_numpy(dtype=np.float64)
+    ranks: np.ndarray = np.searchsorted(reference, np.nan_to_num(numbers), side="right") / max(len(reference), 1)
+    return np.where(np.isnan(numbers), np.nan, ranks)
 
 
 def _rank_block(values: pd.Series, reference: np.ndarray) -> np.ndarray:
@@ -207,22 +239,27 @@ def mismatches(codes_a: list[np.ndarray], codes_b: list[np.ndarray]) -> np.ndarr
     return total
 
 
-def knn_auc(
-    real_train: np.ndarray, synth_train: np.ndarray, real_test: np.ndarray, synth_test: np.ndarray, k: int
-) -> float:
-    """Returns the test AUC of a k-nearest-neighbour classifier telling synthetic (positive) from real rows.
+def discriminator_auc(real: np.ndarray, synth: np.ndarray, categorical: np.ndarray, seed: int, max_iter: int) -> float:
+    """Returns the held-out AUC of a gradient-boosted classifier telling synthetic (positive) from real rows.
 
-    The score of a test row is the share of synthetic rows among its `k` nearest training rows; rows tied at the
-    k-th distance share the remaining votes equally.
+    Row `i` of both sides goes to the same half, so the split is stratified and an identical pair of samples cannot
+    be told apart. The classifier trains on one half and is scored on the other, on one thread: parallel histogram
+    building is many times slower beside a local Spark session.
+
+    Args:
+        real: Real feature rows.
+        synth: Synthetic feature rows, as many as `real`.
+        categorical: Which feature columns hold category codes.
+        seed: Seed of the split and the classifier.
+        max_iter: Boosting iterations.
     """
-    train = np.vstack([real_train, synth_train])
-    is_synth = np.concatenate([np.zeros(len(real_train)), np.ones(len(synth_train))])
-    test = np.vstack([real_test, synth_test])
-    labels = np.concatenate([np.zeros(len(real_test)), np.ones(len(synth_test))]).astype(np.int64)
-    k = min(k, len(train))
-    distances = squared_distances(test, train)
-    kth = np.partition(distances, k - 1, axis=1)[:, k - 1 : k]
-    closer, tied = distances < kth, distances == kth
-    room = (k - closer.sum(axis=1)) / tied.sum(axis=1)
-    votes = (closer * is_synth).sum(axis=1) + room * (tied * is_synth).sum(axis=1)
-    return auc(votes / k, labels)
+    order = np.random.default_rng(seed).permutation(len(real))
+    train, test = order[: len(order) // 2], order[len(order) // 2 :]
+    model = HistGradientBoostingClassifier(
+        max_iter=max_iter, early_stopping=False, categorical_features=categorical, random_state=seed
+    )
+    labels = np.concatenate([np.zeros(len(train)), np.ones(len(train))])
+    with threadpool_limits(1):
+        model.fit(np.vstack([real[train], synth[train]]), labels)
+        scores = model.predict_proba(np.vstack([real[test], synth[test]]))[:, 1]
+    return auc(scores, np.concatenate([np.zeros(len(test)), np.ones(len(test))]).astype(np.int64))

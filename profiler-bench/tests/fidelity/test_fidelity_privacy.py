@@ -24,7 +24,7 @@ def profile(real: dict[str, DataFrame]) -> Profile:
 
 
 def test_independent_synth_passes(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:
-    score = score_privacy(real, load("retail", "xs", 2, spark), profile, materialize("retail", "xs", 0).manifest)
+    score = score_privacy(real, load("retail", "xs", 3, spark), profile, materialize("retail", "xs", 0).manifest)
     assert score.passed, [c for c in score.checks if not c.passed]
     assert PrivacyScore.model_validate_json(score.model_dump_json()) == score
 
@@ -51,7 +51,7 @@ def test_sensitive_values_in_the_profile_are_found(
         "patterns": [{"regex": re.escape(email.upper()) + "|" + re.escape(email), "coverage": 0.5}],
     }
     leaky = Profile.model_validate(data)
-    score = score_privacy(real, load("retail", "xs", 2, spark), leaky, materialize("retail", "xs", 0).manifest)
+    score = score_privacy(real, load("retail", "xs", 3, spark), leaky, materialize("retail", "xs", 0).manifest)
     detail = {c.name: c for c in score.checks}
     assert detail["profile.sensitive_value_leaks"].value == 1
     assert detail["profile.k_threshold"].detail == {"customers.email top_values": 1.0}
@@ -74,4 +74,4 @@ def test_quasi_identifier_sets_are_checked(
     truth = materialize("retail", "xs", 0).manifest
     name = "customers.quasi_identifiers[segment,country,signup_date].match_rate_excess"
     assert not _checks(score_privacy(real, real, profile, truth))[name]
-    assert _checks(score_privacy(real, load("retail", "xs", 2, spark), profile, truth))[name]
+    assert _checks(score_privacy(real, load("retail", "xs", 3, spark), profile, truth))[name]

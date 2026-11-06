@@ -50,14 +50,23 @@ class Sampling(_Model):
         discriminator_rows: Rows per side used by the discriminator, half to train and half to test.
         privacy_rows: Rows per side used for distance to closest record.
         pattern_samples: Strings generated per regex when testing pattern equivalence.
-        holdout_seed_offset: Catalog seed offset of the real holdout used as the privacy baseline.
+        ceiling_sample_offset: Sample seed offset of the stand-in synthetic data of the ceiling.
+        holdout_sample_offset: Sample seed offset of the real holdout used as the privacy baseline; must differ from
+            `ceiling_sample_offset`.
     """
 
     max_rows: int = Field(gt=0)
     discriminator_rows: int = Field(gt=0)
     privacy_rows: int = Field(gt=0)
     pattern_samples: int = Field(gt=0)
-    holdout_seed_offset: int = Field(gt=0)
+    ceiling_sample_offset: int = Field(gt=0)
+    holdout_sample_offset: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _check_offsets(self) -> Sampling:
+        if self.ceiling_sample_offset == self.holdout_sample_offset:
+            raise ValueError("the ceiling and the privacy holdout need different sample seeds")
+        return self
 
 
 class Marginal(_Model):
@@ -88,10 +97,10 @@ class Discriminator(_Model):
     """Discriminator settings.
 
     Attributes:
-        k: Neighbours of the k-nearest-neighbour classifier.
+        max_iter: Boosting iterations of the gradient-boosted classifier.
     """
 
-    k: int = Field(gt=0)
+    max_iter: int = Field(gt=0)
 
 
 class StructureTolerances(_Model):

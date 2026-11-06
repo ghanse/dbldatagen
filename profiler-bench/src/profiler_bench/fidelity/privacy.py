@@ -1,7 +1,7 @@
 """Privacy guard: whether a profile or the synthetic data generated from it gives away real rows or sensitive values.
 
-Data checks compare the synth with a real holdout, a fresh draw from the same catalog dataset under another seed. The
-holdout never reached the profiler, so the rate at which it matches the real data is the rate expected by chance.
+Data checks compare the synth with a real holdout: another row sample of the same dataset structure. The holdout
+never reached the profiler, so the rate at which it matches the real data is the rate expected by chance.
 Every check is pass/fail against a threshold of the metrics configuration; values themselves are never reported.
 """
 
@@ -17,13 +17,19 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from dbldatagen_profiler.model import ColumnProfile, EnumerationConstraint, LogicalType, Profile
-from profiler_bench.catalog import load
 from profiler_bench.catalog.manifest import Manifest, Table
 from profiler_bench.fidelity import regex, stats
 from profiler_bench.fidelity.config import MetricsConfig, load_config
 from profiler_bench.fidelity.frames import ROW_FRAME, collect, identifier, leaf_kind, require_utc
 from profiler_bench.fidelity.scores import GuardCheck, PrivacyScore
-from profiler_bench.fidelity.truth import VALUE_LEAK_CATEGORIES, quasi_identifier_sets, sensitive_columns
+from profiler_bench.fidelity.truth import (
+    VALUE_LEAK_CATEGORIES,
+    load_instance,
+    quasi_identifier_sets,
+    sample_seed,
+    sensitive_columns,
+    structure_seed,
+)
 
 
 def score_privacy(
@@ -43,8 +49,8 @@ def score_privacy(
         synth: Synthetic DataFrames by table name.
         profile: Profile of the real data.
         manifest: Ground-truth manifest of the real data.
-        holdout: Real holdout DataFrames; defaults to the catalog dataset at seed `manifest.seed` plus the configured
-            offset.
+        holdout: Real holdout DataFrames; defaults to the catalog dataset at the manifest's structure seed and its sample
+            seed plus `sampling.holdout_sample_offset`.
         seed: Seed of the distance-to-closest-record samples.
         config: Metrics configuration; defaults to the packaged one.
 
@@ -55,8 +61,13 @@ def score_privacy(
     require_utc(list(real.values()))
     session = next(iter(real.values())).sparkSession
     if holdout is None:
-        offset = config.sampling.holdout_seed_offset
-        holdout = load(manifest.dataset, manifest.tier, manifest.seed + offset, session)
+        holdout = load_instance(
+            manifest.dataset,
+            manifest.tier,
+            structure_seed=structure_seed(manifest),
+            sample_seed=sample_seed(manifest) + config.sampling.holdout_sample_offset,
+            spark=session,
+        )
     limits = config.privacy
     checks: list[GuardCheck] = []
     for table in manifest.tables:

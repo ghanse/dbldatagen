@@ -109,7 +109,7 @@ class DiscriminatorScore(_Score):
     """Two-sample classifier score.
 
     Attributes:
-        auc: Test AUC of a k-nearest-neighbour classifier telling synth from real rows.
+        auc: Held-out AUC of a gradient-boosted classifier telling synth from real rows.
         rows: Rows per side, half used to train and half to test.
         score: 1 - |auc - 0.5| * 2.
     """

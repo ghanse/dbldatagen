@@ -1,11 +1,12 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "sampling": {
     "max_rows": 20000,
     "discriminator_rows": 2000,
     "privacy_rows": 2000,
     "pattern_samples": 200,
-    "holdout_seed_offset": 1
+    "ceiling_sample_offset": 1,
+    "holdout_sample_offset": 2
   },
   "marginal": {
     "top_values": 20,
@@ -16,7 +17,7 @@
     "correlation_bins": 50
   },
   "discriminator": {
-    "k": 10
+    "max_iter": 100
   },
   "reconstruction_weights": {
     "schema": 0.05,

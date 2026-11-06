@@ -72,7 +72,7 @@ from profiler_bench.fidelity import ceiling, overall, score_privacy, score_recon
 recon = score_reconstruction(real, synth, truth, seed=0)  # synthetic tables vs real tables
 structure = score_structure(profile, truth)               # profile vs the planted ground truth
 privacy = score_privacy(real, synth, profile, truth)      # guard: privacy.passed
-top = ceiling("retail", "s", spark=spark)                 # real seed 0 vs real seed 1
+top = ceiling("retail", "s", spark=spark)                 # two real row samples of one structure
 recon.relative_to(top)                                    # score as a fraction of the achievable
 ```
 
@@ -101,10 +101,11 @@ dataset's score is the mean of its table scores.
 | `constraints` | 0.10 | share of synth rows satisfying each check; for functional dependencies, the largest share of rows that can be kept so the dependency holds |
 | `keys` | 0.05 | distinct non-null keys over rows (primary) or over rows with a key (unique) |
 | `foreign_keys` | 0.10 | mean of 1 - abs(coverage error), 1 - fan-out KS, and 1 - fan-out Wasserstein |
-| `discriminator` | 0.10 | 1 - abs(AUC - 0.5) * 2 for a k-nearest-neighbour (k=10) classifier on 2,000 rows per side, half train, half test |
+| `discriminator` | 0.10 | 1 - abs(AUC - 0.5) * 2 on the held-out half for a scikit-learn `HistGradientBoostingClassifier` (100 iterations, fixed `random_state`) on 2,000 seeded rows per side, split in stratified halves |
 
-A column or table the synth lacks, or a column with a different type, scores 0. The **ceiling** scores catalog seed 0
-against seed 1, which shows how far apart two real draws already are.
+A column or table the synth lacks, or a column with a different type, scores 0. The **ceiling** scores two row
+samples of the same dataset structure (same structure seed, sample seeds `s` and `s + 1`), which shows how far apart
+two real draws already are.
 
 ### Structure recovery
 
@@ -125,8 +126,8 @@ structure is reported as `not recovered`, never as an error.
 
 ### Privacy guard
 
-Data checks compare the synth with a **real holdout**, the same dataset at seed `manifest.seed + 1`, which the
-profiler never saw. A rate check passes when the synth exceeds the holdout by at most the threshold plus three
+Data checks compare the synth with a **real holdout**, another row sample of the same structure (sample seed
+`s + 2`, distinct from the ceiling's), which the profiler never saw. A rate check passes when the synth exceeds the holdout by at most the threshold plus three
 standard errors. Reports carry counts and rates, never values.
 
 | Check | Passes when |

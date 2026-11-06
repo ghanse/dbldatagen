@@ -21,7 +21,6 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-from profiler_bench.catalog import load, materialize
 from profiler_bench.catalog.manifest import (
     Check,
     ComparisonCheck,
@@ -48,6 +47,7 @@ from profiler_bench.fidelity.scores import (
     mean,
     weighted,
 )
+from profiler_bench.fidelity.truth import load_instance, manifest_of
 
 
 MARGINAL_METRICS = frozenset(
@@ -99,24 +99,31 @@ def ceiling(
     tier: str,
     *,
     spark: SparkSession,
-    seeds: tuple[int, int] = (0, 1),
+    structure_seed: int = 0,
+    sample_seed: int = 0,
     seed: int = 0,
     config: MetricsConfig | None = None,
 ) -> ReconstructionScore:
-    """Scores one catalog seed of a dataset against another: the best reconstruction score achievable.
+    """Scores two row samples of one dataset structure against each other: the best reconstruction score achievable.
+
+    The stand-in synthetic data shares the structure seed (parameters and vocabularies) and uses sample seed
+    `sample_seed + sampling.ceiling_sample_offset`.
 
     Args:
         name: Dataset name.
         tier: Scale tier.
         spark: Spark session.
-        seeds: Catalog seeds of the real and the stand-in synthetic data.
+        structure_seed: Catalog structure seed of both sides.
+        sample_seed: Catalog sample seed of the real side.
         seed: Seed of the metric's sampling.
         config: Metrics configuration; defaults to the packaged one.
     """
-    truth = materialize(name, tier, seeds[0]).manifest
-    return score_reconstruction(
-        load(name, tier, seeds[0], spark), load(name, tier, seeds[1], spark), truth, seed=seed, config=config
-    )
+    config = config or load_config()
+    other = sample_seed + config.sampling.ceiling_sample_offset
+    real = load_instance(name, tier, structure_seed=structure_seed, sample_seed=sample_seed, spark=spark)
+    stand_in = load_instance(name, tier, structure_seed=structure_seed, sample_seed=other, spark=spark)
+    manifest = manifest_of(name, tier, structure_seed=structure_seed, sample_seed=sample_seed)
+    return score_reconstruction(real, stand_in, manifest, seed=seed, config=config)
 
 
 def _score_table(
@@ -572,8 +579,6 @@ def _discriminator(
     encoder_kinds = {p: "numeric" if k in ("numeric", "length") else k for p, k in kinds.items()}
     real, synth = real.iloc[:rows], synth.iloc[:rows]
     encoder = stats.Encoder(real, encoder_kinds, config.marginal.top_values)
-    x_real, x_synth = encoder.features(real), encoder.features(synth)
-    order = np.random.default_rng(seed).permutation(rows)
-    train, test = order[: rows // 2], order[rows // 2 :]
-    value = stats.knn_auc(x_real[train], x_synth[train], x_real[test], x_synth[test], config.discriminator.k)
+    (x_real, categorical), (x_synth, _) = encoder.tree_features(real), encoder.tree_features(synth)
+    value = stats.discriminator_auc(x_real, x_synth, categorical, seed, config.discriminator.max_iter)
     return DiscriminatorScore(auc=value, rows=rows, score=clamp(1 - abs(value - 0.5) * 2))
