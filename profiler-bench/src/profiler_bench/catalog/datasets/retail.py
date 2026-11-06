@@ -63,9 +63,28 @@ def _uniform_dates(rng: np.random.Generator, n: int, bounds: tuple[str, str]) ->
     return rng.integers(gen.days(bounds[0]), gen.days(bounds[1]) + 1, n)
 
 
-def build(n: int, rng: Rng) -> Build:
-    """Generates the retail tables for base row count `n` (about `n` order items)."""
-    n_products, n_customers, n_orders = max(100, n // 200), max(200, n // 20), n // 4
+def _counts(n: int) -> tuple[int, int, int]:
+    return max(100, n // 200), max(200, n // 20), n // 4
+
+
+def _extra_items(n_orders: int) -> int:
+    return round(ITEMS_LAM * n_orders)
+
+
+def sizes(n: int) -> dict[str, float]:
+    """Returns the expected row count of each retail table for base row count `n`."""
+    n_products, n_customers, n_orders = _counts(n)
+    return {
+        "customers": n_customers,
+        "products": n_products,
+        "orders": n_orders,
+        "order_items": n_orders + _extra_items(n_orders),
+    }
+
+
+def build(n: int, rng: Rng, structure: Rng) -> Build:
+    """Generates the retail tables for base row count `n` (about `n` order items), each in shuffled row order."""
+    n_products, n_customers, n_orders = _counts(n)
 
     category = gen.choice(rng("products.category"), n_products, CATEGORY_PROBABILITIES)
     price_cents = np.maximum(
@@ -82,8 +101,9 @@ def build(n: int, rng: Rng) -> Build:
     )
 
     country = gen.choice(rng("customers.country"), n_customers, COUNTRY_PROBABILITIES)
-    customer_id = np.arange(1, n_customers + 1)
-    names = gen.words(rng("customers.names"), 400)
+    customer_number = np.arange(1, n_customers + 1)
+    customer_id = gen.hashed_ids(customer_number, int(rng("customers.customer_id").integers(0, 2**62)))
+    names = gen.words(structure("customers.names"), 400)
     customers = pa.table(
         {
             "customer_id": pa.array(customer_id, pa.int64()),
@@ -91,7 +111,7 @@ def build(n: int, rng: Rng) -> Build:
                 gen.take(names, rng("customers.first").integers(0, 200, n_customers)),
                 ".",
                 gen.take(names, rng("customers.last").integers(200, 400, n_customers)),
-                pa.array(customer_id.astype(str)),
+                pa.array(customer_number.astype(str)),
                 "@",
                 gen.take(DOMAINS, rng("customers.domain").integers(0, len(DOMAINS), n_customers)),
             ),
@@ -110,7 +130,8 @@ def build(n: int, rng: Rng) -> Build:
         {
             "order_id": pa.array(np.arange(1, n_orders + 1), pa.int64()),
             "customer_id": pa.array(
-                gen.zipf_choice(rng("orders.customer_id"), n_orders, n_customers, CUSTOMER_ZIPF_S) + 1, pa.int64()
+                customer_id[gen.zipf_choice(rng("orders.customer_id"), n_orders, n_customers, CUSTOMER_ZIPF_S)],
+                pa.int64(),
             ),
             "order_date": gen.dates(order_date),
             "ship_date": gen.dates(ship_date, mask=unshipped),
@@ -118,7 +139,8 @@ def build(n: int, rng: Rng) -> Build:
         }
     )
 
-    items_per_order = 1 + rng("order_items.count").poisson(ITEMS_LAM, n_orders)
+    extra = _extra_items(n_orders)
+    items_per_order = 1 + rng("order_items.count").multinomial(extra, np.full(n_orders, 1 / n_orders))
     n_items = int(items_per_order.sum())
     starts = np.repeat(np.cumsum(items_per_order) - items_per_order, items_per_order)
     product = gen.zipf_choice(rng("order_items.product_id"), n_items, n_products, PRODUCT_ZIPF_S)
@@ -134,8 +156,9 @@ def build(n: int, rng: Rng) -> Build:
         }
     )
 
-    tables = {"customers": customers, "products": products, "orders": orders, "order_items": order_items}
-    return Build(tables, _truth(n_products, n_customers, n_orders), _foreign_keys(n_customers, n_products))
+    ordered = {"customers": customers, "products": products, "orders": orders, "order_items": order_items}
+    tables = {name: gen.shuffle(table, rng(f"{name}.row_order")) for name, table in ordered.items()}
+    return Build(tables, _truth(n_products, n_customers, n_orders), _foreign_keys(n_customers, n_products, n_orders))
 
 
 def _truth(n_products: int, n_customers: int, n_orders: int) -> list[Table]:
@@ -144,17 +167,23 @@ def _truth(n_products: int, n_customers: int, n_orders: int) -> list[Table]:
     unshipped_sql = ", ".join(f"'{s}'" for s in UNSHIPPED)
     customers = Table(
         name="customers",
+        row_order="shuffled",
         description="Customers with a unique email, a country, and the region the country belongs to.",
         primary_key=("customer_id",),
         unique_keys=(("email",),),
         columns=(
-            Column(name="customer_id", unique=True, distinct=n_customers, distribution=sequence),
+            Column(
+                name="customer_id",
+                unique=True,
+                distinct=n_customers,
+                note="Hashed: a keyed 63-bit bijection of 1..n, so ids are distinct, non-negative, and unordered.",
+            ),
             Column(
                 name="email",
                 unique=True,
-                sensitive=True,
+                privacy="direct_identifier",
                 formats=(Format(regex=r"[a-z]+\.[a-z]+[0-9]+@(example\.com|mail\.test|corp\.example)", share=1.0),),
-                note="first.last plus the customer id, so it is unique and must not leak.",
+                note="first.last plus the customer number, so it is unique and must not leak.",
             ),
             Column(name="segment", distinct=len(SEGMENTS), distribution=_categorical(SEGMENTS, SEGMENT_PROBABILITIES)),
             Column(
@@ -167,6 +196,7 @@ def _truth(n_products: int, n_customers: int, n_orders: int) -> list[Table]:
             ),
         ),
         checks=(
+            RangeCheck(column="customer_id", min=0),
             EnumerationCheck(column="segment", values=tuple(SEGMENTS)),
             EnumerationCheck(column="country", values=tuple(COUNTRIES)),
             RangeCheck(column="signup_date", min=SIGNUP[0], max=SIGNUP[1]),
@@ -175,6 +205,7 @@ def _truth(n_products: int, n_customers: int, n_orders: int) -> list[Table]:
     )
     products = Table(
         name="products",
+        row_order="shuffled",
         description="Product catalog; every category belongs to one department.",
         primary_key=("product_id",),
         unique_keys=(("sku",),),
@@ -201,6 +232,7 @@ def _truth(n_products: int, n_customers: int, n_orders: int) -> list[Table]:
     )
     orders = Table(
         name="orders",
+        row_order="shuffled",
         description="Orders; customers are chosen by a Zipf law, and only shipped orders have a ship date.",
         primary_key=("order_id",),
         columns=(
@@ -229,6 +261,7 @@ def _truth(n_products: int, n_customers: int, n_orders: int) -> list[Table]:
     )
     order_items = Table(
         name="order_items",
+        row_order="shuffled",
         description="Order lines; products are chosen by a Zipf law and the line total is price times quantity.",
         primary_key=("order_id", "line_no"),
         columns=(
@@ -252,7 +285,7 @@ def _truth(n_products: int, n_customers: int, n_orders: int) -> list[Table]:
     return [customers, products, orders, order_items]
 
 
-def _foreign_keys(n_customers: int, n_products: int) -> list[ForeignKey]:
+def _foreign_keys(n_customers: int, n_products: int, n_orders: int) -> list[ForeignKey]:
     return [
         ForeignKey(
             child_table="orders",
@@ -266,7 +299,10 @@ def _foreign_keys(n_customers: int, n_products: int) -> list[ForeignKey]:
             child_columns=("order_id",),
             parent_table="orders",
             parent_columns=("order_id",),
-            fanout=Distribution(family=Family.POISSON, params={"lam": ITEMS_LAM, "shift": 1}),
+            fanout=Distribution(
+                family=Family.BINOMIAL,
+                params={"n": _extra_items(n_orders), "p": 1 / n_orders, "shift": 1},
+            ),
         ),
         ForeignKey(
             child_table="order_items",
@@ -282,4 +318,5 @@ DATASET = Dataset(
     name="retail",
     description="Relational retail model with PK/FKs, Zipf fan-out, date ordering, a status enum, and line totals.",
     build=build,
+    sizes=sizes,
 )

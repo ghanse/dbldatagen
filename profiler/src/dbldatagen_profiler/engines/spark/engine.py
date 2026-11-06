@@ -137,12 +137,13 @@ def _aggregate_expressions(column: Column, data_type: T.DataType, index: int) ->
         F.countDistinct(distinct_value).alias(f"{prefix}_distinct"),
     ]
     if isinstance(data_type, _NUMERIC_TYPES):
+        approximate = column.cast("double")
         expressions.extend(
             [
                 F.min(column).alias(f"{prefix}_min"),
                 F.max(column).alias(f"{prefix}_max"),
-                F.avg(column).alias(f"{prefix}_mean"),
-                F.stddev_samp(column).alias(f"{prefix}_stddev"),
+                F.avg(approximate).alias(f"{prefix}_mean"),
+                F.stddev_samp(approximate).alias(f"{prefix}_stddev"),
             ]
         )
     elif isinstance(data_type, _string_types()):

@@ -97,7 +97,7 @@ def cramers_v(x: pd.Series, y: pd.Series) -> float:
     """Returns Cramer's V of two categorical series, or 0 when either has a single category."""
     if x.nunique() < 2 or y.nunique() < 2:
         return 0.0
-    return _cramers_v(x.astype(str), y.astype(str))
+    return _cramers_v(pd.crosstab(x.astype(str), y.astype(str)).to_numpy(dtype=np.float64))
 
 
 def correlation_ratio(x: pd.Series, y: pd.Series, bins: int, numeric_x: bool) -> float:

@@ -36,7 +36,12 @@ MICROS_PER_HOUR = 3_600_000_000
 MICROS_PER_DAY = 24 * MICROS_PER_HOUR
 
 
-def build(n: int, rng: Rng) -> Build:
+def sizes(n: int) -> dict[str, float]:
+    """Returns the row count of each table for base row count `n`."""
+    return {"events": n}
+
+
+def build(n: int, rng: Rng, structure: Rng) -> Build:
     """Generates the `events` table with `n` rows in timestamp order."""
     start = gen.micros(START)
     day_weights = np.tile(WEEKDAY_WEIGHTS, WEEKS)
@@ -140,4 +145,5 @@ DATASET = Dataset(
     name="temporal",
     description="Seasonal timestamps, monotonic ids, exponential inter-arrivals, timestamp vs timestamp_ntz, dates.",
     build=build,
+    sizes=sizes,
 )

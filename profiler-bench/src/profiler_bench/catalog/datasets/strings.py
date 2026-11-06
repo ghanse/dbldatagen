@@ -18,6 +18,7 @@ from profiler_bench.catalog.manifest import (
     Family,
     Format,
     FunctionalDependency,
+    QuasiIdentifierSet,
     Table,
 )
 from profiler_bench.catalog.registry import Build, Dataset
@@ -41,6 +42,20 @@ TIERS = ["bronze", "silver", "gold", "platinum"]
 TIER_PROBABILITIES = [0.5, 0.3, 0.15, 0.05]
 CHANNELS = ["web", "store", "phone"]
 CHANNEL_GIVEN_TIER = [[0.7, 0.2, 0.1], [0.5, 0.35, 0.15], [0.3, 0.5, 0.2], [0.1, 0.4, 0.5]]
+N_HOME_ZIPS = 100
+BIRTH = ("1940-01-01", "2005-12-31")
+GENDERS = ["F", "M"]
+
+
+def qi_unique_fraction(n: int) -> float:
+    """Returns the expected share of rows whose (home_zip, birth_date, gender) occurs once among `n` rows."""
+    combinations = N_HOME_ZIPS * (gen.days(BIRTH[1]) - gen.days(BIRTH[0]) + 1) * len(GENDERS)
+    return float((1 - 1 / combinations) ** (n - 1))
+
+
+def sizes(n: int) -> dict[str, float]:
+    """Returns the row count of the `contacts` table for base row count `n`."""
+    return {"contacts": n}
 
 
 def cramers_v(marginal: list[float], conditional: list[list[float]]) -> float:
@@ -51,13 +66,14 @@ def cramers_v(marginal: list[float], conditional: list[list[float]]) -> float:
     return math.sqrt(phi2 / (min(joint.shape) - 1))
 
 
-def build(n: int, rng: Rng) -> Build:
+def build(n: int, rng: Rng, structure: Rng) -> Build:
     """Generates the `contacts` table with `n` rows."""
-    names = gen.words(rng("names"), 300)
-    vocabulary = gen.words(rng("vocabulary"), VOCABULARY_SIZE, 1, 3)
-    cities = [w.capitalize() for w in gen.words(rng("cities"), N_CITIES, 2, 4)]
-    states = gen.indexed_strings(rng("states").choice(26**2, N_STATES, replace=False), [UPPER, UPPER]).to_pylist()
-    city_state = rng("city_state").integers(0, N_STATES, N_CITIES)
+    names = gen.words(structure("names"), 300)
+    vocabulary = gen.words(structure("vocabulary"), VOCABULARY_SIZE, 1, 3)
+    cities = [w.capitalize() for w in gen.words(structure("cities"), N_CITIES, 2, 4)]
+    states = gen.indexed_strings(structure("states").choice(26**2, N_STATES, replace=False), [UPPER, UPPER]).to_pylist()
+    city_state = structure("city_state").integers(0, N_STATES, N_CITIES)
+    home_zips = gen.indexed_strings(structure("home_zips").choice(10**5, N_HOME_ZIPS, replace=False), [DIGITS] * 5)
 
     phone_us = rng("phone.format").random(n) < PHONE_US_SHARE
     digits = [DIGITS] * 3
@@ -75,14 +91,14 @@ def build(n: int, rng: Rng) -> Build:
         [HEX] * 8 + ["-"] + [HEX] * 4 + ["-", "4"] + [HEX] * 3 + ["-", "89ab"] + [HEX] * 3 + ["-"] + [HEX] * 12,
     )
     comment_lengths = 1 + rng("comment.length").poisson(COMMENT_WORDS_LAM, n)
-    city = gen.zipf_choice(rng("city"), n, N_CITIES, CITY_ZIPF_S)
+    city = gen.zipf_choice(rng("city"), n, N_CITIES, CITY_ZIPF_S, structure("city.order"))
     tier = gen.choice(rng("tier"), n, TIER_PROBABILITIES)
     channel_cdf = np.cumsum(np.asarray(CHANNEL_GIVEN_TIER), axis=1)[tier]
     channel = np.minimum((rng("channel").random(n)[:, None] > channel_cdf).sum(axis=1), len(CHANNELS) - 1)
 
     table = pa.table(
         {
-            "id": pa.array(np.arange(1, n + 1), pa.int64()),
+            "id": pa.array(gen.hashed_ids(np.arange(n), int(rng("id").integers(0, 2**62))), pa.int64()),
             "email": gen.join(
                 gen.take(names, rng("email.first").integers(0, len(names), n)),
                 gen.take([".", "_"], rng("email.sep").integers(0, 2, n)),
@@ -105,15 +121,19 @@ def build(n: int, rng: Rng) -> Build:
             "channel": gen.take(CHANNELS, channel),
             "account_number": gen.random_strings(rng("account_number"), n, [DIGITS] * 10),
             "session_token": gen.random_strings(rng("session_token"), n, [HEX] * 32),
+            "home_zip": gen.take(home_zips, rng("home_zip").integers(0, N_HOME_ZIPS, n)),
+            "birth_date": gen.dates(rng("birth_date").integers(gen.days(BIRTH[0]), gen.days(BIRTH[1]) + 1, n)),
+            "gender": gen.take(GENDERS, rng("gender").integers(0, len(GENDERS), n)),
         }
     )
-    return Build({"contacts": table}, [_truth(n)], [])
+    return Build({"contacts": gen.shuffle(table, rng("row_order"))}, [_truth(n)], [])
 
 
 def _truth(n: int) -> Table:
     channel_probabilities = (np.asarray(TIER_PROBABILITIES) @ np.asarray(CHANNEL_GIVEN_TIER)).round(12).tolist()
     return Table(
         name="contacts",
+        row_order="shuffled",
         description="One row per contact; string columns with known formats, shares, and cardinalities.",
         primary_key=("id",),
         unique_keys=(("uuid",), ("session_token",)),
@@ -122,24 +142,31 @@ def _truth(n: int) -> Table:
                 name="id",
                 unique=True,
                 distinct=n,
-                distribution=Distribution(family=Family.SEQUENCE, params={"start": 1, "step": 1}),
+                note="Hashed: a keyed 63-bit bijection of 0..n-1, so ids are distinct, non-negative, and unordered.",
             ),
             Column(
                 name="email",
-                sensitive=True,
+                privacy="direct_identifier",
                 formats=(Format(regex=r"[a-z]+[._][a-z]+[0-9]{2}@(example\.com|mail\.test)", share=1.0),),
                 note="Near-unique; collisions are possible and the values must not leak.",
             ),
             Column(
                 name="phone",
                 null_rate=PHONE_NULL_RATE,
+                privacy="direct_identifier",
                 formats=(
                     Format(regex=PHONE_US, share=PHONE_US_SHARE),
                     Format(regex=PHONE_INTL, share=1 - PHONE_US_SHARE),
                 ),
             ),
             Column(name="sku", max_distinct=26**3 * 10**4, formats=(Format(regex=SKU, share=1.0),)),
-            Column(name="uuid", unique=True, formats=(Format(regex=UUID, share=1.0),), note="Random UUID v4."),
+            Column(
+                name="uuid",
+                unique=True,
+                privacy="direct_identifier",
+                formats=(Format(regex=UUID, share=1.0),),
+                note="Random UUID v4; a pseudonymous record id that links rows to a person.",
+            ),
             Column(
                 name="postal_code",
                 formats=(
@@ -150,6 +177,7 @@ def _truth(n: int) -> Table:
             Column(
                 name="comment",
                 null_rate=COMMENT_NULL_RATE,
+                privacy="free_text",
                 formats=(Format(regex=r"[a-z]+( [a-z]+)*", share=1.0),),
                 note=f"1 + Poisson({COMMENT_WORDS_LAM}) words drawn uniformly from {VOCABULARY_SIZE} words.",
             ),
@@ -174,7 +202,7 @@ def _truth(n: int) -> Table:
             ),
             Column(
                 name="account_number",
-                sensitive=True,
+                privacy="direct_identifier",
                 max_distinct=10**10,
                 formats=(Format(regex=r"[0-9]{10}", share=1.0),),
                 note="Near-unique random digits.",
@@ -182,8 +210,34 @@ def _truth(n: int) -> Table:
             Column(
                 name="session_token",
                 unique=True,
-                sensitive=True,
+                privacy="secret",
                 formats=(Format(regex=r"[0-9a-f]{32}", share=1.0),),
+            ),
+            Column(
+                name="home_zip",
+                privacy="quasi_identifier",
+                max_distinct=N_HOME_ZIPS,
+                formats=(Format(regex=r"[0-9]{5}", share=1.0),),
+                note=f"Uniform over {N_HOME_ZIPS} zip codes.",
+            ),
+            Column(
+                name="birth_date",
+                privacy="quasi_identifier",
+                distribution=Distribution(family=Family.UNIFORM, params={"low": BIRTH[0], "high": BIRTH[1]}),
+            ),
+            Column(
+                name="gender",
+                privacy="quasi_identifier",
+                distribution=Distribution(
+                    family=Family.CATEGORICAL, params={"values": GENDERS, "probabilities": [0.5, 0.5]}
+                ),
+            ),
+        ),
+        quasi_identifiers=(
+            QuasiIdentifierSet(
+                columns=("home_zip", "birth_date", "gender"),
+                unique_fraction=qi_unique_fraction(n),
+                mechanism="independent uniform zip, birth date, and gender",
             ),
         ),
         checks=(
@@ -206,4 +260,5 @@ DATASET = Dataset(
     name="strings",
     description="Emails, phones, SKUs, UUIDs, free text, mixed-format columns, categoricals, and near-unique ids.",
     build=build,
+    sizes=sizes,
 )

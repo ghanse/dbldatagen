@@ -26,9 +26,7 @@ from profiler_bench.fidelity.truth import (
     VALUE_LEAK_CATEGORIES,
     load_instance,
     quasi_identifier_sets,
-    sample_seed,
     sensitive_columns,
-    structure_seed,
 )
 
 
@@ -39,6 +37,7 @@ def score_privacy(
     manifest: Manifest,
     *,
     holdout: Mapping[str, DataFrame] | None = None,
+    sample_seed: int | None = None,
     seed: int = 0,
     config: MetricsConfig | None = None,
 ) -> PrivacyScore:
@@ -49,8 +48,10 @@ def score_privacy(
         synth: Synthetic DataFrames by table name.
         profile: Profile of the real data.
         manifest: Ground-truth manifest of the real data.
-        holdout: Real holdout DataFrames; defaults to the catalog dataset at the manifest's structure seed and its sample
-            seed plus `sampling.holdout_sample_offset`.
+        holdout: Real holdout DataFrames; defaults to the catalog dataset at the manifest's structure seed and sample
+            seed `sample_seed + sampling.holdout_sample_offset`.
+        sample_seed: Catalog sample seed of `real`, used to pick the holdout; defaults to the structure seed, which is
+            the catalog's default sample seed.
         seed: Seed of the distance-to-closest-record samples.
         config: Metrics configuration; defaults to the packaged one.
 
@@ -64,8 +65,9 @@ def score_privacy(
         holdout = load_instance(
             manifest.dataset,
             manifest.tier,
-            structure_seed=structure_seed(manifest),
-            sample_seed=sample_seed(manifest) + config.sampling.holdout_sample_offset,
+            structure_seed=manifest.structure_seed,
+            sample_seed=(manifest.structure_seed if sample_seed is None else sample_seed)
+            + config.sampling.holdout_sample_offset,
             spark=session,
         )
     limits = config.privacy

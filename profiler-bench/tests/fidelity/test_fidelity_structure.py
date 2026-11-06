@@ -137,7 +137,7 @@ def test_wrong_range_and_partial_enumeration_get_partial_credit(retail: tuple[Pr
     for check in customers["check_constraints"]:
         if check["kind"] == "enumeration" and check["column"] == "segment":
             check["values"] = ["consumer", "enterprise"]
-        if check["kind"] == "range":
+        if check["kind"] == "range" and check["column"] == "signup_date":
             check["min"] = "2010-01-01"
     checks = _category(score_structure(Profile.model_validate(data), truth), "customers", "checks")
     credits = {i.target.split(" ")[1]: i.credit for i in checks.items}

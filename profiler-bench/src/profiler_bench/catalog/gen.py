@@ -17,24 +17,29 @@ DIGITS = "0123456789"
 HEX = "0123456789abcdef"
 
 Rng = Callable[[str], np.random.Generator]
+STRUCTURE = "structure"
 
 _CONSONANTS = "bcdfghjklmnprstvz"
 _VOWELS = "aeiou"
 
 
-def rng_factory(seed: int, dataset: str) -> Rng:
+def rng_factory(seed: int, dataset: str, namespace: str = "") -> Rng:
     """Returns a function that maps a stream key to an independent, reproducible generator.
 
-    Each key gets its own stream derived from the seed, the dataset name, and the key, so adding
-    or reordering columns does not change the values of other columns.
+    Each key gets its own stream derived from the seed, the dataset name, the namespace, and the key,
+    so adding or reordering columns does not change the values of other columns. Generators use the
+    empty namespace with the sample seed for rows, and `STRUCTURE` with the structure seed for
+    generating parameters and vocabularies.
 
     Args:
-        seed: Dataset seed.
+        seed: Sample or structure seed.
         dataset: Dataset name.
+        namespace: Stream namespace.
     """
+    prefix = [seed, _stable_int(dataset)] + ([_stable_int(namespace)] if namespace else [])
 
     def rng(key: str) -> np.random.Generator:
-        return np.random.default_rng([seed, _stable_int(dataset), _stable_int(key)])
+        return np.random.default_rng([*prefix, _stable_int(key)])
 
     return rng
 
@@ -121,10 +126,21 @@ def zipf_probabilities(n_values: int, s: float) -> np.ndarray:
     return np.asarray(weights / weights.sum())
 
 
-def zipf_choice(rng: np.random.Generator, n: int, n_values: int, s: float) -> np.ndarray:
-    """Returns `n` indexes in `[0, n_values)` drawn by Zipf rank, with ranks assigned in random order."""
+def zipf_choice(
+    rng: np.random.Generator, n: int, n_values: int, s: float, order: np.random.Generator | None = None
+) -> np.ndarray:
+    """Returns `n` indexes in `[0, n_values)` drawn by Zipf rank, with ranks assigned in random order.
+
+    Args:
+        rng: Generator for the draws.
+        n: Number of draws.
+        n_values: Number of values.
+        s: Zipf exponent.
+        order: Generator for the rank order of the values; `rng` when None. Pass a structure stream
+            when the values are a fixed vocabulary, so which value is most frequent is structure.
+    """
     ranks = rng.choice(n_values, size=n, p=zipf_probabilities(n_values, s))
-    return rng.permutation(n_values)[ranks]
+    return (order or rng).permutation(n_values)[ranks]
 
 
 def words(rng: np.random.Generator, count: int, min_syllables: int = 2, max_syllables: int = 3) -> list[str]:
@@ -169,3 +185,29 @@ def dates(epoch_days: np.ndarray, mask: np.ndarray | None = None) -> pa.Array:
 def days(iso: str) -> int:
     """Returns days since the Unix epoch for an ISO date string."""
     return int(np.datetime64(iso, "D").astype(np.int64))
+
+
+_MASK63 = np.uint64(2**63 - 1)
+
+
+def hashed_ids(index: np.ndarray, salt: int) -> np.ndarray:
+    """Returns distinct non-negative int64 ids that look random, by a keyed bijection of `index` on 63 bits.
+
+    Every step (xor with the salt, xor-shift, multiplication by an odd constant, all mod 2**63) is a
+    bijection, so distinct indexes give distinct ids.
+
+    Args:
+        index: Distinct non-negative integers below 2**63.
+        salt: Key of the bijection.
+    """
+    x = (np.asarray(index, dtype=np.uint64) ^ np.uint64(salt & (2**63 - 1))) & _MASK63
+    with np.errstate(over="ignore"):
+        for shift, multiplier in ((31, 0x7FB5D329728EA185), (27, 0x01FF3D2A8CB7F6F1), (33, 0x1D2F3C9AAB1F0E8B)):
+            x ^= x >> np.uint64(shift)
+            x = (x * np.uint64(multiplier)) & _MASK63
+    return x.astype(np.int64)
+
+
+def shuffle(table: pa.Table, rng: np.random.Generator) -> pa.Table:
+    """Returns `table` with its rows in a random order."""
+    return table.take(pa.array(rng.permutation(table.num_rows)))

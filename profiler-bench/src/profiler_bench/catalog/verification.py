@@ -1,36 +1,44 @@
 """Checks that a manifest is true of the data it describes.
 
 Structural claims (row counts, types, keys, foreign keys, check constraints, functional
-dependencies, null rates, exact distinct counts) must hold exactly. Statistical claims
-(distribution parameters, format shares, dependency strengths, fan-out) must hold within a
-tolerance of a few standard errors for the observed sample size. Verification collects
-column values to the driver, so it is meant for the `xs` and `s` tiers.
+dependencies, exact distinct counts, planted extremes, null rates of 0 or 1) must hold exactly.
+Statistical claims are tested at significance `ALPHA` (see `profiler_bench.catalog.distributions`):
+distributions by goodness of fit, shares and rates within `Z` binomial standard errors, and
+dependency strengths with a measure-specific standard error:
+
+- Pearson: Fisher z, `var(atanh r) = 1 / (n - 3)`. This assumes bivariate normality; for
+  non-normal pairs the true variance can be larger, which makes the test stricter.
+- Spearman: Fisher z with the Fieller-Hartley-Pearson correction, `var = 1.06 / (n - 3)`.
+- Cramér's V: seeded parametric bootstrap, resampling the observed contingency table from its
+  multinomial distribution `BOOTSTRAP_SAMPLES` times.
+- Correlation ratio: seeded nonparametric bootstrap over rows with the bins held fixed.
+
+Verification collects column values to the driver, so it is meant for the `xs` and `s` tiers.
 """
 
 from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import date
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from pyspark.errors import AnalysisException
 from pyspark.sql import Column as SparkColumn
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
+from profiler_bench.catalog.distributions import ALPHA, DATE, NUMBER, RAW, TIMESTAMP, Z, check_distribution, near, share
 from profiler_bench.catalog.manifest import (
-    Bound,
     Check,
     Column,
     ComparisonCheck,
     Dependency,
-    Distribution,
     EnumerationCheck,
-    Family,
     ForeignKey,
     Manifest,
     RangeCheck,
@@ -38,21 +46,23 @@ from profiler_bench.catalog.manifest import (
 )
 
 
-Z = 5.0
+__all__ = ["ALPHA", "Z", "check_distribution", "verify"]
+
 MICROS_PER_SECOND = 1_000_000
-MICROS_PER_HOUR = 3_600 * MICROS_PER_SECOND
-MICROS_PER_DAY = 24 * MICROS_PER_HOUR
-EPOCH_WEEKDAY = 3
 CORRELATION_BINS = 50
 EPOCH_ORDINAL = date(1970, 1, 1).toordinal()
+SPEARMAN_VARIANCE = 1.06
+BOOTSTRAP_SAMPLES = 200
+BOOTSTRAP_SEED = 20_261_106
 
 
-def verify(truth: Manifest, frames: Mapping[str, DataFrame]) -> list[str]:
+def verify(truth: Manifest, frames: Mapping[str, DataFrame], tables: Collection[str] | None = None) -> list[str]:
     """Returns every claim of `truth` that the data in `frames` does not satisfy.
 
     Args:
         truth: Ground-truth manifest.
         frames: DataFrames by table name, as returned by `load`.
+        tables: Tables whose claims to check, with the foreign keys between them; all when None.
 
     Returns:
         One message per failed claim; empty when the manifest is true of the data.
@@ -63,8 +73,9 @@ def verify(truth: Manifest, frames: Mapping[str, DataFrame]) -> list[str]:
     session = next(iter(frames.values())).sparkSession
     if session.conf.get("spark.sql.session.timeZone") not in ("UTC", "Etc/UTC", "Z"):
         raise ValueError("verify needs spark.sql.session.timeZone=UTC")
-    failures = [f"{t.name}: {m}" for t in truth.tables for m in _verify_table(t, frames[t.name])]
-    for fk in truth.foreign_keys:
+    selected = {t.name for t in truth.tables} if tables is None else set(tables)
+    failures = [f"{t.name}: {m}" for t in truth.tables if t.name in selected for m in _verify_table(t, frames[t.name])]
+    for fk in (fk for fk in truth.foreign_keys if {fk.child_table, fk.parent_table} <= selected):
         label = f"{fk.child_table}{list(fk.child_columns)} -> {fk.parent_table}{list(fk.parent_columns)}"
         failures += [f"{label}: {m}" for m in _verify_foreign_key(fk, frames)]
     return failures
@@ -77,7 +88,8 @@ def _verify_table(table: Table, df: DataFrame) -> list[str]:
     expected = [(c.name, c.type) for c in table.columns]
     if actual != expected:
         return [*failures, f"schema {actual} != {expected}"]
-    failures += _verify_columns(df, table.columns, "")
+    ordered = any(c.monotonic is not None or c.increments is not None for c in table.columns)
+    failures += _verify_columns(storage_ordered(df) if ordered else df, table.columns, "")
     failures += _verify_keys(table, df, rows)
     failures += [m for check in table.checks for m in _verify_check(check, df)]
     for fd in table.functional_dependencies:
@@ -93,10 +105,30 @@ def _verify_table(table: Table, df: DataFrame) -> list[str]:
             failures.append(f"functional dependency {list(fd.determinant)} -> {list(fd.dependent)} violated")
     if table.dependencies:
         names = sorted({c for dep in table.dependencies for c in dep.columns})
-        raw = _collect(df, names)
-        pairs = pd.DataFrame({c: _values(raw[c], df.schema[c].dataType) for c in names})
+        raw = collect(df, names)
+        pairs = pd.DataFrame({c: values_of(raw[c], df.schema[c].dataType) for c in names})
         failures += [m for dep in table.dependencies for m in _verify_dependency(dep, pairs)]
+    for qi in table.quasi_identifiers:
+        unique_rows = df.groupBy(*qi.columns).count().where("count = 1").count()
+        failures += share(f"unique share of {list(qi.columns)}", unique_rows / max(rows, 1), qi.unique_fraction, rows)
     return failures
+
+
+def storage_ordered(df: DataFrame) -> DataFrame:
+    """Returns `df` sorted into storage order: part files by path, then rows within each file.
+
+    Spark does not read multi-file tables in file order, so storage-order claims need this. A
+    DataFrame that is not a plain file scan (for example a union) is returned unchanged.
+    """
+    try:
+        with_file = df.withColumn("__file", F.col("_metadata.file_path"))
+    except AnalysisException:
+        return df
+    return (
+        with_file.withColumn("__row", F.monotonically_increasing_id())
+        .orderBy("__file", "__row")
+        .drop("__file", "__row")
+    )
 
 
 def _verify_keys(table: Table, df: DataFrame, rows: int) -> list[str]:
@@ -140,7 +172,7 @@ def _verify_foreign_key(fk: ForeignKey, frames: Mapping[str, DataFrame]) -> list
     total = child.count()
     missing = child.join(parent, list(fk.child_columns), "left_anti").count()
     coverage = 1.0 - missing / total if total else 1.0
-    failures = _share("coverage", coverage, fk.coverage, total)
+    failures = _rate("coverage", coverage, fk.coverage, total)
     if fk.fanout is not None:
         joined: pd.DataFrame = (
             parent.join(child.groupBy(*fk.child_columns).count(), list(fk.child_columns), "left")
@@ -148,53 +180,87 @@ def _verify_foreign_key(fk: ForeignKey, frames: Mapping[str, DataFrame]) -> list
             .toPandas()
         )
         counts = joined["count"].to_numpy(dtype=np.float64)
-        failures += [f"fanout {m}" for m in check_distribution(counts, fk.fanout, _NUMBER, counts_input=True)]
+        failures += [f"fanout {m}" for m in check_distribution(counts, fk.fanout, NUMBER, counts_input=True)]
     return failures
+
+
+def dependency_value(measure: str, x: pd.Series, y: pd.Series) -> float:
+    """Returns the realized value of a dependency measure over aligned non-null pairs."""
+    if measure == "pearson":
+        return float(np.corrcoef(x.astype(float), y.astype(float))[0, 1])
+    if measure == "spearman":
+        return float(np.corrcoef(x.rank(), y.rank())[0, 1])
+    if measure == "cramers_v":
+        return _cramers_v(pd.crosstab(x, y).to_numpy(dtype=np.float64))
+    codes, values = _bins(x), y.to_numpy(dtype=np.float64)
+    return _correlation_ratio(codes, values)
 
 
 def _verify_dependency(dep: Dependency, values: pd.DataFrame) -> list[str]:
     pdf = values[list(dep.columns)].dropna()
-    x, y = pdf[dep.columns[0]], pdf[dep.columns[1]]
-    if dep.measure == "pearson":
-        observed = float(np.corrcoef(x.astype(float), y.astype(float))[0, 1])
-    elif dep.measure == "spearman":
-        observed = float(np.corrcoef(x.rank(), y.rank())[0, 1])
-    elif dep.measure == "cramers_v":
-        observed = _cramers_v(x, y)
+    x, y, n = pdf[dep.columns[0]], pdf[dep.columns[1]], len(pdf)
+    label = f"{dep.measure}{list(dep.columns)}"
+    observed = dependency_value(dep.measure, x, y)
+    if dep.measure in ("pearson", "spearman"):
+        factor = 1.0 if dep.measure == "pearson" else SPEARMAN_VARIANCE
+        return _fisher(label, observed, dep.value, n, factor)
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    if dep.measure == "cramers_v":
+        table = pd.crosstab(x, y).to_numpy(dtype=np.float64)
+        draws = rng.multinomial(n, (table / n).ravel(), BOOTSTRAP_SAMPLES).reshape(-1, *table.shape)
+        replicates = np.asarray([_cramers_v(t.astype(np.float64)) for t in draws])
     else:
-        observed = _correlation_ratio(x, y)
-    tolerance = 0.02 + 4 * (1 - dep.value**2) / math.sqrt(len(pdf))
-    return _near(f"{dep.measure}{list(dep.columns)}", observed, dep.value, tolerance)
+        codes, ys = _bins(x), y.to_numpy(dtype=np.float64)
+        resamples = (rng.integers(0, n, n) for _ in range(BOOTSTRAP_SAMPLES))
+        replicates = np.asarray([_correlation_ratio(codes[r], ys[r]) for r in resamples])
+    return near(f"{label} (bootstrap)", observed, dep.value, Z * float(replicates.std(ddof=1)) + 1e-9)
 
 
-def _cramers_v(x: pd.Series, y: pd.Series) -> float:
-    table = pd.crosstab(x, y).to_numpy(dtype=np.float64)
+def _fisher(label: str, observed: float, expected: float, n: int, factor: float) -> list[str]:
+    if n <= 3:
+        return [f"{label}: too few pairs ({n})"]
+    se = math.sqrt(factor / (n - 3))
+    z_observed, z_expected = (math.atanh(min(max(r, -0.999999), 0.999999)) for r in (observed, expected))
+    if abs(z_observed - z_expected) <= Z * se:
+        return []
+    return [
+        f"{label} {observed:.4g}, expected {expected:.4g} (Fisher z off by {abs(z_observed - z_expected) / se:.3g} se)"
+    ]
+
+
+def _cramers_v(table: np.ndarray) -> float:
+    table = table[table.sum(axis=1) > 0][:, table.sum(axis=0) > 0]
     expected = table.sum(axis=1, keepdims=True) * table.sum(axis=0, keepdims=True) / table.sum()
     chi2 = float(((table - expected) ** 2 / expected).sum())
     return math.sqrt(chi2 / (table.sum() * (min(table.shape) - 1)))
 
 
-def _correlation_ratio(x: pd.Series, y: pd.Series) -> float:
-    groups = pd.qcut(x, CORRELATION_BINS, labels=False, duplicates="drop") if pd.api.types.is_numeric_dtype(x) else x
-    y = y.astype(float)
-    means = y.groupby(groups).transform("mean")
-    return math.sqrt(float(((means - y.mean()) ** 2).sum() / ((y - y.mean()) ** 2).sum()))
+def _bins(x: pd.Series) -> np.ndarray:
+    if pd.api.types.is_numeric_dtype(x):
+        return np.asarray(pd.qcut(x, CORRELATION_BINS, labels=False, duplicates="drop"), dtype=np.int64)
+    return np.asarray(pd.factorize(x)[0], dtype=np.int64)
 
 
-_NUMBER, _DATE, _TIMESTAMP, _RAW = "number", "date", "timestamp", "raw"
+def _correlation_ratio(codes: np.ndarray, y: np.ndarray) -> float:
+    counts = np.bincount(codes)
+    sums = np.bincount(codes, weights=y)
+    present = counts > 0
+    means = sums[present] / counts[present]
+    total = ((y - y.mean()) ** 2).sum()
+    return math.sqrt(float((counts[present] * (means - y.mean()) ** 2).sum() / total))
 
 
 def _kind(dtype: T.DataType) -> str:
     if isinstance(dtype, T.DateType):
-        return _DATE
+        return DATE
     if isinstance(dtype, T.TimestampType | T.TimestampNTZType):
-        return _TIMESTAMP
+        return TIMESTAMP
     if isinstance(dtype, T.NumericType):
-        return _NUMBER
-    return _RAW
+        return NUMBER
+    return RAW
 
 
-def _collect(frame: DataFrame, names: Sequence[str]) -> pd.DataFrame:
+def collect(frame: DataFrame, names: Sequence[str]) -> pd.DataFrame:
     """Collects columns to pandas, with timestamps as epoch microseconds computed by Spark.
 
     Converting in Spark keeps the session time zone; `toPandas` would apply the local one.
@@ -205,12 +271,12 @@ def _collect(frame: DataFrame, names: Sequence[str]) -> pd.DataFrame:
         column = F.col(f"`{name}`")
         if isinstance(schema[name], T.TimestampNTZType):
             column = column.cast(T.TimestampType())
-        return F.unix_micros(column).alias(name) if _kind(schema[name]) == _TIMESTAMP else column
+        return F.unix_micros(column).alias(name) if _kind(schema[name]) == TIMESTAMP else column
 
     return frame.select(*(expr(n) for n in names)).toPandas()
 
 
-def _values(series: pd.Series, dtype: T.DataType) -> pd.Series:
+def values_of(series: pd.Series, dtype: T.DataType) -> pd.Series:
     """Returns the non-null, finite values of a collected column in storage order.
 
     Arrays, maps, and binary values become their lengths, dates days since the epoch, and numbers
@@ -239,15 +305,19 @@ def _verify_columns(frame: DataFrame, columns: Sequence[Column], path: str) -> l
             if bound is not None:
                 aggregates.append((aggregate(col) == F.lit(bound).cast(schema[c.name])).alias(f"{c.name}__{name}"))
         if isinstance(schema[c.name], T.FloatType | T.DoubleType):
-            aggregates.append(F.sum(F.isnan(col).cast("int")).alias(f"{c.name}__nan"))
-            aggregates.append(F.sum((col == float("inf")).cast("int")).alias(f"{c.name}__inf"))
-            aggregates.append(F.sum((col == float("-inf")).cast("int")).alias(f"{c.name}__-inf"))
+            if c.special_values:
+                aggregates.append(F.sum(F.isnan(col).cast("int")).alias(f"{c.name}__nan"))
+                aggregates.append(F.sum((col == float("inf")).cast("int")).alias(f"{c.name}__inf"))
+                aggregates.append(F.sum((col == float("-inf")).cast("int")).alias(f"{c.name}__-inf"))
+            else:
+                nonfinite = F.isnan(col) | (F.abs(col) == float("inf"))
+                aggregates.append(F.sum(nonfinite.cast("int")).alias(f"{c.name}__nonfinite"))
     stats = frame.agg(*aggregates).collect()[0].asDict()
-    values = _collect(frame, [c.name for c in columns])
+    values = collect(frame, [c.name for c in columns])
     failures = []
     for c in columns:
         label = f"{path}{c.name}"
-        series = _values(values[c.name], schema[c.name])
+        series = values_of(values[c.name], schema[c.name])
         failures += [f"{label}: {m}" for m in _verify_column(c, schema[c.name], stats, series)]
         failures += _verify_children(frame, c, schema[c.name], f"{label}.")
     return failures
@@ -266,11 +336,14 @@ def _verify_column(column: Column, dtype: T.DataType, stats: dict[str, Any], ser
     for name, bound in (("min", column.min_value), ("max", column.max_value)):
         if bound is not None and not stats[f"{column.name}__{name}"]:
             failures.append(f"{name} is not {bound}")
-    for special, share in column.special_values.items():
-        failures += _share(f"{special} share", stats[f"{column.name}__{special}"] / max(present, 1), share, present)
+    if stats.get(f"{column.name}__nonfinite"):
+        failures.append(f"{stats[f'{column.name}__nonfinite']} undeclared NaN or infinite values")
+    for special, expected in column.special_values.items():
+        observed = stats[f"{column.name}__{special}"] / max(present, 1)
+        failures += share(f"{special} share", observed, expected, present)
     if isinstance(dtype, T.ArrayType | T.MapType | T.BinaryType):
         if column.length is not None:
-            failures += [f"length {m}" for m in check_distribution(series.to_numpy(), column.length, _NUMBER)]
+            failures += [f"length {m}" for m in check_distribution(series.to_numpy(), column.length, NUMBER)]
         return failures
     kind = _kind(dtype)
     if column.formats:
@@ -282,16 +355,22 @@ def _verify_column(column: Column, dtype: T.DataType, stats: dict[str, Any], ser
     return failures
 
 
+def _rate(label: str, observed: float, expected: float, n: int) -> list[str]:
+    if expected in (0.0, 1.0):
+        return [] if observed == expected else [f"{label} {observed:.6g} != {expected}"]
+    return share(label, observed, expected, n)
+
+
 def _verify_formats(column: Column, strings: pd.Series) -> list[str]:
     failures, matched = [], np.zeros(len(strings), dtype=bool)
     for fmt in column.formats:
         pattern = re.compile(fmt.regex)
         hits = strings.map(lambda s, p=pattern: p.fullmatch(s) is not None).to_numpy(dtype=bool)
         matched |= hits
-        failures += _share(f"format {fmt.regex!r} share", hits.mean() if len(hits) else 0.0, fmt.share, len(hits))
+        failures += share(f"format {fmt.regex!r} share", hits.mean() if len(hits) else 0.0, fmt.share, len(hits))
     unmatched = 1.0 - matched.mean() if len(matched) else 0.0
     declared = max(0.0, 1.0 - sum(f.share for f in column.formats))
-    return failures + _share("unmatched share", unmatched, declared, len(strings))
+    return failures + share("unmatched share", unmatched, declared, len(strings))
 
 
 def _verify_order(column: Column, values: np.ndarray, kind: str) -> list[str]:
@@ -302,8 +381,8 @@ def _verify_order(column: Column, values: np.ndarray, kind: str) -> list[str]:
     if column.monotonic == "strictly_increasing" and (steps <= 0).any():
         failures.append("values do not strictly increase in storage order")
     if column.increments is not None:
-        scaled = steps / MICROS_PER_SECOND if kind == _TIMESTAMP else steps
-        failures += [f"increments {m}" for m in check_distribution(scaled, column.increments, _NUMBER)]
+        scaled = steps / MICROS_PER_SECOND if kind == TIMESTAMP else steps
+        failures += [f"increments {m}" for m in check_distribution(scaled, column.increments, NUMBER)]
     return failures
 
 
@@ -317,214 +396,3 @@ def _verify_children(frame: DataFrame, column: Column, dtype: T.DataType, path: 
     if isinstance(dtype, T.MapType) and column.key is not None and column.value is not None:
         return _verify_columns(frame.select(F.explode(col).alias("key", "value")), (column.key, column.value), path)
     return []
-
-
-def _near(label: str, observed: float, expected: float, tolerance: float) -> list[str]:
-    if abs(observed - expected) <= tolerance:
-        return []
-    return [f"{label} {observed:.6g}, expected {expected:.6g} ± {tolerance:.3g}"]
-
-
-def _share(label: str, observed: float, expected: float, n: int) -> list[str]:
-    tolerance = 0.002 + Z * math.sqrt(expected * (1 - expected) / max(n, 1))
-    return _near(label, observed, expected, tolerance)
-
-
-def _rate(label: str, observed: float, expected: float, n: int) -> list[str]:
-    if expected in (0.0, 1.0):
-        return [] if observed == expected else [f"{label} {observed:.6g} != {expected}"]
-    return _share(label, observed, expected, n)
-
-
-def _to_number(value: Bound, kind: str) -> float:
-    if kind == _DATE:
-        return float(np.datetime64(str(value), "D").astype(np.int64))
-    if kind == _TIMESTAMP:
-        return float(np.datetime64(str(value).rstrip("Z"), "us").astype(np.int64))
-    return float(value)
-
-
-def check_distribution(
-    values: np.ndarray, dist: Distribution, kind: str = _NUMBER, counts_input: bool = False
-) -> list[str]:
-    """Returns the ways `values` departs from `dist` by more than the sampling tolerance.
-
-    Args:
-        values: Non-null values in storage order: numbers (days for dates, microseconds for
-            timestamps) or raw values for strings and booleans.
-        dist: Declared distribution.
-        kind: `number`, `date`, `timestamp`, or `raw`; selects how ISO parameters are read.
-        counts_input: Whether `values` are counts per category (as for foreign-key fan-out)
-            rather than draws. Only changes the meaning of `zipf`.
-    """
-    if len(values) == 0:
-        return ["no values to check"]
-    if dist.family == Family.ZIPF:
-        counts = values if counts_input else pd.Series(values).value_counts().to_numpy()
-        return _check_zipf(np.asarray(counts, dtype=np.float64), dist.params["s"], dist.params["n_values"])
-    if dist.family in (Family.CATEGORICAL, Family.CONSTANT) and kind == _RAW:
-        return _check_categorical(values, dist)
-    params = {
-        k: _to_number(v, kind) if k in ("low", "high", "start", "end", "value") else v for k, v in dist.params.items()
-    }
-    return _CHECKS[dist.family](np.asarray(values, dtype=np.float64), params)
-
-
-def _check_categorical(values: np.ndarray, dist: Distribution) -> list[str]:
-    if dist.family == Family.CONSTANT:
-        others = int((pd.Series(values) != dist.params["value"]).sum())
-        return [f"{others} values differ from the constant"] if others else []
-    shares = pd.Series(values).value_counts(normalize=True)
-    unknown = sorted(map(str, set(shares.index) - set(dist.params["values"])))
-    failures = [f"unexpected values {unknown[:5]}"] if unknown else []
-    for value, p in zip(dist.params["values"], dist.params["probabilities"], strict=True):
-        failures += _share(f"share of {value!r}", float(shares.get(value, 0.0)), p, len(values))
-    return failures
-
-
-def _check_zipf(counts: np.ndarray, s: float, n_values: int) -> list[str]:
-    total = counts.sum()
-    if len(counts) > n_values:
-        return [f"{len(counts)} distinct values > n_values {n_values}"]
-    p = np.sort(np.arange(1, n_values + 1, dtype=np.float64) ** -s)[::-1]
-    p /= p.sum()
-    observed = np.sort(np.pad(counts, (0, n_values - len(counts))))[::-1] / total
-    failures = [m for k in range(min(3, n_values)) for m in _share(f"rank {k + 1} share", observed[k], p[k], total)]
-    hit = 1.0 - (1.0 - p) ** total
-    used = float((counts > 0).sum())
-    tolerance = 1 + Z * math.sqrt(float((hit * (1 - hit)).sum()))
-    return failures + _near("distinct used", used, float(hit.sum()), tolerance)
-
-
-def _mean_std(values: np.ndarray, mean: float, std: float) -> list[str]:
-    n = len(values)
-    return _near("mean", float(values.mean()), mean, Z * std / math.sqrt(n) + 1e-9) + _near(
-        "std", float(values.std()), std, Z * std / math.sqrt(2 * n) + 1e-9
-    )
-
-
-def _bounds(values: np.ndarray, low: float | None, high: float | None) -> list[str]:
-    failures = []
-    if low is not None and values.min() < low:
-        failures.append(f"min {values.min():.6g} < {low:.6g}")
-    if high is not None and values.max() > high:
-        failures.append(f"max {values.max():.6g} > {high:.6g}")
-    return failures
-
-
-def _integral(values: np.ndarray) -> list[str]:
-    return [] if np.array_equal(values, np.round(values)) else ["non-integer values"]
-
-
-def _normal(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    return _mean_std(v, p["mean"], p["std"])
-
-
-def _lognormal(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    return _bounds(v, 1e-300, None) or _mean_std(np.log(v), p["mu"], p["sigma"])
-
-
-def _mixture(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    components = p["components"]
-    mean = sum(c["weight"] * c["mean"] for c in components)
-    variance = sum(c["weight"] * (c["std"] ** 2 + c["mean"] ** 2) for c in components) - mean**2
-    centered = v - v.mean()
-    fourth = float((centered**4).mean())
-    n = len(v)
-    return _near("mean", float(v.mean()), mean, Z * math.sqrt(variance / n)) + _near(
-        "variance", float(centered.var()), variance, Z * math.sqrt(max(fourth - variance**2, 1e-12) / n)
-    )
-
-
-def _uniform(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    low, high = p["low"], p["high"]
-    tolerance = Z * (high - low) / math.sqrt(12 * len(v)) + 1e-9
-    return _bounds(v, low, high) + _near("mean", float(v.mean()), (low + high) / 2, tolerance)
-
-
-def _discrete_uniform(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    return _integral(v) + _uniform(v, p)
-
-
-def _exponential(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    scale = p["scale"]
-    return _bounds(v, 0.0, None) + _near("mean", float(v.mean()), scale, Z * scale / math.sqrt(len(v)))
-
-
-def _pareto(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    alpha, scale = p["alpha"], p["scale"]
-    failures = _bounds(v, scale * (1 - 1e-9), None)
-    for factor in (2.0, 10.0):
-        failures += _share(f"share above {factor}x scale", float((v > factor * scale).mean()), factor**-alpha, len(v))
-    return failures
-
-
-def _poisson(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    lam, shift, n = p["lam"], p.get("shift", 0), len(v)
-    return (
-        _integral(v)
-        + _bounds(v, shift, None)
-        + _near("mean", float(v.mean()), lam + shift, Z * math.sqrt(lam / n))
-        + _near("variance", float(v.var()), lam, Z * math.sqrt((lam + 2 * lam**2) / n))
-    )
-
-
-def _binomial(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    trials, prob = p["n"], p["p"]
-    sd = math.sqrt(trials * prob * (1 - prob))
-    return (
-        _integral(v) + _bounds(v, 0, trials) + _near("mean", float(v.mean()), trials * prob, Z * sd / math.sqrt(len(v)))
-    )
-
-
-def _negative_binomial(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    size, prob = p["n"], p["p"]
-    mean, variance = size * (1 - prob) / prob, size * (1 - prob) / prob**2
-    return _integral(v) + _bounds(v, 0, None) + _near("mean", float(v.mean()), mean, Z * math.sqrt(variance / len(v)))
-
-
-def _constant(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    others = int((v != p["value"]).sum())
-    return [f"{others} values differ from the constant"] if others else []
-
-
-def _categorical_numbers(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    return _check_categorical(v, Distribution(family=Family.CATEGORICAL, params=p))
-
-
-def _sequence(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    expected = p["start"] + p["step"] * np.arange(len(v))
-    return [] if np.array_equal(np.sort(v), expected) else [f"values are not the sequence {p['start']} + {p['step']}*i"]
-
-
-def _seasonal(v: np.ndarray, p: dict[str, Any]) -> list[str]:
-    failures = _bounds(v, p["start"], p["end"])
-    whole = v.astype(np.int64)
-    for label, index, weights in (
-        ("hour", (whole // MICROS_PER_HOUR) % 24, p["hour_weights"]),
-        ("weekday", (whole // MICROS_PER_DAY + EPOCH_WEEKDAY) % 7, p["weekday_weights"]),
-    ):
-        shares = np.bincount(index, minlength=len(weights)) / len(v)
-        expected = np.asarray(weights, dtype=np.float64) / sum(weights)
-        failures += [
-            m for i in range(len(weights)) for m in _share(f"{label} {i} share", shares[i], expected[i], len(v))
-        ]
-    return failures
-
-
-_CHECKS: dict[Family, Callable[[np.ndarray, dict[str, Any]], list[str]]] = {
-    Family.CONSTANT: _constant,
-    Family.NORMAL: _normal,
-    Family.LOGNORMAL: _lognormal,
-    Family.MIXTURE: _mixture,
-    Family.UNIFORM: _uniform,
-    Family.DISCRETE_UNIFORM: _discrete_uniform,
-    Family.EXPONENTIAL: _exponential,
-    Family.PARETO: _pareto,
-    Family.POISSON: _poisson,
-    Family.BINOMIAL: _binomial,
-    Family.NEGATIVE_BINOMIAL: _negative_binomial,
-    Family.CATEGORICAL: _categorical_numbers,
-    Family.SEQUENCE: _sequence,
-    Family.SEASONAL: _seasonal,
-}

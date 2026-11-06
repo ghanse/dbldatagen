@@ -29,8 +29,12 @@ def _parser() -> argparse.ArgumentParser:
         else:
             command.add_argument("name", choices=sorted(DATASETS))
         command.add_argument("--tier", choices=sorted(TIERS), default=DEFAULT_TIER)
-        command.add_argument("--seed", type=int, default=0)
+        command.add_argument("--seed", type=int, default=0, help="structure seed (and sample seed by default)")
+        command.add_argument("--sample-seed", type=int, default=None, help="seed of the rows (default: --seed)")
         command.add_argument("--cache-dir", type=Path, default=None)
+        command.add_argument(
+            "--skip-hash-check", action="store_true", help="trust a cached instance without re-hashing its files"
+        )
     return parser
 
 
@@ -49,10 +53,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"tiers: {', '.join(f'{t}={n:,}' for t, n in TIERS.items())} base rows")
     elif args.command == "materialize":
         for name in args.names or list(DATASETS):
-            instance = materialize(name, args.tier, args.seed, args.cache_dir)
-            print(f"{name:<10} {args.tier:<3} seed={args.seed} {instance.content_hash} {instance.path}")
+            instance = materialize(
+                name, args.tier, args.seed, args.cache_dir, not args.skip_hash_check, args.sample_seed
+            )
+            seeds = f"seed={instance.structure_seed} sample={instance.sample_seed}"
+            print(f"{name:<10} {args.tier:<3} {seeds} {instance.content_hash} {instance.path}")
     else:
-        print(materialize(args.name, args.tier, args.seed, args.cache_dir).manifest.model_dump_json(indent=2))
+        instance = materialize(
+            args.name, args.tier, args.seed, args.cache_dir, not args.skip_hash_check, args.sample_seed
+        )
+        print(instance.manifest.model_dump_json(indent=2))
     return 0
 
 

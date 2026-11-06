@@ -122,7 +122,7 @@ def ceiling(
     other = sample_seed + config.sampling.ceiling_sample_offset
     real = load_instance(name, tier, structure_seed=structure_seed, sample_seed=sample_seed, spark=spark)
     stand_in = load_instance(name, tier, structure_seed=structure_seed, sample_seed=other, spark=spark)
-    manifest = manifest_of(name, tier, structure_seed=structure_seed, sample_seed=sample_seed)
+    manifest = manifest_of(name, tier, structure_seed=structure_seed)
     return score_reconstruction(real, stand_in, manifest, seed=seed, config=config)
 
 
