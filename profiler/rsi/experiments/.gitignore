@@ -1,0 +1,10 @@
+# Large intermediates must never be retained under experiments/.
+*.parquet
+*.orc
+*.avro
+*.arrow
+*.bin
+*.snappy
+**/spark-warehouse/
+**/_temporary/
+**/.cache/
