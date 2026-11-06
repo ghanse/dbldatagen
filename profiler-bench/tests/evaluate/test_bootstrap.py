@@ -172,6 +172,62 @@ def test_deleted_sample_file_blocks_acceptance_on_reevaluate(tmp_path: Path) -> 
     assert completeness["detail"]["missing"]
 
 
+def test_failed_raw_record_not_masked_by_duplicate_success() -> None:
+    fidelity = _fidelity_pairs(baseline=0.70, candidate=0.85, ceiling=0.90, seeds=2)
+    speed = _speed_pairs(baseline=1.0, candidate=0.5, n=2)
+    failed = dict(speed[0])
+    failed["ok"] = False
+    success_dup = dict(speed[0])
+    success_dup["ok"] = True
+    # Failed record appears first; a later successful duplicate must not hide it.
+    speed_with_dup = [failed, success_dup, *speed[1:]]
+    verdict = evaluate_gates(
+        speed_records=speed_with_dup,
+        fidelity_records=fidelity,
+        policy=_policy(n_speed=2, n_fid=2),
+        proposal={"type": "accuracy", "targets": ["numeric"]},
+        run=_run(control=False, n_speed=2, n_fid=2, distinct=True),
+    )
+    assert verdict["verdict"] != "accepted"
+    assert "failed_or_missing_samples" in verdict["reasons"]
+    completeness = next(gate for gate in verdict["gates"] if gate["name"] == "sample_completeness")
+    assert completeness["detail"]["failed"]
+
+
+def test_duplicate_sample_blocks_acceptance() -> None:
+    fidelity = _fidelity_pairs(baseline=0.70, candidate=0.85, ceiling=0.90, seeds=2)
+    speed = _speed_pairs(baseline=1.0, candidate=0.5, n=2)
+    speed = [*speed, dict(speed[0])]
+    verdict = evaluate_gates(
+        speed_records=speed,
+        fidelity_records=fidelity,
+        policy=_policy(n_speed=2, n_fid=2),
+        proposal={"type": "accuracy", "targets": ["numeric"]},
+        run=_run(control=False, n_speed=2, n_fid=2, distinct=True),
+    )
+    assert verdict["verdict"] != "accepted"
+    assert "duplicate_sample" in verdict["reasons"]
+
+
+def test_unexpected_sample_blocks_acceptance() -> None:
+    fidelity = _fidelity_pairs(baseline=0.70, candidate=0.85, ceiling=0.90, seeds=2)
+    speed = _speed_pairs(baseline=1.0, candidate=0.5, n=2)
+    extra = dict(speed[0])
+    extra["sample_index"] = 99
+    speed = [*speed, extra]
+    verdict = evaluate_gates(
+        speed_records=speed,
+        fidelity_records=fidelity,
+        policy=_policy(n_speed=2, n_fid=2),
+        proposal={"type": "accuracy", "targets": ["numeric"]},
+        run=_run(control=False, n_speed=2, n_fid=2, distinct=True),
+    )
+    assert verdict["verdict"] != "accepted"
+    assert "unexpected_sample" in verdict["reasons"]
+    completeness = next(gate for gate in verdict["gates"] if gate["name"] == "sample_completeness")
+    assert "speed/baseline/numeric/s/99" in completeness["detail"]["unexpected"]
+
+
 def test_control_favorable_noise_never_accepted() -> None:
     fidelity = _fidelity_pairs(baseline=0.50, candidate=0.90, ceiling=0.95, seeds=6)
     speed = _speed_pairs(baseline=2.0, candidate=0.5, n=4)

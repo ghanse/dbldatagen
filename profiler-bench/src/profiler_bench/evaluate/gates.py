@@ -121,23 +121,56 @@ def _sample_completeness(
     fidelity_records: Sequence[dict[str, Any]],
     expected: dict[str, set[str]],
 ) -> GateResult:
-    present = {_sample_key(record): record for record in [*speed_records, *fidelity_records]}
-    missing: list[str] = []
-    failed: list[str] = []
-    for key in sorted(expected["speed"] | expected["fidelity"]):
-        record = present.get(key)
-        if record is None:
-            missing.append(key)
-        elif not record.get("ok"):
-            failed.append(key)
-    if missing or failed:
+    """Checks raw records first, then duplicates, unexpected cells, and missing cells."""
+    raw = [*speed_records, *fidelity_records]
+    # Any failed record anywhere blocks acceptance, including cells outside the matrix and
+    # failures that a later duplicate success would otherwise overwrite if keyed first.
+    failed = [_sample_key(record) for record in raw if not record.get("ok")]
+    if failed:
         return GateResult(
             name="sample_completeness",
             passed=False,
             status="fail",
             reason="failed_or_missing_samples",
-            detail={"missing": missing, "failed": failed},
+            detail={"failed": failed},
         )
+
+    expected_keys = expected["speed"] | expected["fidelity"]
+    counts: dict[str, int] = defaultdict(int)
+    for record in raw:
+        counts[_sample_key(record)] += 1
+
+    duplicates = sorted(key for key, count in counts.items() if count > 1)
+    if duplicates:
+        return GateResult(
+            name="sample_completeness",
+            passed=False,
+            status="fail",
+            reason="duplicate_sample",
+            detail={"duplicates": duplicates},
+        )
+
+    present = set(counts)
+    unexpected = sorted(present - expected_keys)
+    if unexpected:
+        return GateResult(
+            name="sample_completeness",
+            passed=False,
+            status="fail",
+            reason="unexpected_sample",
+            detail={"unexpected": unexpected},
+        )
+
+    missing = sorted(expected_keys - present)
+    if missing:
+        return GateResult(
+            name="sample_completeness",
+            passed=False,
+            status="fail",
+            reason="failed_or_missing_samples",
+            detail={"missing": missing},
+        )
+
     return GateResult(
         name="sample_completeness",
         passed=True,
