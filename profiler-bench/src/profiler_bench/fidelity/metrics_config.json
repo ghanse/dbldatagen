@@ -1,0 +1,59 @@
+{
+  "version": "1.0.0",
+  "sampling": {
+    "max_rows": 20000,
+    "discriminator_rows": 2000,
+    "privacy_rows": 2000,
+    "pattern_samples": 200,
+    "holdout_seed_offset": 1
+  },
+  "marginal": {
+    "top_values": 20,
+    "categorical_max_distinct": 20
+  },
+  "dependence": {
+    "random_pairs": 20,
+    "correlation_bins": 50
+  },
+  "discriminator": {
+    "k": 10
+  },
+  "reconstruction_weights": {
+    "schema": 0.05,
+    "marginal": 0.25,
+    "null_fraction": 0.1,
+    "distinct": 0.1,
+    "dependence_declared": 0.1,
+    "dependence_random": 0.05,
+    "constraints": 0.1,
+    "keys": 0.05,
+    "foreign_keys": 0.1,
+    "discriminator": 0.1
+  },
+  "structure_weights": {
+    "keys": 0.15,
+    "foreign_keys": 0.15,
+    "checks": 0.15,
+    "functional_dependencies": 0.1,
+    "dependencies": 0.15,
+    "patterns": 0.1,
+    "null_rates": 0.1,
+    "cardinality": 0.1
+  },
+  "structure_tolerances": {
+    "dependency": 0.05,
+    "distinct_log_ratio": 0.05,
+    "range_relative": 0.05,
+    "pattern_equivalence": 0.95
+  },
+  "privacy": {
+    "max_copy_rate_excess": 0.01,
+    "min_dcr_ratio": 0.8,
+    "max_profile_leaks": 0,
+    "max_synth_leak_rate_excess": 0.001,
+    "max_qi_match_rate_excess": 0.01,
+    "max_k_violations": 0,
+    "noise_z": 3.0,
+    "min_substring_length": 6
+  }
+}
