@@ -6,6 +6,12 @@ per-column distributions, string formats, pairwise dependencies, null rates, and
 cardinality. It is independent of the profile spec so that the benchmark does not
 measure the profiler with its own vocabulary.
 
+Declared values are GENERATING parameters: the distribution parameters, shares,
+null rates, dependency strengths, and fan-out laws the generator sampled from, not
+statistics of the realized sample. Use `profiler_bench.catalog.realized` for the
+statistics of a materialized instance. Exact structure (keys, constraints, exact
+distinct counts, planted extremes, null rates of 0 or 1) holds in every instance.
+
 Conventions:
 
 - Column `type` is the Spark SQL type string (`DataType.simpleString()`).
@@ -21,16 +27,21 @@ Conventions:
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-MANIFEST_VERSION = "0.1.0"
+MANIFEST_VERSION = "0.2.0"
 
 Fraction = Annotated[float, Field(ge=0.0, le=1.0)]
 Bound = int | float | str
+Privacy = Literal["direct_identifier", "quasi_identifier", "secret", "free_text"]
 
 
 class _Model(BaseModel):
@@ -95,6 +106,131 @@ REQUIRED_PARAMS: dict[Family, frozenset[str]] = {
 OPTIONAL_PARAMS: dict[Family, frozenset[str]] = {Family.POISSON: frozenset({"shift"})}
 
 
+def _is_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _order_key(value: object) -> float:
+    """Returns a comparable number for a numeric bound, a decimal string, or an ISO date or timestamp string."""
+    if isinstance(value, str):
+        try:
+            return float(Decimal(value))
+        except InvalidOperation:
+            moment = datetime.fromisoformat(value.removesuffix("Z"))
+            return (moment - datetime(1970, 1, 1)).total_seconds()
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    raise ValueError(f"{value!r} is not a number, decimal string, or ISO date")
+
+
+def _positive(p: dict[str, Any], *keys: str) -> list[str]:
+    return [f"{k} must be a positive number" for k in keys if not (_is_number(p[k]) and p[k] > 0)]
+
+
+def _numbers(p: dict[str, Any], *keys: str) -> list[str]:
+    return [f"{k} must be a finite number" for k in keys if not _is_number(p[k])]
+
+
+def _probability(p: dict[str, Any], key: str) -> list[str]:
+    return [] if _is_number(p[key]) and 0 < p[key] < 1 else [f"{key} must be in (0, 1)"]
+
+
+def _ordered(low: object, high: object, strict: bool) -> list[str]:
+    try:
+        lo, hi = _order_key(low), _order_key(high)
+    except (TypeError, ValueError) as error:
+        return [str(error)]
+    return [] if lo < hi or (not strict and lo == hi) else [f"bounds {low!r}, {high!r} are not ordered"]
+
+
+def _weights(values: object, length: int | None, name: str) -> list[str]:
+    if not isinstance(values, list) or (length is not None and len(values) != length) or not values:
+        return [f"{name} must be a non-empty list" + (f" of {length}" if length else "")]
+    if not all(_is_number(v) and v >= 0 for v in values) or sum(values) <= 0:
+        return [f"{name} must be non-negative with a positive sum"]
+    return []
+
+
+def _probabilities(values: object, name: str) -> list[str]:
+    errors = _weights(values, None, name)
+    if errors or not isinstance(values, list):
+        return errors
+    return [] if all(v <= 1 for v in values) and abs(sum(values) - 1.0) <= 1e-6 else [f"{name} must sum to 1"]
+
+
+def _mixture(p: dict[str, Any]) -> list[str]:
+    components = p["components"]
+    if not isinstance(components, list) or not components:
+        return ["components must be a non-empty list"]
+    if any(not isinstance(c, dict) or set(c) != {"weight", "mean", "std"} for c in components):
+        return ["each component needs exactly weight, mean, and std"]
+    errors = [e for c in components for e in _numbers(c, "mean") + _positive(c, "std")]
+    return errors + _probabilities([c["weight"] for c in components], "component weights")
+
+
+def _categorical(p: dict[str, Any]) -> list[str]:
+    values, probabilities = p["values"], p["probabilities"]
+    if not isinstance(values, list) or not isinstance(probabilities, list) or len(values) != len(probabilities):
+        return ["categorical values and probabilities must be aligned lists"]
+    if len({repr(v) for v in values}) != len(values):
+        return ["categorical values must be distinct"]
+    return _probabilities(probabilities, "probabilities")
+
+
+def _poisson(p: dict[str, Any]) -> list[str]:
+    return _positive(p, "lam") + ([] if _is_int(p.get("shift", 0)) else ["shift must be an integer"])
+
+
+def _binomial(p: dict[str, Any]) -> list[str]:
+    return ([] if _is_int(p["n"]) and p["n"] >= 1 else ["n must be a positive integer"]) + _probability(p, "p")
+
+
+def _zipf(p: dict[str, Any]) -> list[str]:
+    return _positive(p, "s") + ([] if _is_int(p["n_values"]) and p["n_values"] >= 1 else ["n_values must be >= 1"])
+
+
+def _discrete_uniform(p: dict[str, Any]) -> list[str]:
+    if not (_is_int(p["low"]) and _is_int(p["high"])):
+        return ["low and high must be integers"]
+    return _ordered(p["low"], p["high"], strict=False)
+
+
+def _sequence(p: dict[str, Any]) -> list[str]:
+    errors = _numbers(p, "start", "step")
+    return errors or ([] if p["step"] != 0 else ["step must be non-zero"])
+
+
+def _seasonal(p: dict[str, Any]) -> list[str]:
+    return (
+        _ordered(p["start"], p["end"], strict=True)
+        + _weights(p["hour_weights"], 24, "hour_weights")
+        + _weights(p["weekday_weights"], 7, "weekday_weights")
+    )
+
+
+_DOMAINS: dict[Family, Callable[[dict[str, Any]], list[str]]] = {
+    Family.CONSTANT: lambda p: [],
+    Family.NORMAL: lambda p: _numbers(p, "mean") + _positive(p, "std"),
+    Family.LOGNORMAL: lambda p: _numbers(p, "mu") + _positive(p, "sigma"),
+    Family.MIXTURE: _mixture,
+    Family.UNIFORM: lambda p: _ordered(p["low"], p["high"], strict=True),
+    Family.DISCRETE_UNIFORM: _discrete_uniform,
+    Family.EXPONENTIAL: lambda p: _positive(p, "scale"),
+    Family.PARETO: lambda p: _positive(p, "alpha", "scale"),
+    Family.POISSON: _poisson,
+    Family.BINOMIAL: _binomial,
+    Family.NEGATIVE_BINOMIAL: lambda p: _positive(p, "n") + _probability(p, "p"),
+    Family.ZIPF: _zipf,
+    Family.CATEGORICAL: _categorical,
+    Family.SEQUENCE: _sequence,
+    Family.SEASONAL: _seasonal,
+}
+
+
 class Distribution(_Model):
     """Distribution a column's values, lengths, increments, or fan-out were drawn from.
 
@@ -113,16 +249,9 @@ class Distribution(_Model):
         keys = set(self.params)
         if not required <= keys <= allowed:
             raise ValueError(f"{self.family.value} needs params {sorted(required)}, got {sorted(keys)}")
-        if self.family == Family.CATEGORICAL:
-            values, probabilities = self.params["values"], self.params["probabilities"]
-            if len(values) != len(probabilities) or abs(sum(probabilities) - 1.0) > 1e-6:
-                raise ValueError("categorical values and probabilities must align and sum to 1")
-        if self.family == Family.MIXTURE and abs(sum(c["weight"] for c in self.params["components"]) - 1.0) > 1e-6:
-            raise ValueError("mixture weights must sum to 1")
-        if self.family == Family.SEASONAL and (
-            len(self.params["hour_weights"]) != 24 or len(self.params["weekday_weights"]) != 7
-        ):
-            raise ValueError("seasonal needs 24 hour weights and 7 weekday weights")
+        errors = _DOMAINS[self.family](self.params)
+        if errors:
+            raise ValueError(f"{self.family.value}: {'; '.join(errors)}")
         return self
 
 
@@ -157,7 +286,11 @@ class Column(_Model):
         increments: Distribution of the differences between consecutive values in storage order,
             in the column's unit (days for dates, seconds for timestamps).
         special_values: Shares of `nan`, `inf`, and `-inf` among non-null float values.
-        sensitive: Whether the values identify individuals and must not appear in a profile.
+        privacy: Privacy class of the values, or None when they are not sensitive:
+            `direct_identifier` (identifies a person or record on its own, e.g. email, phone, account
+            number, a record UUID), `quasi_identifier` (identifies in combination, see
+            `Table.quasi_identifiers`), `secret` (credentials and tokens), or `free_text` (may hold
+            anything). Values of every class except `quasi_identifier` must not appear in a profile.
         fields: Struct fields.
         element: Array element.
         key: Map key.
@@ -179,7 +312,7 @@ class Column(_Model):
     monotonic: Literal["increasing", "strictly_increasing"] | None = None
     increments: Distribution | None = None
     special_values: dict[Literal["nan", "inf", "-inf"], Fraction] = {}
-    sensitive: bool = False
+    privacy: Privacy | None = None
     fields: tuple[Column, ...] = ()
     element: Column | None = None
     key: Column | None = None
@@ -191,6 +324,11 @@ class Column(_Model):
         if sum(f.share for f in self.formats) > 1.0 + 1e-6:
             raise ValueError(f"format shares of {self.name} exceed 1")
         return self
+
+    @property
+    def sensitive(self) -> bool:
+        """Returns whether the column has a privacy class."""
+        return self.privacy is not None
 
     def children(self) -> tuple[Column, ...]:
         """Returns the nested columns: struct fields, then the array element or map key and value."""
@@ -211,6 +349,13 @@ class RangeCheck(_Model):
     column: str
     min: Bound | None = None
     max: Bound | None = None
+
+    @model_validator(mode="after")
+    def _check_order(self) -> RangeCheck:
+        errors = [] if self.min is None or self.max is None else _ordered(self.min, self.max, strict=False)
+        if errors:
+            raise ValueError(f"range on {self.column}: {errors[0]}")
+        return self
 
 
 class EnumerationCheck(_Model):
@@ -289,6 +434,21 @@ class Dependency(_Model):
     mechanism: str
 
 
+class QuasiIdentifierSet(_Model):
+    """Columns that together identify rows although none does alone.
+
+    Attributes:
+        columns: The quasi-identifier columns.
+        unique_fraction: Expected fraction of rows whose combination of values occurs once in the table,
+            under the generating distribution.
+        mechanism: How the combination was generated.
+    """
+
+    columns: tuple[str, ...]
+    unique_fraction: Fraction
+    mechanism: str
+
+
 class Table(_Model):
     """Planted structure of one table.
 
@@ -302,6 +462,12 @@ class Table(_Model):
         checks: Check constraints that hold for every row.
         functional_dependencies: Functional dependencies between columns.
         dependencies: Pairwise dependencies with their strength.
+        quasi_identifiers: Planted quasi-identifier combinations.
+        row_order: `generated` when rows are stored in generation order, or `shuffled` when they were
+            permuted at random before writing. Storage order, which claims such as `monotonic` refer
+            to, is the part files in path order and the rows in file order; Spark does not read
+            multi-file tables in that order, so sort by `_metadata.file_path` first.
+        files: Number of parquet files the table is written as, filled in from the tier.
     """
 
     name: str
@@ -313,6 +479,9 @@ class Table(_Model):
     checks: tuple[Check, ...] = ()
     functional_dependencies: tuple[FunctionalDependency, ...] = ()
     dependencies: tuple[Dependency, ...] = ()
+    quasi_identifiers: tuple[QuasiIdentifierSet, ...] = ()
+    row_order: Literal["generated", "shuffled"] = "generated"
+    files: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def _check_references(self) -> Table:
@@ -325,6 +494,7 @@ class Table(_Model):
             *(c for fd in self.functional_dependencies for c in (*fd.determinant, *fd.dependent)),
             *(c for dep in self.dependencies for c in dep.columns),
             *(c for check in self.checks for c in _check_columns(check)),
+            *(c for qi in self.quasi_identifiers for c in qi.columns),
         ]
         missing = sorted(set(referenced) - set(names))
         if missing:
@@ -370,6 +540,8 @@ class Manifest(_Model):
 
     Attributes:
         manifest_version: Version of this schema.
+        declared_values: Always `generating_parameters`: declared values are what the generator sampled
+            from, not statistics of this instance (see `profiler_bench.catalog.realized`).
         dataset: Catalog dataset name.
         tier: Scale tier the data was generated at.
         seed: Seed the data was generated with.
@@ -379,6 +551,7 @@ class Manifest(_Model):
     """
 
     manifest_version: str = MANIFEST_VERSION
+    declared_values: Literal["generating_parameters"] = "generating_parameters"
     dataset: str
     tier: str
     seed: int

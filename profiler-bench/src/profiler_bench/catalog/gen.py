@@ -169,3 +169,29 @@ def dates(epoch_days: np.ndarray, mask: np.ndarray | None = None) -> pa.Array:
 def days(iso: str) -> int:
     """Returns days since the Unix epoch for an ISO date string."""
     return int(np.datetime64(iso, "D").astype(np.int64))
+
+
+_MASK63 = np.uint64(2**63 - 1)
+
+
+def hashed_ids(index: np.ndarray, salt: int) -> np.ndarray:
+    """Returns distinct non-negative int64 ids that look random, by a keyed bijection of `index` on 63 bits.
+
+    Every step (xor with the salt, xor-shift, multiplication by an odd constant, all mod 2**63) is a
+    bijection, so distinct indexes give distinct ids.
+
+    Args:
+        index: Distinct non-negative integers below 2**63.
+        salt: Key of the bijection.
+    """
+    x = (np.asarray(index, dtype=np.uint64) ^ np.uint64(salt & (2**63 - 1))) & _MASK63
+    with np.errstate(over="ignore"):
+        for shift, multiplier in ((31, 0x7FB5D329728EA185), (27, 0x01FF3D2A8CB7F6F1), (33, 0x1D2F3C9AAB1F0E8B)):
+            x ^= x >> np.uint64(shift)
+            x = (x * np.uint64(multiplier)) & _MASK63
+    return x.astype(np.int64)
+
+
+def shuffle(table: pa.Table, rng: np.random.Generator) -> pa.Table:
+    """Returns `table` with its rows in a random order."""
+    return table.take(pa.array(rng.permutation(table.num_rows)))

@@ -51,10 +51,16 @@ def _list(lengths: np.ndarray, values: pa.Array, mask: np.ndarray | None = None)
     return pa.ListArray.from_arrays(gen.list_offsets(lengths), values, mask=None if mask is None else pa.array(mask))
 
 
+def sizes(n: int) -> dict[str, float]:
+    """Returns the row count of each table for base row count `n`."""
+    return {"profiles": n, "wide": max(500, n // 10)}
+
+
 def build(n: int, rng: Rng) -> Build:
     """Generates the `profiles` table with `n` rows and the `wide` table with `max(500, n // 10)` rows."""
+    rows = sizes(n)
     profiles, profiles_truth = _profiles(n, rng)
-    wide, wide_truth = _wide(max(500, n // 10), rng)
+    wide, wide_truth = _wide(int(rows["wide"]), rng)
     return Build({"profiles": profiles, "wide": wide}, [profiles_truth, wide_truth], [])
 
 
@@ -270,4 +276,5 @@ DATASET = Dataset(
     name="nested",
     description="Struct, array, map, and array-of-struct columns with length distributions, and a 200-column table.",
     build=build,
+    sizes=sizes,
 )

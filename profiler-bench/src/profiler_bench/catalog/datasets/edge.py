@@ -52,6 +52,11 @@ def _plant(array: pa.Array, values: list[object]) -> pa.Array:
     return pa.concat_arrays([head, array.slice(len(values))])
 
 
+def sizes(n: int) -> dict[str, float]:
+    """Returns the row count of each table for base row count `n`."""
+    return {"edge_cases": n, "empty": 0}
+
+
 def build(n: int, rng: Rng) -> Build:
     """Generates the `edge_cases` table with `n` rows and the zero-row `empty` table."""
     int_digits = DECIMAL_SCALED[0] - DECIMAL_SCALED[1]
@@ -238,4 +243,5 @@ DATASET = Dataset(
     name="edge",
     description="All-null and constant columns, decimal(38) and int64 extremes, NaN/inf, blanks vs nulls, unicode.",
     build=build,
+    sizes=sizes,
 )

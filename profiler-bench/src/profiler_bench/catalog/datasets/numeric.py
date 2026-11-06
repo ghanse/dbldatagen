@@ -45,9 +45,22 @@ def spearman_of_gaussian(rho: float) -> float:
     return 6 / math.pi * math.asin(rho / 2)
 
 
-def _nonlinear_eta() -> float:
-    signal = 4 * NONLINEAR_RANGE**4 / 45
-    return math.sqrt(signal / (signal + NONLINEAR_NOISE**2))
+def nonlinear_eta(bins: int = 50) -> float:
+    """Returns the population correlation ratio of `nl_y` given `nl_x` cut into `bins` quantile bins.
+
+    `nl_x` is uniform, so quantile bins are equal-width; the between-bin variance of `nl_x ** 2` is
+    exact, and the total variance is `Var(nl_x ** 2) + noise**2`.
+    """
+    edges = np.linspace(-NONLINEAR_RANGE, NONLINEAR_RANGE, bins + 1)
+    bin_means = (edges[1:] ** 3 - edges[:-1] ** 3) / (3 * (edges[1:] - edges[:-1]))
+    between = float(((bin_means - NONLINEAR_RANGE**2 / 3) ** 2).mean())
+    total = 4 * NONLINEAR_RANGE**4 / 45 + NONLINEAR_NOISE**2
+    return math.sqrt(between / total)
+
+
+def sizes(n: int) -> dict[str, float]:
+    """Returns the row count of each table for base row count `n`."""
+    return {"measurements": n}
 
 
 def build(n: int, rng: Rng) -> Build:
@@ -166,7 +179,7 @@ def _truth(n: int) -> Table:
             Dependency(
                 columns=("nl_x", "nl_y"),
                 measure="correlation_ratio",
-                value=_nonlinear_eta(),
+                value=nonlinear_eta(),
                 mechanism="nl_y = nl_x ** 2 + noise",
             ),
         ),
@@ -177,4 +190,5 @@ DATASET = Dataset(
     name="numeric",
     description="Parametric marginals (normal, lognormal, mixture, Pareto, counts), a copula, and a nonlinear pair.",
     build=build,
+    sizes=sizes,
 )

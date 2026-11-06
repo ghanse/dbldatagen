@@ -19,7 +19,7 @@ def test_materialize_prints_content_hashes(tmp_path: Path, capsys: pytest.Captur
     lines = capsys.readouterr().out.splitlines()
     assert [line.split()[0] for line in lines] == ["numeric", "edge"]
     assert all(len(line.split()[3]) == 64 for line in lines)
-    assert (tmp_path / "numeric" / "xs" / "seed=0").is_dir()
+    assert (tmp_path / "numeric" / "xs" / "seed-0").is_dir()
 
 
 def test_materialize_rejects_unknown_datasets(tmp_path: Path) -> None:

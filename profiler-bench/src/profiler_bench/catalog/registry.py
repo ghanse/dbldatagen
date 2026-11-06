@@ -6,6 +6,7 @@ import hashlib
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path
 from typing import NamedTuple
 
@@ -17,7 +18,9 @@ from profiler_bench.catalog.manifest import Column, ForeignKey, Manifest, Table
 
 
 TIERS: dict[str, int] = {"xs": 5_000, "s": 100_000, "m": 2_000_000}
+TIER_FILES: dict[str, int] = {"xs": 1, "s": 4, "m": 16}
 DEFAULT_TIER = "s"
+FINGERPRINT_PACKAGES = ("numpy", "pandas", "pyarrow", "pyspark")
 
 
 class Build(NamedTuple):
@@ -42,21 +45,27 @@ class Dataset:
         name: Dataset name.
         description: What the dataset exercises.
         build: Generator taking the tier's base row count and a stream factory.
+        sizes: Expected row count of each table for a base row count, without generating data.
+            Counts are exact for deterministic tables and expectations for random ones.
     """
 
     name: str
     description: str
     build: Callable[[int, Rng], Build]
+    sizes: Callable[[int], dict[str, float]] | None = None
 
     def fingerprint(self) -> str:
-        """Returns a hash of the generator source and the shared catalog code it depends on.
+        """Returns a hash of the generator source, the shared catalog code, and the library versions.
 
-        The fingerprint is part of the cache key, so editing a generator invalidates its cache.
+        The fingerprint is part of the cache key, so editing a generator or upgrading numpy, pandas,
+        pyarrow, or pyspark invalidates the cache.
         """
         sources = [inspect.getsourcefile(self.build), gen.__file__, manifest.__file__, __file__]
         digest = hashlib.sha256()
         for source in sources:
             digest.update(Path(str(source)).read_bytes())
+        for package in FINGERPRINT_PACKAGES:
+            digest.update(f"{package}=={version(package)}\n".encode())
         return digest.hexdigest()[:16]
 
 
@@ -77,7 +86,8 @@ def generate(dataset: Dataset, tier: str, seed: int) -> tuple[dict[str, pa.Table
     build = dataset.build(TIERS[tier], rng_factory(seed, dataset.name))
     if sorted(build.tables) != sorted(t.name for t in build.truth):
         raise ValueError(f"{dataset.name}: declared tables do not match generated tables")
-    truth = tuple(_complete(t, build.tables[t.name]) for t in build.truth)
+    files = TIER_FILES[tier]
+    truth = tuple(_complete(t, build.tables[t.name], files) for t in build.truth)
     result = Manifest(
         dataset=dataset.name,
         tier=tier,
@@ -89,11 +99,12 @@ def generate(dataset: Dataset, tier: str, seed: int) -> tuple[dict[str, pa.Table
     return build.tables, result
 
 
-def _complete(table: Table, data: pa.Table) -> Table:
+def _complete(table: Table, data: pa.Table, files: int) -> Table:
     if [c.name for c in table.columns] != data.column_names:
         raise ValueError(f"{table.name}: declared columns {[c.name for c in table.columns]} != {data.column_names}")
     columns = tuple(_typed(c, data.schema.field(c.name).type) for c in table.columns)
-    return table.model_copy(update={"row_count": data.num_rows, "columns": columns})
+    update = {"row_count": data.num_rows, "columns": columns, "files": min(files, max(1, data.num_rows))}
+    return table.model_copy(update=update)
 
 
 def _typed(column: Column, arrow_type: pa.DataType) -> Column:
