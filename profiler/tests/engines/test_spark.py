@@ -212,6 +212,45 @@ def test_lossless_decimal_and_int64_extremes(spark: SparkSession) -> None:
     assert columns[1].numeric.max == "99999999999999999999.999999999999999999"
 
 
+def test_large_numeric_aggregates_do_not_overflow_in_ansi_mode(spark: SparkSession) -> None:
+    key = "spark.sql.ansi.enabled"
+    previous = spark.conf.get(key, None)
+    spark.conf.set(key, "true")
+    try:
+        frame = spark.range(100_000).selectExpr(
+            "IF(id % 2 = 0, 9999999999999999999999999999.9999999999, "
+            "8999999999999999999999999999.9999999999)::DECIMAL(38, 10) AS scaled",
+            "IF(id % 2 = 0, 99999999999999999999999999999999999999, "
+            "89999999999999999999999999999999999999)::DECIMAL(38, 0) AS unscaled",
+            f"IF(id % 2 = 0, {-(2**63)}, {2**63 - 1})::BIGINT AS integer",
+        )
+
+        profile = profile_dataframe("large_numeric", frame)
+        columns = {column.name: column for column in profile.tables[0].columns}
+        scaled = columns["scaled"].numeric
+        unscaled = columns["unscaled"].numeric
+        integer = columns["integer"].numeric
+
+        assert scaled is not None and unscaled is not None and integer is not None
+        assert scaled.min == "8999999999999999999999999999.9999999999"
+        assert scaled.max == "9999999999999999999999999999.9999999999"
+        assert scaled.mean == pytest.approx(9.5e27)
+        assert scaled.stddev == pytest.approx(5e26, rel=1e-4)
+        assert unscaled.min == "89999999999999999999999999999999999999"
+        assert unscaled.max == "99999999999999999999999999999999999999"
+        assert unscaled.mean == pytest.approx(9.5e37)
+        assert unscaled.stddev == pytest.approx(5e36, rel=1e-4)
+        assert integer.min == "-9223372036854775808"
+        assert integer.max == "9223372036854775807"
+        assert integer.mean == pytest.approx(0.0, abs=1024.0)
+        assert integer.stddev == pytest.approx(2**63, rel=1e-4)
+    finally:
+        if previous is None:
+            spark.conf.unset(key)
+        else:
+            spark.conf.set(key, previous)
+
+
 def test_suppressed_extremes_produce_valid_profile(spark: SparkSession) -> None:
     policy = PrivacyPolicy(extremes=ValueTreatment.SUPPRESSED)
     profile = profile_dataframe(
