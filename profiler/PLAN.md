@@ -90,6 +90,7 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P1.7a | Fix: `rsi_log.py append --kind` flag is dropped; add CLI-flag tests | P1.7 | merged (PR #5) |
 | P1.8 | Baseline run: freeze the harness, record the baseline + ceiling for every dataset | P1.2–P1.7 | todo |
 | P1.2a | Fix: baseline engine overflows on `avg`/`stddev` of decimal(38,x) under ANSI mode (found by P1.5 at tier s) | P1.2 | merged (PR #11) |
+| P1.3c | Investigate retail real-vs-real ceiling 0.94 (order_items 0.86): suspected catalog Zipf parent ranking varying by sample seed | P1.3, P1.5 | todo |
 | P1.3b | Register real public datasets in the catalog (download + checksum hook exists; none registered) — needs a decision on which datasets are reachable through the proxy | P1.3 | todo |
 | P1.9 | Rust engine scaffold (Polars vs DataFusion decision, CLI binary, spec-valid output for the baseline features) | P1.1, Rust toolchain | deferred (human decision 2026-11-06: PySpark-only Phase 1; Rust engine later) |
 
