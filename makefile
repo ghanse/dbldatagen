@@ -51,6 +51,17 @@ test-fast:
 	$(UV_RUN) pytest tests/ --ignore=tests/core/ -n 2 --timeout 600 --durations 20
 	$(UV_RUN) pytest tests/core/ --timeout 600 --durations 20 --no-header -q
 
+# profiler-test / profiler-lint: the dbldatagen-profiler workspace member (profiler/).
+PROFILER_RUN := uv run --exact --package dbldatagen-profiler --all-extras --all-groups
+
+profiler-test:
+	$(PROFILER_RUN) pytest profiler/tests
+
+profiler-lint:
+	$(PROFILER_RUN) black --check profiler
+	$(PROFILER_RUN) ruff check profiler
+	$(PROFILER_RUN) mypy --config-file profiler/pyproject.toml profiler/src profiler/tests
+
 # test-coverage: same as test, then open HTML report.
 test-coverage: test
 	open htmlcov/index.html
@@ -85,4 +96,4 @@ docs-api-core:
 	$(UV_RUN) --group docs pydoc-markdown
 
 .DEFAULT: all
-.PHONY: all clean dev lint fmt test test-fast test-coverage build lock-dependencies docs-build docs-clean docs-serve docs-api-core
+.PHONY: all clean dev lint fmt test test-fast test-coverage build lock-dependencies docs-build docs-clean docs-serve docs-api-core profiler-test profiler-lint
