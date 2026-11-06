@@ -50,11 +50,6 @@ def test_schema_writes_to_file(tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8") == render_json_schema()
 
 
-def test_profile_is_not_implemented(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["profile"]) == 2
-    assert "not implemented" in capsys.readouterr().err
-
-
 def test_missing_subcommand_is_a_usage_error() -> None:
     with pytest.raises(SystemExit) as exit_info:
         main([])

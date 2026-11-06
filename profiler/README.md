@@ -15,6 +15,7 @@ profiler/
   pyproject.toml                  distribution `dbldatagen-profiler`
   src/dbldatagen_profiler/
     model/                        profile spec as pydantic models
+    engines/spark/                baseline PySpark profiling engine
     cli.py                        `dbldatagen-profile` command
   spec/
     profile.schema.json           JSON Schema generated from the model
@@ -33,8 +34,17 @@ make profiler-test
 make profiler-lint
 ```
 
-`dbldatagen-profile profile` is reserved for the profiling engine and is not implemented yet. PySpark is an optional
-extra: install `dbldatagen-profiler[spark]` to use the Spark engine once it exists.
+Profile one or more local datasets with PySpark:
+
+```bash
+uv run --package dbldatagen-profiler --all-extras dbldatagen-profile profile \
+  --table customers=data/customers.parquet \
+  --table orders=data/orders.parquet \
+  --format parquet -o profile.json
+```
+
+The input format may be `parquet`, `csv`, or `delta`. PySpark is an optional extra; install
+`dbldatagen-profiler[spark]` when using the engine as a library.
 
 ## The profile spec
 
