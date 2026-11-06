@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from math import isfinite
 from typing import Any
 
 import pyspark
-from pyspark.sql import Column, DataFrame
+from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
@@ -60,14 +61,15 @@ def profile_tables(tables: Mapping[str, DataFrame], *, privacy: PrivacyPolicy | 
     if not tables:
         raise ValueError("at least one table is required")
     policy = privacy or PrivacyPolicy()
-    result = Profile(
-        spec_version=SPEC_VERSION,
-        created_at=datetime.now(timezone.utc),
-        engine=EngineInfo(name="pyspark", version=pyspark.__version__),
-        privacy=policy,
-        tables=[_profile_table(name, frame, policy) for name, frame in tables.items()],
-    )
-    return Profile.model_validate(result.model_dump(), context={"strict": True})
+    with _utc_session_time_zones(tables.values()):
+        result = Profile(
+            spec_version=SPEC_VERSION,
+            created_at=datetime.now(timezone.utc),
+            engine=EngineInfo(name="pyspark", version=pyspark.__version__),
+            privacy=policy,
+            tables=[_profile_table(name, frame, policy) for name, frame in tables.items()],
+        )
+        return Profile.model_validate(result.model_dump(), context={"strict": True})
 
 
 def profile_dataframe(name: str, df: DataFrame, *, privacy: PrivacyPolicy | None = None) -> Profile:
@@ -85,7 +87,6 @@ def profile_dataframe(name: str, df: DataFrame, *, privacy: PrivacyPolicy | None
 
 
 def _profile_table(name: str, df: DataFrame, privacy: PrivacyPolicy) -> TableProfile:
-    df.sparkSession.conf.set("spark.sql.session.timeZone", "UTC")
     expressions: list[Column] = [F.count(F.lit(1)).alias("__row_count")]
     for index, field in enumerate(df.schema.fields):
         expressions.extend(_aggregate_expressions(df[field.name], field.dataType, index))
@@ -96,6 +97,29 @@ def _profile_table(name: str, df: DataFrame, privacy: PrivacyPolicy) -> TablePro
         for index, field in enumerate(df.schema.fields)
     ]
     return TableProfile(name=name, row_count=row_count, columns=columns)
+
+
+@contextmanager
+def _utc_session_time_zones(frames: Iterable[DataFrame]) -> Iterator[None]:
+    """Temporarily configures each input Spark session to use UTC."""
+    sessions: list[tuple[SparkSession, str | None]] = []
+    seen: set[int] = set()
+    key = "spark.sql.session.timeZone"
+    try:
+        for frame in frames:
+            session = frame.sparkSession
+            if id(session) in seen:
+                continue
+            seen.add(id(session))
+            sessions.append((session, session.conf.get(key, None)))
+            session.conf.set(key, "UTC")
+        yield
+    finally:
+        for session, previous in reversed(sessions):
+            if previous is None:
+                session.conf.unset(key)
+            else:
+                session.conf.set(key, previous)
 
 
 def _aggregate_expressions(column: Column, data_type: T.DataType, index: int) -> list[Column]:

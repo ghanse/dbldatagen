@@ -169,6 +169,24 @@ def test_timestamp_extremes_are_utc_when_host_is_not(spark: SparkSession, monkey
     assert column.temporal.max == "2026-01-02T03:04:05Z"
 
 
+def test_profile_restores_session_time_zone(spark: SparkSession) -> None:
+    key = "spark.sql.session.timeZone"
+    previous = spark.conf.get(key, None)
+    spark.conf.set(key, "America/Los_Angeles")
+    try:
+        frame = spark.sql("SELECT TIMESTAMP '2026-01-02 03:04:05' AS moment")
+        column = profile_dataframe("timestamps", frame).tables[0].columns[0]
+        assert spark.conf.get(key) == "America/Los_Angeles"
+        assert column.temporal is not None
+        assert column.temporal.min == "2026-01-02T11:04:05Z"
+        assert column.temporal.max == "2026-01-02T11:04:05Z"
+    finally:
+        if previous is None:
+            spark.conf.unset(key)
+        else:
+            spark.conf.set(key, previous)
+
+
 def test_non_finite_float_extremes_are_omitted(spark: SparkSession) -> None:
     column = (
         profile_dataframe("non_finite", spark.createDataFrame([(float("inf"),)], "value double")).tables[0].columns[0]
