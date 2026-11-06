@@ -79,7 +79,7 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | ID | Item | Depends on | Status |
 |----|------|------------|--------|
 | P1.1 | Package scaffold (`profiler/` uv workspace member) + profile spec v0.1 (model + JSON Schema) + CLI stub | — | merged (PR #6) |
-| P1.2 | Baseline PySpark engine: schema, row count, nulls, min/max/mean/std, distinct count | P1.1 | todo |
+| P1.2 | Baseline PySpark engine: schema, row count, nulls, min/max/mean/std, distinct count | P1.1 | merged (PR #7) |
 | P1.3 | Dataset catalog: synthetic datasets with known ground truth (relational PK/FK model, skew, correlated columns, regex-shaped strings, check constraints, nested types, wide/tall), deterministic seeds, scale tiers | P1.1 | in-progress (PR pending; was stacked on P1.1) |
 | P1.4 | Reference sampler (profile -> PySpark DataFrames, multi-table, respects keys) | P1.1 | todo |
 | P1.5 | Fidelity metrics: marginals (KS / Wasserstein / TVD), cardinality error, pattern match rate, pairwise dependence error, constraint satisfaction, referential integrity, discriminator AUC, privacy guard (exact-row copy rate, distance to closest record) | P1.1 | todo |
@@ -101,6 +101,7 @@ Candidate proposal areas (they enter the log as proposals when triaged):
 - Dependence: pairwise Spearman / Cramér's V / correlation ratio; Gaussian copula; conditional distributions for categorical pairs
 - Temporal: seasonality, monotonic / sequential columns, inter-arrival distributions
 - Nested types (struct / array / map) and semi-structured strings (JSON)
+- Speed: batch nested-child aggregates into one Spark job (baseline runs one job per nested child; found in P1.2 review)
 - Speed: sampling strategies, single-pass aggregation, approximate sketches, Rust engine parity and performance
 
 ### Generator follow-ups (dbldatagen gaps found along the way)
