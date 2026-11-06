@@ -3,7 +3,6 @@
   "$comment": "dbldatagen profile spec 0.1.0. Generated from dbldatagen_profiler.model; do not edit.",
   "$defs": {
     "BooleanStats": {
-      "additionalProperties": false,
       "description": "Statistics for a boolean column.\n\nAttributes:\n    true_fraction: Fraction of non-null values that are true.",
       "properties": {
         "true_fraction": {
@@ -32,8 +31,7 @@
       "type": "string"
     },
     "ColumnProfile": {
-      "additionalProperties": false,
-      "description": "Profile of a single column, or of a field nested inside a complex column.\n\nNested types use `children`: a struct lists its fields, an array has one child\nnamed \"element\", and a map has two children named \"key\" and \"value\". Child\nstatistics are computed over all nested values, not over rows.\n\nAttributes:\n    name: Column or field name.\n    logical_type: Engine-neutral logical type.\n    source_type: Type name as reported by the source system, e.g. \"decimal(10,2)\".\n    nullable: Whether the schema allows nulls.\n    null_fraction: Fraction of values that are null.\n    precision: Total digits; required for `decimal` and absent otherwise.\n    scale: Digits after the decimal point; required for `decimal` and absent otherwise.\n    children: Nested field profiles; required for `struct`, `array`, and `map`, absent otherwise.\n    distinct_count: Optional number of distinct non-null values.\n    cardinality: Optional cardinality bucket.\n    numeric: Optional statistics for numeric types.\n    string: Optional statistics for `string`.\n    temporal: Optional statistics for `date`, `time`, `timestamp`, and `timestamp_ntz`.\n    boolean: Optional statistics for `boolean`.",
+      "description": "Profile of a single column, or of a field nested inside a complex column.\n\nNested types use `children`: a struct lists its fields, an array has one child\nnamed \"element\", and a map has two children named \"key\" and \"value\". Child\nstatistics are computed over all nested values, not over rows.\n\nAttributes:\n    name: Column or field name.\n    logical_type: Engine-neutral logical type.\n    source_type: Type name as reported by the source system, e.g. \"decimal(10,2)\".\n    nullable: Whether the schema allows nulls.\n    null_fraction: Fraction of values that are null.\n    precision: Total digits; required for `decimal` and absent otherwise.\n    scale: Digits after the decimal point; required for `decimal` and absent otherwise.\n    children: Nested field profiles; required for `struct`, `array`, and `map`, absent otherwise.\n    distinct_count: Optional number of distinct non-null values.\n    cardinality: Optional cardinality bucket.\n    numeric: Optional statistics for numeric types.\n    string: Optional statistics for `string`.\n    temporal: Optional statistics for `date`, `time`, `timestamp`, and `timestamp_ntz`.\n    boolean: Optional statistics for `boolean`.\n    collection_length: Optional distribution of entry counts for non-null `array` and `map` values.",
       "properties": {
         "name": {
           "minLength": 1,
@@ -163,6 +161,17 @@
             }
           ],
           "default": null
+        },
+        "collection_length": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LengthStats"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -176,7 +185,6 @@
       "type": "object"
     },
     "ComparisonConstraint": {
-      "additionalProperties": false,
       "description": "Compares two columns of the same row, as `left <operator> right`.\n\nAttributes:\n    kind: Discriminator; always \"comparison\".\n    left: Left-hand column.\n    operator: Comparison operator.\n    right: Right-hand column.\n    satisfied_fraction: Fraction of rows that satisfy the constraint.",
       "properties": {
         "satisfied_fraction": {
@@ -233,7 +241,6 @@
       "type": "string"
     },
     "Dependency": {
-      "additionalProperties": false,
       "description": "Measured dependence between two columns of a table.\n\nAttributes:\n    columns: The two column names.\n    method: Dependence measure.\n    value: Measured value; in [-1, 1] for `pearson` and `spearman` and in [0, 1] otherwise.",
       "properties": {
         "columns": {
@@ -267,7 +274,6 @@
       "type": "object"
     },
     "DistinctCount": {
-      "additionalProperties": false,
       "description": "Number of distinct non-null values in a column.\n\nAttributes:\n    value: Distinct value count.\n    exact: Whether the count is exact (true) or an approximation such as HyperLogLog (false).",
       "properties": {
         "value": {
@@ -288,7 +294,6 @@
       "type": "object"
     },
     "EngineInfo": {
-      "additionalProperties": false,
       "description": "Engine that produced the profile.\n\nAttributes:\n    name: Engine name, e.g. \"pyspark\".\n    version: Engine version.",
       "properties": {
         "name": {
@@ -310,8 +315,7 @@
       "type": "object"
     },
     "EnumerationConstraint": {
-      "additionalProperties": false,
-      "description": "Limits a column to a fixed set of values.\n\nAttributes:\n    kind: Discriminator; always \"enumeration\".\n    column: Constrained column.\n    values: Allowed values.\n    satisfied_fraction: Fraction of rows that satisfy the constraint.",
+      "description": "Limits a column to a fixed set of values.\n\nAttributes:\n    kind: Discriminator; always \"enumeration\".\n    column: Constrained column.\n    values: Allowed values, encoded by the column's logical type.\n    min_value_count: Number of rows holding the least frequent listed value; must be at least\n        `privacy.min_value_count`.\n    satisfied_fraction: Fraction of rows that satisfy the constraint.",
       "properties": {
         "satisfied_fraction": {
           "maximum": 1.0,
@@ -333,6 +337,9 @@
           "items": {
             "anyOf": [
               {
+                "type": "boolean"
+              },
+              {
                 "type": "integer"
               },
               {
@@ -340,28 +347,30 @@
               },
               {
                 "type": "string"
-              },
-              {
-                "type": "boolean"
               }
             ]
           },
           "minItems": 1,
           "title": "Values",
           "type": "array"
+        },
+        "min_value_count": {
+          "minimum": 0,
+          "title": "Min Value Count",
+          "type": "integer"
         }
       },
       "required": [
         "satisfied_fraction",
         "column",
-        "values"
+        "values",
+        "min_value_count"
       ],
       "title": "EnumerationConstraint",
       "type": "object"
     },
     "ExpressionConstraint": {
-      "additionalProperties": false,
-      "description": "Boolean Spark SQL expression that rows satisfy.\n\nAttributes:\n    kind: Discriminator; always \"expression\".\n    expression: Spark SQL boolean expression over the table's columns.\n    satisfied_fraction: Fraction of rows that satisfy the constraint.",
+      "description": "Boolean SQL expression that rows satisfy.\n\nAttributes:\n    kind: Discriminator; always \"expression\".\n    expression: Boolean SQL expression over the table's columns.\n    dialect: SQL dialect of `expression` (default \"spark\").\n    satisfied_fraction: Fraction of rows that satisfy the constraint.",
       "properties": {
         "satisfied_fraction": {
           "maximum": 1.0,
@@ -379,6 +388,11 @@
           "minLength": 1,
           "title": "Expression",
           "type": "string"
+        },
+        "dialect": {
+          "default": "spark",
+          "title": "Dialect",
+          "type": "string"
         }
       },
       "required": [
@@ -389,8 +403,7 @@
       "type": "object"
     },
     "FanOutStats": {
-      "additionalProperties": false,
-      "description": "Distribution of the number of child rows per parent key.\n\nAttributes:\n    min: Fewest child rows for a parent key.\n    max: Most child rows for a parent key.\n    mean: Mean child rows per parent key.\n    stddev: Optional sample standard deviation.\n    quantiles: Optional list of quantiles.",
+      "description": "Distribution of the number of child rows per parent key.\n\nEvery parent key counts, including keys with no child rows. Child rows whose\nkey matches no parent are left out; `Relationship.coverage` accounts for them.\nQuantile values are integer row counts.\n\nAttributes:\n    min: Fewest child rows for a parent key.\n    max: Most child rows for a parent key.\n    mean: Mean child rows per parent key.\n    stddev: Optional sample standard deviation.\n    quantiles: Optional list of quantiles.",
       "properties": {
         "min": {
           "minimum": 0,
@@ -445,12 +458,24 @@
       "type": "object"
     },
     "Histogram": {
-      "additionalProperties": false,
-      "description": "Equal- or variable-width histogram over the non-null values.\n\nAttributes:\n    edges: Non-decreasing bin edges; one more than the number of bins.\n    counts: Number of values in each bin.",
+      "description": "Histogram over the non-null values of a numeric column.\n\nBin `i` holds values in `[edges[i], edges[i + 1])`; the last bin also holds\n`edges[-1]`. The edges span every profiled value, so no value falls outside\nthe bins and the counts add up to the number of non-null values profiled.\n\nAttributes:\n    edges: Non-decreasing bin edges, encoded by the column's logical type; one more than the number of bins.\n    counts: Number of values in each bin.\n    sampled: Whether the counts come from a sample rather than every row (default false).",
       "properties": {
         "edges": {
           "items": {
-            "type": "number"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ]
           },
           "minItems": 2,
           "title": "Edges",
@@ -463,6 +488,11 @@
           },
           "title": "Counts",
           "type": "array"
+        },
+        "sampled": {
+          "default": false,
+          "title": "Sampled",
+          "type": "boolean"
         }
       },
       "required": [
@@ -473,8 +503,7 @@
       "type": "object"
     },
     "KeyCandidate": {
-      "additionalProperties": false,
-      "description": "Set of columns that is likely unique across the table.\n\nAttributes:\n    columns: Column names that form the key, in order.\n    confidence: Confidence that the columns form a key, in [0, 1].",
+      "description": "Set of columns that is likely unique across the table.\n\nAttributes:\n    columns: Distinct column names that form the key, in order.\n    confidence: Confidence that the columns form a key, in [0, 1].",
       "properties": {
         "columns": {
           "items": {
@@ -499,8 +528,7 @@
       "type": "object"
     },
     "LengthStats": {
-      "additionalProperties": false,
-      "description": "Distribution of value lengths, in characters.\n\nAttributes:\n    min: Optional shortest length.\n    max: Optional longest length.\n    mean: Optional mean length.\n    stddev: Optional sample standard deviation of the length.\n    quantiles: Optional list of length quantiles.",
+      "description": "Distribution of lengths: characters for strings, entries for arrays and maps.\n\nAttributes:\n    min: Optional shortest length.\n    max: Optional longest length.\n    mean: Optional mean length.\n    stddev: Optional sample standard deviation of the length.\n    quantiles: Optional list of length quantiles.",
       "properties": {
         "min": {
           "anyOf": [
@@ -605,16 +633,21 @@
       "type": "string"
     },
     "NumericStats": {
-      "additionalProperties": false,
-      "description": "Distribution statistics for an integer, floating-point, or decimal column.\n\nAttributes:\n    min: Optional smallest value.\n    max: Optional largest value.\n    mean: Optional arithmetic mean.\n    stddev: Optional sample standard deviation.\n    quantiles: Optional list of quantiles.\n    histogram: Optional histogram.",
+      "description": "Distribution statistics for an integer, floating-point, or decimal column.\n\nAttributes:\n    min: Optional smallest value, encoded by the column's logical type.\n    max: Optional largest value, encoded by the column's logical type.\n    mean: Optional arithmetic mean, as an approximate JSON number.\n    stddev: Optional sample standard deviation, as an approximate JSON number.\n    quantiles: Optional list of quantiles.\n    histogram: Optional histogram.",
       "properties": {
         "min": {
           "anyOf": [
+            {
+              "type": "boolean"
+            },
             {
               "type": "integer"
             },
             {
               "type": "number"
+            },
+            {
+              "type": "string"
             },
             {
               "type": "null"
@@ -626,10 +659,16 @@
         "max": {
           "anyOf": [
             {
+              "type": "boolean"
+            },
+            {
               "type": "integer"
             },
             {
               "type": "number"
+            },
+            {
+              "type": "string"
             },
             {
               "type": "null"
@@ -694,7 +733,6 @@
       "type": "object"
     },
     "Pattern": {
-      "additionalProperties": false,
       "description": "Regular expression that matches part of a string column.\n\nAttributes:\n    regex: Regular expression that a matching value satisfies in full.\n    coverage: Fraction of non-null values that match the expression.",
       "properties": {
         "regex": {
@@ -715,9 +753,29 @@
       "title": "Pattern",
       "type": "object"
     },
+    "PrivacyPolicy": {
+      "description": "Privacy policy that the producer applied when writing the profile.\n\nAttributes:\n    min_value_count: Fewest rows a literal value must occur in before it may appear in `top_values` or an\n        enumeration constraint (default 10).\n    extremes: Treatment of numeric and temporal `min` and `max` statistics and range constraint bounds\n        (default \"exact\"). When \"suppressed\", none of them may appear.\n    enumerations: Treatment of `top_values` and enumeration constraints (default \"exact\"). When \"suppressed\",\n        none of them may appear.",
+      "properties": {
+        "min_value_count": {
+          "default": 10,
+          "minimum": 1,
+          "title": "Min Value Count",
+          "type": "integer"
+        },
+        "extremes": {
+          "$ref": "#/$defs/ValueTreatment",
+          "default": "exact"
+        },
+        "enumerations": {
+          "$ref": "#/$defs/ValueTreatment",
+          "default": "exact"
+        }
+      },
+      "title": "PrivacyPolicy",
+      "type": "object"
+    },
     "Quantile": {
-      "additionalProperties": false,
-      "description": "Value at a given quantile of the non-null values.\n\nAttributes:\n    q: Quantile in [0, 1], e.g. 0.5 for the median.\n    value: Value at the quantile; an ISO-8601 string for temporal columns.",
+      "description": "Value at a given quantile of the non-null values.\n\nAttributes:\n    q: Quantile in [0, 1], e.g. 0.5 for the median.\n    value: Value at the quantile, encoded by the column's logical type.",
       "properties": {
         "q": {
           "maximum": 1.0,
@@ -727,6 +785,9 @@
         },
         "value": {
           "anyOf": [
+            {
+              "type": "boolean"
+            },
             {
               "type": "integer"
             },
@@ -748,8 +809,7 @@
       "type": "object"
     },
     "RangeConstraint": {
-      "additionalProperties": false,
-      "description": "Bounds a column's values to an inclusive range.\n\nAttributes:\n    kind: Discriminator; always \"range\".\n    column: Constrained column.\n    min: Optional inclusive lower bound; an ISO-8601 string for temporal columns.\n    max: Optional inclusive upper bound; an ISO-8601 string for temporal columns.\n    satisfied_fraction: Fraction of rows that satisfy the constraint.",
+      "description": "Bounds a column's values to an inclusive range.\n\nAttributes:\n    kind: Discriminator; always \"range\".\n    column: Constrained column.\n    min: Optional inclusive lower bound, encoded by the column's logical type.\n    max: Optional inclusive upper bound, encoded by the column's logical type.\n    satisfied_fraction: Fraction of rows that satisfy the constraint.",
       "properties": {
         "satisfied_fraction": {
           "maximum": 1.0,
@@ -770,6 +830,9 @@
         "min": {
           "anyOf": [
             {
+              "type": "boolean"
+            },
+            {
               "type": "integer"
             },
             {
@@ -787,6 +850,9 @@
         },
         "max": {
           "anyOf": [
+            {
+              "type": "boolean"
+            },
             {
               "type": "integer"
             },
@@ -812,8 +878,7 @@
       "type": "object"
     },
     "Relationship": {
-      "additionalProperties": false,
-      "description": "Foreign key from child columns to parent key columns.\n\nAttributes:\n    child_table: Table that holds the foreign key.\n    child_columns: Foreign key columns, in order.\n    parent_table: Referenced table.\n    parent_columns: Referenced key columns, matched to `child_columns` by position.\n    coverage: Fraction of non-null child keys that match a parent key.\n    confidence: Optional confidence that the relationship is a true foreign key, in [0, 1].\n    fan_out: Optional distribution of child rows per parent key, including parents with no children.",
+      "description": "Foreign key from child columns to parent key columns.\n\nAttributes:\n    child_table: Table that holds the foreign key.\n    child_columns: Foreign key columns, in order.\n    parent_table: Referenced table.\n    parent_columns: Referenced key columns, matched to `child_columns` by position.\n    coverage: Fraction of non-null child keys that match a parent key.\n    confidence: Optional confidence that the relationship is a true foreign key, in [0, 1].\n    fan_out: Optional distribution of child rows per parent key.",
       "properties": {
         "child_table": {
           "title": "Child Table",
@@ -882,7 +947,6 @@
       "type": "object"
     },
     "SamplingInfo": {
-      "additionalProperties": false,
       "description": "How rows were sampled before profiling.\n\nAttributes:\n    fraction: Optional fraction of rows sampled.\n    max_rows: Optional cap on the number of rows sampled.\n    seed: Optional random seed.",
       "properties": {
         "fraction": {
@@ -929,7 +993,6 @@
       "type": "object"
     },
     "SourceInfo": {
-      "additionalProperties": false,
       "description": "Metadata about the profiled source. Holds no data values.\n\nAttributes:\n    name: Optional dataset name.\n    format: Optional storage format, e.g. \"delta\" or \"parquet\".\n    location: Optional path, URI, or catalog name of the source.\n    sampling: Optional sampling applied before profiling.",
       "properties": {
         "name": {
@@ -984,8 +1047,7 @@
       "type": "object"
     },
     "StringStats": {
-      "additionalProperties": false,
-      "description": "Statistics for a string column.\n\nAttributes:\n    length: Optional distribution of value lengths.\n    patterns: Optional regular expressions with the fraction of values each one matches.\n    top_values: Optional most frequent values. Engines must leave out rare values that could identify a record.",
+      "description": "Statistics for a string column.\n\nAttributes:\n    length: Optional distribution of value lengths.\n    patterns: Optional regular expressions with the fraction of values each one matches.\n    top_values: Optional most frequent values. Allowed on top-level columns only; each value must occur in at\n        least `privacy.min_value_count` rows.",
       "properties": {
         "length": {
           "anyOf": [
@@ -1033,8 +1095,7 @@
       "type": "object"
     },
     "TableProfile": {
-      "additionalProperties": false,
-      "description": "Profile of a single table.\n\nAttributes:\n    name: Table name, unique within the profile.\n    row_count: Number of rows profiled.\n    columns: Top-level column profiles, in schema order.\n    primary_key: Optional best primary key candidate.\n    unique_keys: Optional other unique key candidates.\n    check_constraints: Optional row-level constraints found in the data.\n    dependencies: Optional pairwise dependence measures between columns.",
+      "description": "Profile of a single table.\n\nAttributes:\n    name: Table name, unique within the profile.\n    row_count: Number of rows profiled.\n    columns: Top-level column profiles, in schema order; at least one.\n    primary_key: Optional best primary key candidate.\n    unique_keys: Optional other unique key candidates.\n    check_constraints: Optional row-level constraints found in the data.\n    dependencies: Optional pairwise dependence measures between columns.",
       "properties": {
         "name": {
           "minLength": 1,
@@ -1050,6 +1111,7 @@
           "items": {
             "$ref": "#/$defs/ColumnProfile"
           },
+          "minItems": 1,
           "title": "Columns",
           "type": "array"
         },
@@ -1141,8 +1203,7 @@
       "type": "object"
     },
     "TemporalStats": {
-      "additionalProperties": false,
-      "description": "Statistics for a date, time, or timestamp column.\n\nValues are ISO-8601 strings. `timestamp` values carry a UTC offset and\n`timestamp_ntz` values do not.\n\nAttributes:\n    min: Optional earliest value.\n    max: Optional latest value.\n    quantiles: Optional list of quantiles.",
+      "description": "Statistics for a date, time, or timestamp column.\n\nValues are ISO-8601 strings: `YYYY-MM-DD` for `date`, `HH:MM:SS[.f]` for\n`time`, `YYYY-MM-DDTHH:MM:SS[.f]` followed by `Z` or `+HH:MM` for\n`timestamp`, and the same without an offset for `timestamp_ntz`. Fractions\nhave up to nine digits.\n\nAttributes:\n    min: Optional earliest value.\n    max: Optional latest value.\n    quantiles: Optional list of quantiles.",
       "properties": {
         "min": {
           "anyOf": [
@@ -1188,7 +1249,6 @@
       "type": "object"
     },
     "ValueFrequency": {
-      "additionalProperties": false,
       "description": "Frequent value and its share of the column.\n\nAttributes:\n    value: The value.\n    frequency: Fraction of non-null values equal to `value`.",
       "properties": {
         "value": {
@@ -1208,13 +1268,22 @@
       ],
       "title": "ValueFrequency",
       "type": "object"
+    },
+    "ValueTreatment": {
+      "description": "How a producer handled a class of raw values.",
+      "enum": [
+        "exact",
+        "generalized",
+        "suppressed"
+      ],
+      "title": "ValueTreatment",
+      "type": "string"
     }
   },
-  "additionalProperties": false,
-  "description": "Profile of one or more tables and the relationships between them.\n\nAttributes:\n    spec_version: Version of this spec that the profile follows, as \"major.minor.patch\".\n    created_at: Time the profile was created, with a UTC offset.\n    engine: Engine that produced the profile.\n    source: Optional metadata about the profiled source.\n    tables: Table profiles.\n    relationships: Optional foreign key relationships between tables.",
+  "description": "Profile of one or more tables and the relationships between them.\n\nAttributes:\n    spec_version: Version of this spec that the profile follows, as \"major.minor.patch\". The major version must\n        match the reader's.\n    created_at: Time the profile was created, with a UTC offset.\n    engine: Engine that produced the profile.\n    privacy: Privacy policy the producer applied (default: the `PrivacyPolicy` defaults).\n    source: Optional metadata about the profiled source.\n    tables: Table profiles.\n    relationships: Optional foreign key relationships between tables.",
   "properties": {
     "spec_version": {
-      "pattern": "^(\\d+)\\.(\\d+)\\.(\\d+)$",
+      "pattern": "^0\\.\\d+\\.\\d+$",
       "title": "Spec Version",
       "type": "string"
     },
@@ -1225,6 +1294,9 @@
     },
     "engine": {
       "$ref": "#/$defs/EngineInfo"
+    },
+    "privacy": {
+      "$ref": "#/$defs/PrivacyPolicy"
     },
     "source": {
       "anyOf": [

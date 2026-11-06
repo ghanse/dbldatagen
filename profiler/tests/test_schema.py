@@ -37,7 +37,23 @@ def test_there_are_examples() -> None:
 @pytest.mark.parametrize("path", EXAMPLES, ids=lambda path: path.name)
 def test_example_matches_schema_and_model(validator: Draft202012Validator, path: Path) -> None:
     validator.validate(read_json(path))
-    load_profile(path.read_text(encoding="utf-8"))
+    load_profile(path.read_text(encoding="utf-8"), strict=True)
+
+
+def test_schema_accepts_unknown_fields(validator: Draft202012Validator, minimal_profile: dict[str, Any]) -> None:
+    minimal_profile["future_block"] = {"a": 1}
+    minimal_profile["tables"][0]["future_table_field"] = True
+    minimal_profile["tables"][0]["columns"][0]["future_column_field"] = [1, 2]
+    validator.validate(minimal_profile)
+    assert "additionalProperties" not in SCHEMA_PATH.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(("version", "ok"), [("0.1.0", True), ("0.9.4", True), ("1.0.0", False), ("10.1.0", False)])
+def test_schema_pins_major_version(
+    validator: Draft202012Validator, minimal_profile: dict[str, Any], version: str, ok: bool
+) -> None:
+    minimal_profile["spec_version"] = version
+    assert validator.is_valid(minimal_profile) is ok
 
 
 @pytest.mark.parametrize(
@@ -46,7 +62,8 @@ def test_example_matches_schema_and_model(validator: Draft202012Validator, path:
         lambda p: p.pop("engine"),
         lambda p: p["tables"][0].update(row_count=-1),
         lambda p: p["tables"][0]["columns"][0].update(logical_type="float128"),
-        lambda p: p["tables"][0]["columns"][0].update(extra=1),
+        lambda p: p["tables"][0].update(columns=[]),
+        lambda p: p["tables"][0].update(primary_key={"columns": [], "confidence": 1.0}),
     ],
 )
 def test_schema_rejects_invalid_profile(

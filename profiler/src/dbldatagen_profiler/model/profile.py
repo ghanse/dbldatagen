@@ -5,62 +5,58 @@ without holding raw rows. It is the contract between profiling engines and
 consumers such as data generators and the benchmark's reference sampler. Every
 block except the basic schema, row count, and null information is optional so
 engines can fill it in over time.
+
+Literal values (statistics, histogram edges, and constraint bounds or values)
+are typed by the column's logical type: `decimal`, `int64`, and `uint64` values
+are canonical decimal strings so they survive JSON without loss, other numeric
+values are JSON numbers, temporal values are ISO-8601 strings, `string` values
+are strings, and `boolean` values are booleans.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
+from decimal import Decimal
 from enum import Enum
+from itertools import pairwise
 from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 
 
 SPEC_VERSION = "0.1.0"
-LENIENT_CONTEXT_KEY = "lenient"
-
-_SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+SUPPORTED_MAJOR_VERSION = int(SPEC_VERSION.split(".", maxsplit=1)[0])
+STRICT_CONTEXT_KEY = "strict"
+DEFAULT_MIN_VALUE_COUNT = 10
 
 Fraction = Annotated[float, Field(ge=0.0, le=1.0)]
 Count = Annotated[int, Field(ge=0)]
-Number = int | float
-Scalar = int | float | str
+Scalar = bool | int | float | str
 
-
-def parse_version(version: str) -> tuple[int, int, int]:
-    """Parses a `major.minor.patch` version string.
-
-    Args:
-        version: Version string such as "0.1.0".
-
-    Returns:
-        A `(major, minor, patch)` tuple of integers.
-
-    Raises:
-        ValueError: If `version` is not three dot-separated integers.
-    """
-    match = _SEMVER_RE.fullmatch(version)
-    if match is None:
-        raise ValueError(f"spec_version={version!r} is not a 'major.minor.patch' version")
-    major, minor, patch = (int(part) for part in match.groups())
-    return major, minor, patch
+_INTEGER_RE = re.compile(r"^-?(0|[1-9]\d*)$")
+_DECIMAL_RE = re.compile(r"^-?(0|[1-9]\d*)(\.\d+)?$")
+_DATE = r"\d{4}-\d{2}-\d{2}"
+_TIME = r"\d{2}:\d{2}:\d{2}(\.\d{1,9})?"
 
 
 class _SpecModel(BaseModel):
     """Base model for every spec type.
 
-    Unknown fields are rejected, except when validation runs with the lenient
-    context flag set, in which case they are dropped. Readers set the flag when a
-    profile declares a newer minor spec version than they implement.
+    Unknown fields are ignored so that readers accept profiles written against a
+    newer minor spec version. Validation with the strict context flag set rejects
+    unknown fields instead; producers and tests use it to check their output.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     @model_validator(mode="before")
     @classmethod
-    def _drop_unknown_fields(cls, data: object, info: ValidationInfo) -> object:
-        if isinstance(data, dict) and info.context and info.context.get(LENIENT_CONTEXT_KEY):
-            return {key: value for key, value in data.items() if key in cls.model_fields}
+    def _reject_unknown_fields(cls, data: object, info: ValidationInfo) -> object:
+        if isinstance(data, dict) and info.context and info.context.get(STRICT_CONTEXT_KEY):
+            unknown = sorted(set(data) - set(cls.model_fields))
+            if unknown:
+                raise ValueError(f"{cls.__name__} has unknown fields {unknown}")
         return data
 
 
@@ -93,22 +89,68 @@ class LogicalType(str, Enum):
     VARIANT = "variant"
 
 
-NUMERIC_TYPES = frozenset(
+EXACT_INTEGER_TYPES = frozenset(
     {
         LogicalType.INT8,
         LogicalType.INT16,
         LogicalType.INT32,
-        LogicalType.INT64,
         LogicalType.UINT8,
         LogicalType.UINT16,
         LogicalType.UINT32,
-        LogicalType.UINT64,
-        LogicalType.FLOAT32,
-        LogicalType.FLOAT64,
-        LogicalType.DECIMAL,
     }
 )
+FLOAT_TYPES = frozenset({LogicalType.FLOAT32, LogicalType.FLOAT64})
+STRING_ENCODED_TYPES = frozenset({LogicalType.INT64, LogicalType.UINT64, LogicalType.DECIMAL})
+NUMERIC_TYPES = EXACT_INTEGER_TYPES | FLOAT_TYPES | STRING_ENCODED_TYPES
 TEMPORAL_TYPES = frozenset({LogicalType.DATE, LogicalType.TIME, LogicalType.TIMESTAMP, LogicalType.TIMESTAMP_NTZ})
+COLLECTION_TYPES = frozenset({LogicalType.ARRAY, LogicalType.MAP})
+
+_STRING_LITERAL_RES = {
+    LogicalType.DECIMAL: _DECIMAL_RE,
+    LogicalType.INT64: _INTEGER_RE,
+    LogicalType.UINT64: _INTEGER_RE,
+    LogicalType.DATE: re.compile(rf"^{_DATE}$"),
+    LogicalType.TIME: re.compile(rf"^{_TIME}$"),
+    LogicalType.TIMESTAMP: re.compile(rf"^{_DATE}T{_TIME}(Z|[+-]\d{{2}}:\d{{2}})$"),
+    LogicalType.TIMESTAMP_NTZ: re.compile(rf"^{_DATE}T{_TIME}$"),
+    LogicalType.STRING: re.compile(r".*", re.DOTALL),
+}
+_JSON_LITERAL_TYPES: dict[LogicalType, tuple[type, ...]] = {
+    **dict.fromkeys(EXACT_INTEGER_TYPES, (int,)),
+    **dict.fromkeys(FLOAT_TYPES, (int, float)),
+    LogicalType.BOOLEAN: (bool,),
+}
+
+
+def is_valid_literal(value: object, logical_type: LogicalType) -> bool:
+    """Returns whether `value` is a correctly encoded literal for `logical_type`.
+
+    Args:
+        value: Literal value taken from parsed JSON.
+        logical_type: Logical type of the column the value belongs to.
+
+    Returns:
+        True when `value` follows the spec's encoding rule for `logical_type`, or
+        when the spec defines no rule for the type.
+    """
+    pattern = _STRING_LITERAL_RES.get(logical_type)
+    if pattern is not None:
+        return isinstance(value, str) and pattern.fullmatch(value) is not None
+    types = _JSON_LITERAL_TYPES.get(logical_type)
+    if types is None:
+        return True
+    return isinstance(value, types) and isinstance(value, bool) == (logical_type == LogicalType.BOOLEAN)
+
+
+def _to_decimal(value: Scalar) -> Decimal:
+    """Converts a JSON number or canonical decimal string to a `Decimal`.
+
+    Raises:
+        ValueError: If `value` is a string that is not a canonical decimal.
+    """
+    if isinstance(value, bool) or (isinstance(value, str) and _DECIMAL_RE.fullmatch(value) is None):
+        raise ValueError(f"{value!r} is not a number or canonical decimal string")
+    return Decimal(str(value))
 
 
 class Cardinality(str, Enum):
@@ -144,7 +186,7 @@ class Quantile(_SpecModel):
 
     Attributes:
         q: Quantile in [0, 1], e.g. 0.5 for the median.
-        value: Value at the quantile; an ISO-8601 string for temporal columns.
+        value: Value at the quantile, encoded by the column's logical type.
     """
 
     q: Fraction
@@ -152,21 +194,28 @@ class Quantile(_SpecModel):
 
 
 class Histogram(_SpecModel):
-    """Equal- or variable-width histogram over the non-null values.
+    """Histogram over the non-null values of a numeric column.
+
+    Bin `i` holds values in `[edges[i], edges[i + 1])`; the last bin also holds
+    `edges[-1]`. The edges span every profiled value, so no value falls outside
+    the bins and the counts add up to the number of non-null values profiled.
 
     Attributes:
-        edges: Non-decreasing bin edges; one more than the number of bins.
+        edges: Non-decreasing bin edges, encoded by the column's logical type; one more than the number of bins.
         counts: Number of values in each bin.
+        sampled: Whether the counts come from a sample rather than every row (default false).
     """
 
-    edges: list[float] = Field(min_length=2)
+    edges: list[Scalar] = Field(min_length=2)
     counts: list[Count]
+    sampled: bool = False
 
     @model_validator(mode="after")
     def _check_shape(self) -> Histogram:
         if len(self.counts) != len(self.edges) - 1:
             raise ValueError("Histogram.counts must have exactly one fewer entry than Histogram.edges")
-        if any(left > right for left, right in zip(self.edges, self.edges[1:], strict=False)):
+        edges = [_to_decimal(edge) for edge in self.edges]
+        if any(left > right for left, right in pairwise(edges)):
             raise ValueError("Histogram.edges must be non-decreasing")
         return self
 
@@ -175,16 +224,16 @@ class NumericStats(_SpecModel):
     """Distribution statistics for an integer, floating-point, or decimal column.
 
     Attributes:
-        min: Optional smallest value.
-        max: Optional largest value.
-        mean: Optional arithmetic mean.
-        stddev: Optional sample standard deviation.
+        min: Optional smallest value, encoded by the column's logical type.
+        max: Optional largest value, encoded by the column's logical type.
+        mean: Optional arithmetic mean, as an approximate JSON number.
+        stddev: Optional sample standard deviation, as an approximate JSON number.
         quantiles: Optional list of quantiles.
         histogram: Optional histogram.
     """
 
-    min: Number | None = None
-    max: Number | None = None
+    min: Scalar | None = None
+    max: Scalar | None = None
     mean: float | None = None
     stddev: Annotated[float, Field(ge=0.0)] | None = None
     quantiles: list[Quantile] | None = None
@@ -192,7 +241,7 @@ class NumericStats(_SpecModel):
 
 
 class LengthStats(_SpecModel):
-    """Distribution of value lengths, in characters.
+    """Distribution of lengths: characters for strings, entries for arrays and maps.
 
     Attributes:
         min: Optional shortest length.
@@ -239,7 +288,8 @@ class StringStats(_SpecModel):
     Attributes:
         length: Optional distribution of value lengths.
         patterns: Optional regular expressions with the fraction of values each one matches.
-        top_values: Optional most frequent values. Engines must leave out rare values that could identify a record.
+        top_values: Optional most frequent values. Allowed on top-level columns only; each value must occur in at
+            least `privacy.min_value_count` rows.
     """
 
     length: LengthStats | None = None
@@ -250,8 +300,10 @@ class StringStats(_SpecModel):
 class TemporalStats(_SpecModel):
     """Statistics for a date, time, or timestamp column.
 
-    Values are ISO-8601 strings. `timestamp` values carry a UTC offset and
-    `timestamp_ntz` values do not.
+    Values are ISO-8601 strings: `YYYY-MM-DD` for `date`, `HH:MM:SS[.f]` for
+    `time`, `YYYY-MM-DDTHH:MM:SS[.f]` followed by `Z` or `+HH:MM` for
+    `timestamp`, and the same without an offset for `timestamp_ntz`. Fractions
+    have up to nine digits.
 
     Attributes:
         min: Optional earliest value.
@@ -296,6 +348,7 @@ class ColumnProfile(_SpecModel):
         string: Optional statistics for `string`.
         temporal: Optional statistics for `date`, `time`, `timestamp`, and `timestamp_ntz`.
         boolean: Optional statistics for `boolean`.
+        collection_length: Optional distribution of entry counts for non-null `array` and `map` values.
     """
 
     name: str = Field(min_length=1)
@@ -312,6 +365,7 @@ class ColumnProfile(_SpecModel):
     string: StringStats | None = None
     temporal: TemporalStats | None = None
     boolean: BooleanStats | None = None
+    collection_length: LengthStats | None = None
 
     @model_validator(mode="after")
     def _check_type_consistency(self) -> ColumnProfile:
@@ -328,11 +382,41 @@ class ColumnProfile(_SpecModel):
             "string": kind == LogicalType.STRING,
             "temporal": kind in TEMPORAL_TYPES,
             "boolean": kind == LogicalType.BOOLEAN,
+            "collection_length": kind in COLLECTION_TYPES,
         }
         for block, ok in allowed.items():
             if getattr(self, block) is not None and not ok:
                 raise ValueError(f"column {self.name!r}: {block} stats are not valid for logical_type={kind.value}")
+        check_literals(self, self.literals(), "statistics")
         return self
+
+    def literals(self) -> list[Scalar]:
+        """Returns the literal values held in the numeric and temporal statistics."""
+        stats = self.numeric or self.temporal
+        if stats is None:
+            return []
+        values = [stats.min, stats.max, *(q.value for q in stats.quantiles or [])]
+        if self.numeric is not None and self.numeric.histogram is not None:
+            values.extend(self.numeric.histogram.edges)
+        return [value for value in values if value is not None]
+
+
+def check_literals(column: ColumnProfile, values: list[Scalar], where: str) -> None:
+    """Checks that literal values follow the encoding rule for the column's logical type.
+
+    Args:
+        column: Column the values belong to.
+        values: Literal values to check.
+        where: Name of the block holding the values, used in the error message.
+
+    Raises:
+        ValueError: If any value is not encoded correctly.
+    """
+    invalid = [value for value in values if not is_valid_literal(value, column.logical_type)]
+    if invalid:
+        raise ValueError(
+            f"column {column.name!r}: {where} values {invalid} are not valid {column.logical_type.value} literals"
+        )
 
 
 def _check_children(column: ColumnProfile) -> None:
@@ -356,16 +440,30 @@ def _check_children(column: ColumnProfile) -> None:
         raise ValueError(f"column {column.name!r}: children are only valid for struct, array, and map")
 
 
+def nested_columns(columns: list[ColumnProfile]) -> Iterator[ColumnProfile]:
+    """Yields every column nested below `columns`, at any depth, excluding `columns` themselves."""
+    for column in columns:
+        for child in column.children or []:
+            yield child
+            yield from nested_columns([child])
+
+
 class KeyCandidate(_SpecModel):
     """Set of columns that is likely unique across the table.
 
     Attributes:
-        columns: Column names that form the key, in order.
+        columns: Distinct column names that form the key, in order.
         confidence: Confidence that the columns form a key, in [0, 1].
     """
 
     columns: list[str] = Field(min_length=1)
     confidence: Fraction
+
+    @model_validator(mode="after")
+    def _check_distinct_columns(self) -> KeyCandidate:
+        if len(set(self.columns)) != len(self.columns):
+            raise ValueError(f"key candidate repeats a column: {self.columns}")
+        return self
 
 
 class _Constraint(_SpecModel):
@@ -388,8 +486,8 @@ class RangeConstraint(_Constraint):
     Attributes:
         kind: Discriminator; always "range".
         column: Constrained column.
-        min: Optional inclusive lower bound; an ISO-8601 string for temporal columns.
-        max: Optional inclusive upper bound; an ISO-8601 string for temporal columns.
+        min: Optional inclusive lower bound, encoded by the column's logical type.
+        max: Optional inclusive upper bound, encoded by the column's logical type.
         satisfied_fraction: Fraction of rows that satisfy the constraint.
     """
 
@@ -409,13 +507,16 @@ class EnumerationConstraint(_Constraint):
     Attributes:
         kind: Discriminator; always "enumeration".
         column: Constrained column.
-        values: Allowed values.
+        values: Allowed values, encoded by the column's logical type.
+        min_value_count: Number of rows holding the least frequent listed value; must be at least
+            `privacy.min_value_count`.
         satisfied_fraction: Fraction of rows that satisfy the constraint.
     """
 
     kind: Literal["enumeration"] = "enumeration"
     column: str
-    values: list[Scalar | bool] = Field(min_length=1)
+    values: list[Scalar] = Field(min_length=1)
+    min_value_count: Count
 
     def column_refs(self) -> list[str]:
         """Returns the column names the constraint refers to."""
@@ -444,16 +545,18 @@ class ComparisonConstraint(_Constraint):
 
 
 class ExpressionConstraint(_Constraint):
-    """Boolean Spark SQL expression that rows satisfy.
+    """Boolean SQL expression that rows satisfy.
 
     Attributes:
         kind: Discriminator; always "expression".
-        expression: Spark SQL boolean expression over the table's columns.
+        expression: Boolean SQL expression over the table's columns.
+        dialect: SQL dialect of `expression` (default "spark").
         satisfied_fraction: Fraction of rows that satisfy the constraint.
     """
 
     kind: Literal["expression"] = "expression"
     expression: str = Field(min_length=1)
+    dialect: str = "spark"
 
 
 CheckConstraint = Annotated[
@@ -499,7 +602,7 @@ class TableProfile(_SpecModel):
     Attributes:
         name: Table name, unique within the profile.
         row_count: Number of rows profiled.
-        columns: Top-level column profiles, in schema order.
+        columns: Top-level column profiles, in schema order; at least one.
         primary_key: Optional best primary key candidate.
         unique_keys: Optional other unique key candidates.
         check_constraints: Optional row-level constraints found in the data.
@@ -508,7 +611,7 @@ class TableProfile(_SpecModel):
 
     name: str = Field(min_length=1)
     row_count: Count
-    columns: list[ColumnProfile]
+    columns: list[ColumnProfile] = Field(min_length=1)
     primary_key: KeyCandidate | None = None
     unique_keys: list[KeyCandidate] | None = None
     check_constraints: list[CheckConstraint] | None = None
@@ -516,8 +619,8 @@ class TableProfile(_SpecModel):
 
     @model_validator(mode="after")
     def _check_column_refs(self) -> TableProfile:
-        names = [column.name for column in self.columns]
-        if len(set(names)) != len(names):
+        columns = {column.name: column for column in self.columns}
+        if len(columns) != len(self.columns):
             raise ValueError(f"table {self.name!r} has duplicate column names")
         keys = [self.primary_key] if self.primary_key else []
         refs = [
@@ -525,14 +628,24 @@ class TableProfile(_SpecModel):
             *(name for constraint in self.check_constraints or [] for name in constraint.column_refs()),
             *(name for dependency in self.dependencies or [] for name in dependency.columns),
         ]
-        unknown = sorted(set(refs) - set(names))
+        unknown = sorted(set(refs) - set(columns))
         if unknown:
             raise ValueError(f"table {self.name!r} refers to unknown columns {unknown}")
+        for constraint in self.check_constraints or []:
+            if isinstance(constraint, RangeConstraint):
+                bounds = [bound for bound in (constraint.min, constraint.max) if bound is not None]
+                check_literals(columns[constraint.column], bounds, "range constraint")
+            elif isinstance(constraint, EnumerationConstraint):
+                check_literals(columns[constraint.column], constraint.values, "enumeration constraint")
         return self
 
 
 class FanOutStats(_SpecModel):
     """Distribution of the number of child rows per parent key.
+
+    Every parent key counts, including keys with no child rows. Child rows whose
+    key matches no parent are left out; `Relationship.coverage` accounts for them.
+    Quantile values are integer row counts.
 
     Attributes:
         min: Fewest child rows for a parent key.
@@ -548,6 +661,12 @@ class FanOutStats(_SpecModel):
     stddev: Annotated[float, Field(ge=0.0)] | None = None
     quantiles: list[Quantile] | None = None
 
+    @model_validator(mode="after")
+    def _check_integer_quantiles(self) -> FanOutStats:
+        if any(isinstance(q.value, bool) or not isinstance(q.value, int) for q in self.quantiles or []):
+            raise ValueError("FanOutStats.quantiles values must be integer row counts")
+        return self
+
 
 class Relationship(_SpecModel):
     """Foreign key from child columns to parent key columns.
@@ -559,7 +678,7 @@ class Relationship(_SpecModel):
         parent_columns: Referenced key columns, matched to `child_columns` by position.
         coverage: Fraction of non-null child keys that match a parent key.
         confidence: Optional confidence that the relationship is a true foreign key, in [0, 1].
-        fan_out: Optional distribution of child rows per parent key, including parents with no children.
+        fan_out: Optional distribution of child rows per parent key.
     """
 
     child_table: str
@@ -575,6 +694,31 @@ class Relationship(_SpecModel):
         if len(self.child_columns) != len(self.parent_columns):
             raise ValueError("Relationship.child_columns and parent_columns must have the same length")
         return self
+
+
+class ValueTreatment(str, Enum):
+    """How a producer handled a class of raw values."""
+
+    EXACT = "exact"
+    GENERALIZED = "generalized"
+    SUPPRESSED = "suppressed"
+
+
+class PrivacyPolicy(_SpecModel):
+    """Privacy policy that the producer applied when writing the profile.
+
+    Attributes:
+        min_value_count: Fewest rows a literal value must occur in before it may appear in `top_values` or an
+            enumeration constraint (default 10).
+        extremes: Treatment of numeric and temporal `min` and `max` statistics and range constraint bounds
+            (default "exact"). When "suppressed", none of them may appear.
+        enumerations: Treatment of `top_values` and enumeration constraints (default "exact"). When "suppressed",
+            none of them may appear.
+    """
+
+    min_value_count: Annotated[int, Field(ge=1)] = DEFAULT_MIN_VALUE_COUNT
+    extremes: ValueTreatment = ValueTreatment.EXACT
+    enumerations: ValueTreatment = ValueTreatment.EXACT
 
 
 class EngineInfo(_SpecModel):
@@ -623,27 +767,23 @@ class Profile(_SpecModel):
     """Profile of one or more tables and the relationships between them.
 
     Attributes:
-        spec_version: Version of this spec that the profile follows, as "major.minor.patch".
+        spec_version: Version of this spec that the profile follows, as "major.minor.patch". The major version must
+            match the reader's.
         created_at: Time the profile was created, with a UTC offset.
         engine: Engine that produced the profile.
+        privacy: Privacy policy the producer applied (default: the `PrivacyPolicy` defaults).
         source: Optional metadata about the profiled source.
         tables: Table profiles.
         relationships: Optional foreign key relationships between tables.
     """
 
-    spec_version: str = Field(pattern=_SEMVER_RE.pattern)
+    spec_version: str = Field(pattern=rf"^{SUPPORTED_MAJOR_VERSION}\.\d+\.\d+$")
     created_at: AwareDatetime
     engine: EngineInfo
+    privacy: PrivacyPolicy = Field(default_factory=PrivacyPolicy)
     source: SourceInfo | None = None
     tables: list[TableProfile] = Field(min_length=1)
     relationships: list[Relationship] | None = None
-
-    @field_validator("spec_version")
-    @classmethod
-    def _check_major_version(cls, value: str) -> str:
-        if parse_version(value)[0] != parse_version(SPEC_VERSION)[0]:
-            raise ValueError(f"spec_version={value!r} has a different major version than supported {SPEC_VERSION!r}")
-        return value
 
     @model_validator(mode="after")
     def _check_relationship_refs(self) -> Profile:
@@ -658,3 +798,47 @@ class Profile(_SpecModel):
                 if unknown:
                     raise ValueError(f"relationship refers to unknown columns {unknown} in table {table!r}")
         return self
+
+    @model_validator(mode="after")
+    def _check_privacy(self) -> Profile:
+        for table in self.tables:
+            _check_table_privacy(table, self.privacy)
+        return self
+
+
+def _check_table_privacy(table: TableProfile, policy: PrivacyPolicy) -> None:
+    """Checks that a table's literal values follow the privacy policy.
+
+    Args:
+        table: Table to check.
+        policy: Privacy policy the producer declared.
+
+    Raises:
+        ValueError: If a literal value is rarer than `policy.min_value_count`, or a suppressed value class is present.
+    """
+    k = policy.min_value_count
+    suppress_extremes = policy.extremes == ValueTreatment.SUPPRESSED
+    suppress_enumerations = policy.enumerations == ValueTreatment.SUPPRESSED
+    if any(column.string and column.string.top_values for column in nested_columns(table.columns)):
+        raise ValueError(f"table {table.name!r}: top_values are only allowed on top-level columns")
+    for column in [*table.columns, *nested_columns(table.columns)]:
+        stats = column.numeric or column.temporal
+        if suppress_extremes and stats is not None and (stats.min is not None or stats.max is not None):
+            raise ValueError(f"column {column.name!r}: min/max present but privacy.extremes is suppressed")
+        top_values = column.string.top_values if column.string else None
+        if top_values and suppress_enumerations:
+            raise ValueError(f"column {column.name!r}: top_values present but privacy.enumerations is suppressed")
+        non_null_rows = table.row_count * (1.0 - column.null_fraction)
+        rare = [entry.value for entry in top_values or [] if round(entry.frequency * non_null_rows) < k]
+        if rare:
+            raise ValueError(f"column {column.name!r}: top_values occur in fewer than {k} rows: {rare}")
+    for constraint in table.check_constraints or []:
+        if isinstance(constraint, RangeConstraint) and suppress_extremes:
+            raise ValueError(f"table {table.name!r}: range constraint present but privacy.extremes is suppressed")
+        if isinstance(constraint, EnumerationConstraint):
+            if suppress_enumerations:
+                raise ValueError(f"table {table.name!r}: enumeration present but privacy.enumerations is suppressed")
+            if constraint.min_value_count < k:
+                raise ValueError(
+                    f"table {table.name!r}: enumeration on {constraint.column!r} has values in fewer than {k} rows"
+                )

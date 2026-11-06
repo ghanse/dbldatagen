@@ -1,8 +1,9 @@
 """Reads, writes, and describes profiles in JSON.
 
-`load_profile` applies the spec's version rules: profiles with a different major
-version are rejected, and profiles with a newer minor version are read with
-unknown fields dropped. `profile_json_schema` builds the JSON Schema that is
+`load_profile` ignores unknown fields by default, so a reader accepts profiles
+written against a newer minor spec version; `strict=True` rejects them, which
+producers and tests use to check their output. Profiles with a different major
+version are always rejected. `profile_json_schema` builds the JSON Schema that is
 published as `profiler/spec/profile.schema.json`.
 """
 
@@ -12,29 +13,28 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from dbldatagen_profiler.model.profile import LENIENT_CONTEXT_KEY, SPEC_VERSION, Profile, parse_version
+from dbldatagen_profiler.model.profile import SPEC_VERSION, STRICT_CONTEXT_KEY, Profile
 
 
 JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 
 
-def load_profile(source: str | bytes | Mapping[str, Any]) -> Profile:
+def load_profile(source: str | bytes | Mapping[str, Any], *, strict: bool = False) -> Profile:
     """Validates a profile from JSON text or a parsed JSON object.
 
     Args:
         source: JSON text, or an already parsed JSON object.
+        strict: Optional flag that rejects unknown fields instead of ignoring them (default false).
 
     Returns:
         The validated `Profile`.
 
     Raises:
-        ValueError: If `source` is not valid JSON.
-        pydantic.ValidationError: If the profile does not follow the spec.
+        ValueError: If `source` is not valid JSON or the profile does not follow the spec. Validation failures are
+            raised as `pydantic.ValidationError`, a subclass of `ValueError`.
     """
     data = json.loads(source) if isinstance(source, str | bytes) else dict(source)
-    version = data.get("spec_version") if isinstance(data, dict) else None
-    lenient = isinstance(version, str) and _is_newer_minor(version)
-    return Profile.model_validate(data, context={LENIENT_CONTEXT_KEY: lenient})
+    return Profile.model_validate(data, context={STRICT_CONTEXT_KEY: strict})
 
 
 def dump_profile(profile: Profile) -> str:
@@ -51,6 +51,9 @@ def dump_profile(profile: Profile) -> str:
 
 def profile_json_schema() -> dict[str, Any]:
     """Builds the JSON Schema for the current spec version.
+
+    The schema accepts unknown fields so that readers in any language stay
+    compatible with newer minor versions.
 
     Returns:
         The JSON Schema as a dictionary.
@@ -69,13 +72,3 @@ def render_json_schema() -> str:
         Indented JSON text ending in a newline.
     """
     return json.dumps(profile_json_schema(), indent=2) + "\n"
-
-
-def _is_newer_minor(version: str) -> bool:
-    """Returns whether `version` has the supported major version and a newer minor version."""
-    try:
-        major, minor, _ = parse_version(version)
-    except ValueError:
-        return False
-    supported_major, supported_minor, _ = parse_version(SPEC_VERSION)
-    return major == supported_major and minor > supported_minor

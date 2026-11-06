@@ -35,6 +35,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     validate = commands.add_parser("validate", help="Validate a profile JSON file against the spec.")
     validate.add_argument("path", type=Path, help="Path to the profile JSON file.")
+    validate.add_argument("--strict", action="store_true", help="Reject fields that the spec does not define.")
     validate.set_defaults(handler=_validate)
 
     schema = commands.add_parser("schema", help="Print or write the profile JSON Schema.")
@@ -49,7 +50,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def _validate(args: argparse.Namespace) -> int:
     """Validates the profile at `args.path` and reports the result."""
     try:
-        profile = load_profile(args.path.read_text(encoding="utf-8"))
+        profile = load_profile(args.path.read_text(encoding="utf-8"), strict=args.strict)
     except (OSError, ValueError) as error:
         print(f"{args.path}: invalid profile\n{error}", file=sys.stderr)
         return 1

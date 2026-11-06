@@ -26,6 +26,7 @@ from dbldatagen_profiler.model.profile import (
     LogicalType,
     NumericStats,
     Pattern,
+    PrivacyPolicy,
     Profile,
     Quantile,
     RangeConstraint,
@@ -36,7 +37,8 @@ from dbldatagen_profiler.model.profile import (
     TableProfile,
     TemporalStats,
     ValueFrequency,
-    parse_version,
+    ValueTreatment,
+    is_valid_literal,
 )
 
 
@@ -60,6 +62,7 @@ __all__ = [
     "LogicalType",
     "NumericStats",
     "Pattern",
+    "PrivacyPolicy",
     "Profile",
     "Quantile",
     "RangeConstraint",
@@ -70,9 +73,10 @@ __all__ = [
     "TableProfile",
     "TemporalStats",
     "ValueFrequency",
+    "ValueTreatment",
     "dump_profile",
+    "is_valid_literal",
     "load_profile",
-    "parse_version",
     "profile_json_schema",
     "render_json_schema",
 ]

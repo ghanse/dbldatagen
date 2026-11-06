@@ -59,3 +59,14 @@ def test_missing_subcommand_is_a_usage_error() -> None:
     with pytest.raises(SystemExit) as exit_info:
         main([])
     assert exit_info.value.code == 2
+
+
+def test_validate_strict_rejects_unknown_fields(
+    tmp_path: Path, minimal_profile: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    minimal_profile["future_block"] = {}
+    path = tmp_path / "future.json"
+    path.write_text(json.dumps(minimal_profile), encoding="utf-8")
+    assert main(["validate", str(path)]) == 0
+    assert main(["validate", "--strict", str(path)]) == 1
+    assert "future_block" in capsys.readouterr().err
