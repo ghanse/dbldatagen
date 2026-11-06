@@ -4,7 +4,7 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 
-from profiler_bench.catalog.distributions import ALPHA, Z, check_distribution
+from profiler_bench.catalog.distributions import ALPHA, Z, check_distribution, discrete_bins
 from profiler_bench.catalog.manifest import Distribution, Family
 from profiler_bench.catalog.stats import (
     binomial_logpmf,
@@ -71,3 +71,22 @@ def test_check_distribution_accepts_true_samples(
 ) -> None:
     values = draw(np.random.default_rng(1))
     assert check_distribution(np.asarray(values, dtype=np.float64), Distribution(family=family, params=params)) == []
+
+
+def test_discrete_bins_come_from_the_declared_law() -> None:
+    probabilities, tail = discrete_bins(lambda k: poisson_logpmf(k, 4.0), 5000)
+    assert tail * 5000 < 5 <= (tail + probabilities[-1]) * 5000
+    assert probabilities.sum() + tail == pytest.approx(1.0)
+    bounded, bounded_tail = discrete_bins(lambda k: binomial_logpmf(k, 5, 0.5), 10**6, 5)
+    assert len(bounded) == 6
+    assert bounded_tail == pytest.approx(0.0, abs=1e-12)
+
+
+def test_discrete_chi_square_bins_do_not_depend_on_the_sample() -> None:
+    sample = np.random.default_rng(3).poisson(5.0, 5000).astype(np.float64)
+    wrong = Distribution(family=Family.POISSON, params={"lam": 4.0})
+    with_outlier = sample.copy()
+    with_outlier[0] = 10_000
+    (fit,) = [m for m in check_distribution(sample, wrong) if "chi-square" in m]
+    (fit_outlier,) = [m for m in check_distribution(with_outlier, wrong) if "chi-square" in m]
+    assert fit.split(" df")[0].rsplit(" on ", 1)[1] == fit_outlier.split(" df")[0].rsplit(" on ", 1)[1]

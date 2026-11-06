@@ -4,13 +4,14 @@ The hash covers the Spark schema (column names and type strings), the row count,
 Rows are put in a canonical order by sorting on all non-nested columns in schema order, so tables
 whose rows are identical on those columns must not differ in their nested columns. Each column is
 encoded as its validity bitmap plus its values with null slots zeroed; struct fields inherit the
-struct's nulls, lists and maps are encoded as lengths plus their flattened values, and every NaN is
-encoded with the same bits.
+struct's nulls, lists and maps are encoded as lengths plus their flattened values, every NaN is
+encoded with the same bits, and every multi-byte number is written little-endian whatever the host.
 """
 
 from __future__ import annotations
 
 import hashlib
+import sys
 from decimal import Decimal
 from typing import Protocol
 
@@ -52,7 +53,7 @@ def _feed(digest: _Digest, array: pa.Array) -> None:
     elif pa.types.is_list(arrow_type) or pa.types.is_map(arrow_type):
         offsets = array.offsets.to_numpy(zero_copy_only=False)
         spans = np.diff(offsets)
-        digest.update(np.ascontiguousarray(np.where(valid, spans, 0), dtype=np.int64).tobytes())
+        digest.update(little_endian(np.where(valid, spans, 0).astype(np.int64)))
         if pa.types.is_map(arrow_type):
             children = pa.StructArray.from_arrays([array.keys, array.items], names=["key", "value"])
         else:
@@ -63,18 +64,25 @@ def _feed(digest: _Digest, array: pa.Array) -> None:
         filled = pc.fill_null(array, pa.scalar("" if pa.types.is_string(arrow_type) else b"", arrow_type))
         offsets = np.frombuffer(filled.buffers()[1], dtype=np.int32)[filled.offset : filled.offset + len(filled) + 1]
         data = filled.buffers()[2]
-        digest.update(np.ascontiguousarray(offsets - offsets[0], dtype=np.int64).tobytes())
+        digest.update(little_endian((offsets - offsets[0]).astype(np.int64)))
         if data is not None:
             digest.update(data.to_pybytes()[offsets[0] : offsets[-1]])
     elif pa.types.is_decimal(arrow_type):
         filled = pc.fill_null(array, pa.scalar(Decimal(0), arrow_type))
         width = arrow_type.byte_width
-        digest.update(filled.buffers()[1].to_pybytes()[filled.offset * width : (filled.offset + len(filled)) * width])
+        raw = filled.buffers()[1].to_pybytes()[filled.offset * width : (filled.offset + len(filled)) * width]
+        if sys.byteorder == "big":
+            raw = np.frombuffer(raw, dtype=np.uint8).reshape(-1, width)[:, ::-1].tobytes()
+        digest.update(raw)
     elif pa.types.is_boolean(arrow_type):
         digest.update(pc.fill_null(array, False).to_numpy(zero_copy_only=False).astype(np.uint8).tobytes())
     else:
-        values = _numeric(array)
-        digest.update(np.ascontiguousarray(values).tobytes())
+        digest.update(little_endian(_numeric(array)))
+
+
+def little_endian(values: np.ndarray) -> bytes:
+    """Returns the bytes of a numeric array in little-endian order, whatever its or the host's byte order."""
+    return np.ascontiguousarray(values, dtype=values.dtype.newbyteorder("<")).tobytes()
 
 
 def _numeric(array: pa.Array) -> np.ndarray:

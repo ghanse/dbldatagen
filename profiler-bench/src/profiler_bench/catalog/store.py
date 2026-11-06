@@ -79,7 +79,9 @@ def materialize(
 ) -> Materialized:
     """Writes a dataset instance to the cache unless it is already there, and returns it.
 
-    A cached instance whose files no longer match its recorded logical hashes is regenerated.
+    A cached instance is regenerated when its manifest or metadata cannot be read, when its content hash
+    no longer matches the recorded table hashes and manifest, or (with `check_hash`) when its parquet
+    files no longer match the recorded table hashes.
 
     Args:
         name: Dataset name.
@@ -91,9 +93,8 @@ def materialize(
     """
     target = instance_dir(name, tier, seed, root)
     if (target / META_FILE).exists():
-        cached = _read(target)
-        if not check_hash or file_hashes(cached) == cached.table_hashes:
-            return cached
+        if _is_intact(target, check_hash):
+            return _read(target)
         shutil.rmtree(target)
     tables, truth = generate(get(name), tier, seed)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -106,6 +107,16 @@ def materialize(
         if not (target / META_FILE).exists():
             raise
     return _read(target)
+
+
+def _is_intact(path: Path, check_files: bool) -> bool:
+    try:
+        cached = _read(path)
+    except (OSError, ValueError, KeyError):
+        return False
+    if content_hash(cached.table_hashes, path / MANIFEST_FILE) != cached.content_hash:
+        return False
+    return not check_files or file_hashes(cached) == cached.table_hashes
 
 
 def file_hashes(instance: Materialized) -> dict[str, str]:

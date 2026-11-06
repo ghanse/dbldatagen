@@ -1,17 +1,21 @@
 import itertools
 import json
 import os
+import struct
 import subprocess
 import sys
+from decimal import Decimal
 from pathlib import Path
 
+import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from pyspark.sql import SparkSession
 
 from profiler_bench.catalog import DATASETS, generate, materialize, registry
 from profiler_bench.catalog.gen import rng_factory
-from profiler_bench.catalog.hashing import table_hash
+from profiler_bench.catalog.hashing import little_endian, table_hash
 
 
 @pytest.mark.parametrize("name", sorted(DATASETS))
@@ -118,3 +122,51 @@ def test_streams_are_independent_of_request_order() -> None:
     rng("b").random(3)
     assert (rng("a").random(3) == a_first).all()
     assert not (rng("b").random(3) == a_first).all()
+
+
+@pytest.mark.parametrize("check_hash", [True, False])
+def test_edited_manifest_is_detected_and_regenerated(tmp_path: Path, check_hash: bool) -> None:
+    first = materialize("numeric", "xs", 0, tmp_path)
+    manifest_path = first.path / "manifest.json"
+    original = manifest_path.read_text(encoding="utf-8")
+    edited = json.loads(original)
+    edited["tables"][0]["columns"][1]["null_rate"] = 0.5
+    manifest_path.write_text(json.dumps(edited, indent=2) + "\n", encoding="utf-8")
+    second = materialize("numeric", "xs", 0, tmp_path, check_hash=check_hash)
+    assert manifest_path.read_text(encoding="utf-8") == original
+    assert second.manifest == first.manifest
+    assert second.content_hash == first.content_hash
+
+
+def test_unreadable_manifest_is_regenerated(tmp_path: Path) -> None:
+    first = materialize("numeric", "xs", 0, tmp_path)
+    (first.path / "manifest.json").write_text("{not json", encoding="utf-8")
+    assert materialize("numeric", "xs", 0, tmp_path).manifest == first.manifest
+
+
+@pytest.mark.parametrize(("dtype", "code"), [("i2", "h"), ("i4", "i"), ("i8", "q"), ("f4", "f"), ("f8", "d")])
+def test_hash_bytes_are_little_endian_regardless_of_input_order(dtype: str, code: str) -> None:
+    values = np.array([1, -2, 3, 1000], dtype=f"<{dtype}")
+    big = values.astype(f">{dtype}")
+    expected = struct.pack(f"<{len(values)}{code}", *values.tolist())
+    assert little_endian(big) == little_endian(values) == expected
+
+
+GOLDEN_TABLE_HASH = "b7cd735307c96ab60d4fd136d636ee4e6231bb947140a8425d08183aae0cf4bb"
+
+
+def _golden_table() -> pa.Table:
+    return pa.table(
+        {
+            "i": pa.array([3, None, -(2**40)], pa.int64()),
+            "f": pa.array([1.5, float("nan"), None], pa.float32()),
+            "d": pa.array([Decimal("1.25"), None, Decimal("-3.00")], pa.decimal128(10, 2)),
+            "s": pa.array(["a", None, "ccc"]),
+            "t": pa.array([0, 1_000_000, None], pa.int64()).cast(pa.timestamp("us", tz="UTC")),
+            "l": pa.array([[1, 2], None, []], pa.list_(pa.int32())),
+        }
+    )
+
+
+def test_table_hash_is_pinned_across_hosts() -> None:
+    assert table_hash(_golden_table()) == GOLDEN_TABLE_HASH

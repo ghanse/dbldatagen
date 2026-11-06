@@ -22,6 +22,7 @@ import pandas as pd
 
 from profiler_bench.catalog.manifest import Bound, Distribution, Family
 from profiler_bench.catalog.stats import (
+    MIN_EXPECTED,
     binomial_logpmf,
     chi2_test,
     kolmogorov_pvalue,
@@ -106,14 +107,46 @@ def _chi2(label: str, observed: np.ndarray, expected: np.ndarray) -> list[str]:
     return [] if p >= ALPHA else [f"{label} chi-square {statistic:.4g} on {df} df, p={p:.2g} < alpha={ALPHA:g}"]
 
 
-def _discrete(values: np.ndarray, logpmf: Callable[[np.ndarray], np.ndarray], low: int) -> list[str]:
-    """Chi-square test of integer `values >= low`; the last bin holds the whole upper tail."""
-    ints = values.astype(np.int64)
-    support = np.arange(low, int(ints.max()) + 1)
-    probabilities = np.exp(logpmf(support - low))
-    probabilities[-1] += max(0.0, 1.0 - probabilities.sum())
-    observed = np.bincount(ints - low, minlength=len(support))
-    return _chi2("goodness of fit", observed.astype(np.float64), probabilities * len(values))
+def discrete_bins(
+    logpmf: Callable[[np.ndarray], np.ndarray], n: int, high: int | None = None
+) -> tuple[np.ndarray, float]:
+    """Returns the chi-square bins of a discrete law for `n` draws, chosen from the law alone.
+
+    Bins are the single values `0..K-1` (offsets from the lowest value), where `K` is the first value
+    whose expected upper tail `n * P(X >= K)` falls below five (or the end of a bounded support),
+    plus one bin for the tail `X >= K`. The data never influences the bins.
+
+    Args:
+        logpmf: Log-pmf at offsets from the lowest value.
+        n: Number of draws.
+        high: Largest offset of a bounded support, or None.
+
+    Returns:
+        The probabilities of the single-value bins and the probability of the tail bin.
+    """
+    length = 64
+    while True:
+        bounded = high is not None and length > high
+        limit = high + 1 if bounded and high is not None else length
+        probabilities = np.exp(logpmf(np.arange(limit)))
+        tails = 1.0 - np.concatenate([[0.0], np.cumsum(probabilities)])
+        below = np.nonzero(tails[1:] * n < MIN_EXPECTED)[0]
+        if len(below) or bounded or length >= MAX_DISCRETE_SUPPORT:
+            cut = int(below[0]) + 1 if len(below) else limit
+            return probabilities[:cut], max(0.0, float(tails[cut]))
+        length *= 2
+
+
+def _discrete(
+    values: np.ndarray, logpmf: Callable[[np.ndarray], np.ndarray], low: int, high: int | None = None
+) -> list[str]:
+    """Chi-square test of integer `values >= low` against fixed bins from `discrete_bins`."""
+    offsets = values.astype(np.int64) - low
+    probabilities, tail = discrete_bins(logpmf, len(values), None if high is None else high - low)
+    cut = len(probabilities)
+    observed = np.append(np.bincount(np.minimum(offsets, cut), minlength=cut + 1)[:cut], (offsets >= cut).sum())
+    expected = np.append(probabilities, tail) * len(values)
+    return _chi2("goodness of fit", observed.astype(np.float64), expected)
 
 
 def _mean_std(values: np.ndarray, mean: float, std: float) -> list[str]:
@@ -218,7 +251,7 @@ def _binomial(v: np.ndarray, p: dict[str, Any]) -> list[str]:
         return failures
     sd = math.sqrt(trials * prob * (1 - prob))
     return near("mean", float(v.mean()), trials * prob, Z * sd / math.sqrt(len(v))) + _discrete(
-        v, lambda k: binomial_logpmf(k, trials, prob), 0
+        v, lambda k: binomial_logpmf(k, trials, prob), 0, trials
     )
 
 
