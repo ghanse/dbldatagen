@@ -96,6 +96,30 @@ parquet writer, but a new numpy version may change the generated values and so t
 the URL cannot be reached, so callers can skip it offline. Real datasets have no planted truth and carry no manifest.
 None are registered yet.
 
+## Reference sampler
+
+The sampler reconstructs deterministic PySpark DataFrames from a profile without using dbldatagen. It consumes the
+richest available marginal statistics, cardinality and string information, nested child profiles, keys, relationships,
+constraints, and pairwise dependencies, then reports the fields used, approximated, or unmet for every column.
+
+```python
+from profiler_bench.sampler import sample
+
+result = sample(profile, spark, seed=0, scale=1.0)
+frames = result.tables
+coverage = result.report
+```
+
+Pearson and Spearman dependencies use a Gaussian copula with a nearest-positive-semidefinite correlation matrix.
+Cramér's V is approximated by replacing the requested share of sampled right-hand categories through a deterministic
+left-to-right category mapping; the requested coefficient controls the mixture strength but is not guaranteed to equal
+the resulting coefficient for imbalanced marginals.
+Expression constraints use bounded oversampling followed by Spark SQL filtering; any unmet expression is recorded rather
+than failing the sample.
+
+The reference sampler is designed for benchmark tiers up to `s` (about 100,000 rows and the catalog's roughly
+200-column wide table). Tier `m` measures profiler speed and is not a supported fidelity-sampling workload.
+
 ## Development
 
 ```bash
