@@ -122,7 +122,7 @@ class FakeScorer:
 def try_real_scorer() -> Scorer | None:
     """Returns a real sampler+fidelity scorer when those modules are importable, else None."""
     try:
-        from profiler_bench import fidelity, sampler  # type: ignore[attr-defined]  # noqa: PLC0415
+        from profiler_bench import fidelity, sampler  # noqa: PLC0415
     except ImportError:
         return None
     return _RealScorer(

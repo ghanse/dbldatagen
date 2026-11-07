@@ -25,6 +25,7 @@ dependencies = [
     "pandas>=1.4.4,<3",
     "pyarrow>=8.0.0,<23.0.0",
     "pyspark[sql]>=3.4.1,<4.2",
+    "scikit-learn>=1.4.2,<1.8",
 ]
 
 [tool.uv.sources]

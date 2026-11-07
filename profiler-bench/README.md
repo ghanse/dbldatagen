@@ -96,6 +96,120 @@ parquet writer, but a new numpy version may change the generated values and so t
 the URL cannot be reached, so callers can skip it offline. Real datasets have no planted truth and carry no manifest.
 None are registered yet.
 
+## Fidelity metrics
+
+`profiler_bench.fidelity` scores a profiler from three angles. Every score is in [0, 1] (1 is perfect), is a
+pydantic model that round-trips through JSON with full per-column, per-pair, per-check detail, and carries the
+version and SHA-256 of the metrics configuration that produced it.
+
+```python
+from profiler_bench.fidelity import ceiling, overall, score_privacy, score_reconstruction, score_structure
+
+recon = score_reconstruction(real, synth, truth, seed=0)  # synthetic tables vs real tables
+structure = score_structure(profile, truth)               # profile vs the planted ground truth
+privacy = score_privacy(real, synth, profile, truth)      # guard: privacy.passed
+top = ceiling("retail", "s", spark=spark)                 # two real row samples of one structure
+recon.relative_to(top)                                    # per-group fraction of the achievable
+```
+
+All functions need `spark.sql.session.timeZone=UTC`. Only bounded, content-hash-seeded samples reach the driver
+(`sampling.max_rows` per table and side); row counts, null fractions, distinct counts, constraints, keys, and foreign
+keys are Spark aggregates over the full tables.
+
+### Configuration
+
+[`metrics_config.json`](src/profiler_bench/fidelity/metrics_config.json) holds every sample size, tolerance,
+threshold, and weight. It is frozen per experiment: changing a value is a benchmark change and needs a new `version`.
+
+### Reconstruction
+
+Each table's score is the weighted mean of the groups present in that table, renormalized over those groups, and
+`TableReconstruction.weights` records the effective weights. Because a table without, say, foreign keys spreads that
+weight over its other groups, two tables weight the same group differently: compare tables group by group rather than
+by total score. A dataset's score is the mean of its table scores.
+
+| Group | Weight | Per item |
+|---|---|---|
+| `schema` | 0.05 | mean of the share of columns with matching name and type, and `(min(rows)+1)/(max(rows)+1)` |
+| `marginal` | 0.25 | numeric: 1 - KS and 1 - normalized Wasserstein-1 (clipped to the real 1–99% range widened by that range, divided by it, capped at 1); categorical (at most 20 distinct real values, or boolean): 1 - TVD over the top 20 real values plus `other`; strings: TVD, KS and Wasserstein of lengths, and 1 - TVD over the manifest formats plus `unmatched`; floats: 1 - TVD of the NaN/inf/-inf shares; arrays, maps, binary: length KS and Wasserstein, with elements, keys, and values scored as their own leaves |
+| `null_fraction` | 0.10 | 1 - absolute null fraction error |
+| `distinct` | 0.10 | `(min+1)/(max+1)` of the distinct counts, i.e. exp(-abs(log ratio)) |
+| `dependence_declared` | 0.10 | 1 - abs(delta) of the manifest's declared measure for each declared pair |
+| `dependence_random` | 0.05 | 1 - abs(delta) over 20 seeded random pairs: Spearman (numeric), Cramér's V (categorical), correlation ratio (mixed). High-cardinality strings join the pairs through derived features: `#format` (index of the manifest format matched), `#chars` (length), and `#digits`, `#letters`, `#punctuation` counts; derived features of the same column are not paired with each other. Up to 20 pairs of high-cardinality string columns also score value agreement: 1 - abs(exact-equality rate error) and the KS and Wasserstein distances of the per-row shared-prefix length, so two equal UUID columns or a copied id within a table must stay equal |
+| `constraints` | 0.10 | share of synth rows satisfying each check; for functional dependencies, the largest share of rows that can be kept so the dependency holds |
+| `keys` | 0.05 | distinct non-null keys over rows (primary) or over rows with a key (unique) |
+| `foreign_keys` | 0.10 | mean of 1 - abs(coverage error), 1 - fan-out KS, and 1 - fan-out Wasserstein |
+| `discriminator` | 0.10 | 1 - abs(AUC - 0.5) * 2 on the held-out half for a scikit-learn `HistGradientBoostingClassifier` (100 iterations, fixed `random_state`, one thread) on 2,000 seeded rows per side, split in stratified halves; features include the derived string features |
+
+A column or table the synth lacks, or a column with a different type, scores 0. The **ceiling** scores two row
+samples of the same dataset structure (same structure seed, sample seeds `s` and `s + 1`), which shows how far apart
+two real draws already are. `relative_to(ceiling)` divides each group by the ceiling's same group, caps each at 1,
+and then applies the table's effective weights, so a group above its ceiling cannot hide one below it.
+
+### Structure recovery
+
+Each planted item earns credit in [0, 1]. Recall is the mean credit over planted items; precision is the mean credit
+over the profile's claims about the same columns. Key, foreign key, check, and dependency claims about structure the
+manifest does not plant are checked against the real data (`profiler_bench.fidelity.claims`): fractions within the
+catalog's share tolerance, keys exactly, dependencies within the dependency tolerance on a bounded sample. True ones
+are left out of precision; false ones count as 0, including on tables with nothing planted in that category (recall
+is then 1). A category scores F1, or recall when there are no claims. Missing structure is reported as
+`not recovered`, never as an error. `TableStructure.weights` records the effective category weights.
+
+Verifying claims against the real data gives the profiler no new information: it reads the same data when it
+profiles. The score must not echo that data either, so a category records only how many unplanted claims held
+(`verified_true`) and how many did not (`verified_false`), never the claimed or real values.
+
+| Category | Weight | Recovered when |
+|---|---|---|
+| `keys` | 0.15 | the profile's primary or unique key has the same column set |
+| `foreign_keys` | 0.15 | a relationship has the same tables and columns |
+| `checks` | 0.15 | ranges: each bound within 5% of the planted span; enumerations: Jaccard of the values; comparisons: same columns and an operator that implies the planted one; expressions: identical after normalizing case, whitespace, backticks, and outer parentheses |
+| `functional_dependencies` | 0.10 | the same determinant and dependent sets (spec 0.1.0 has no field for them) |
+| `dependencies` | 0.15 | same measure and columns, value within 0.05 + 4(1 - v²)/√n |
+| `patterns` | 0.10 | 200 strings generated from each regex match the other at a rate of at least 0.95, in both directions |
+| `null_rates` | 0.10 | within the catalog's verification tolerance (exact for 0 and 1) |
+| `cardinality` | 0.10 | distinct count within exp(±0.05) of a planted exact count; unique columns marked unique; capped domains not exceeded |
+
+### Privacy guard
+
+Data checks compare the synth with a **real holdout**, another row sample of the same structure (sample seed
+`s + 2`, distinct from the ceiling's), which the profiler never saw. A rate check passes when the synth exceeds the holdout by at most the threshold plus three
+standard errors. Reports carry counts and rates, never values.
+
+| Check | Passes when |
+|---|---|
+| `<table>.synth_table_present`, `<table>.synth_columns_present`, `<table>.synth_rows_present` | the synth has the table, every real column with the same type, and rows when the real table has rows; a check that cannot be measured because its table or columns are missing is reported as failed, so an empty sampler fails |
+| `<table>.copy_rate_excess` | share of synth rows identical to a real row exceeds the holdout's by at most 0.01 |
+| `<table>.partial_copy_rate_excess` | for up to 20 seeded column pairs, excluding primary and foreign key columns (their values follow from the key structure), the share of synth rows whose pair of values is unique in the real table exceeds the holdout's by at most 0.01; this catches row-aligned copying of a subset of columns |
+| `<table>.dcr_ratio` | median distance to closest real record, synth over holdout, is at least 0.5 (independent samples measured 0.68–1.27; a copy scores 0) |
+| `<table>.<column>.value_leak_rate_excess` | share of distinct sensitive real values found in the synth exceeds the holdout's by at most 0.001 |
+| `<table>.quasi_identifiers[...].match_rate_excess` | share of rows matching a real-unique quasi-identifier combination exceeds the holdout's by at most 0.01 |
+| `profile.sensitive_value_leaks` | no sensitive real value equals a string of the profile JSON or a literal run of its regexes; and none, in a seeded sample of 2,000 per column, is fully matched by a small-language profile regex or contains a rare required literal of one (see below) |
+| `profile.k_threshold` | the profile validates; every `top_values` entry, enumeration value, and sampled value matched by a small-language regex occurs in at least `privacy.min_value_count` (k) real rows; and no required literal of a regex occurs in fewer than k rows of its column |
+
+Two checks look inside every profile regex:
+
+- **Exact size.** The regex is compiled to an automaton over character classes, determinized, and the distinct
+  strings it fully matches are counted for lengths within its column's `string.length` statistics (0 to 64 when
+  absent), capped at 10¹². Alternatives that match the same strings count once. A regex with fewer than
+  max(k, 10⁶) matches is **small**: its matches are as good as literals. `(j|J)(o)(h)(n)` counts 2 and is small;
+  `[A-Z]{3}-\d{4}` counts about 1.8 × 10⁸ and is not.
+- **Required literals.** After flattening groups, turning single-character classes such as `[j]` into literals, and
+  dropping anchors, the literal runs every match must contain are extracted (an optional or multi-character part
+  ends a run; an alternation keeps the runs all branches share). A required literal of at least 4 characters
+  (`privacy.min_literal_len`) that occurs in at least one but fewer than k rows of a column singles those rows out.
+  `(j)(o)(h)(n)[a-z]{0,20}@x\.com` requires `john` and is caught although its language is large. A literal shared by
+  k or more rows, such as an email domain, is not flagged, so `[a-z]+\.[a-z]+[0-9]+@example\.com` passes.
+
+Distance to closest record encodes each column so that it adds at most about 1 to the squared distance: a numeric
+column is its rank in the real sample (a gap of r adds r², plus 1 for a null mismatch); a categorical column is a
+one-hot of the top 20 real values plus `other` and null, scaled by 1/√2 (a mismatch adds 1); a string column adds the
+same one-hot, its length rank, and 1 when the exact values differ (up to about 2). Wide tables therefore weigh each
+column equally, whatever its type.
+
+Sensitivity categories and quasi-identifier sets come from the manifest through `profiler_bench.fidelity.truth`.
+
 ## Reference sampler
 
 The sampler reconstructs deterministic PySpark DataFrames from a profile without using dbldatagen. It consumes the
