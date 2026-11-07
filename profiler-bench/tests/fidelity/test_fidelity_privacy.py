@@ -61,8 +61,10 @@ def test_sensitive_values_in_the_profile_are_found(
         real, load("retail", "xs", 0, spark, sample_seed=3), leaky, materialize("retail", "xs", 0).manifest
     )
     detail = {c.name: c for c in score.checks}
-    assert detail["profile.sensitive_value_leaks"].value == 1
-    assert detail["profile.k_threshold"].detail == {"customers.email top_values": 1.0, "customers.email pattern 0": 1.0}
+    assert detail["profile.sensitive_value_leaks"].detail["customers.email"] == 1.0
+    assert detail["profile.k_threshold"].detail["customers.email top_values"] == 1.0
+    assert detail["profile.sensitive_value_leaks"].detail["sensitive_pattern_not_generalized"] >= 1.0
+    assert detail["profile.k_threshold"].detail["sensitive_pattern_not_generalized"] >= 1.0
     assert not score.passed
 
 
@@ -138,7 +140,9 @@ def test_missing_and_retyped_columns_fail_explicitly(
     assert not checks["order_items.synth_rows_present"].passed
 
 
-def test_obfuscated_literal_regexes_leak(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:
+def test_obfuscated_literal_regexes_fail_structural_on_sensitive(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
     email = real["customers"].orderBy("customer_id").collect()[0]["email"]
     grouped = "".join(f"({c})" if c.isalnum() else re.escape(c) for c in email)
     classes = "".join(f"[{c}]" if c.isalnum() else re.escape(c) for c in email)
@@ -146,8 +150,9 @@ def test_obfuscated_literal_regexes_leak(spark: SparkSession, real: dict[str, Da
         leaky = _with_patterns(profile, "customers", "email", [pattern])
         score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
         detail = {c.name: c for c in score.checks}
-        assert detail["profile.sensitive_value_leaks"].detail["customers.email"] == 1.0, pattern
-        assert detail["profile.k_threshold"].detail["customers.email pattern 0"] == 1.0, pattern
+        assert detail["profile.sensitive_value_leaks"].detail["sensitive_pattern_not_generalized"] >= 1.0, pattern
+        assert detail["profile.k_threshold"].detail["sensitive_pattern_not_generalized"] >= 1.0, pattern
+        assert not score.passed
 
 
 def test_rare_literal_in_a_pattern_fails_the_k_audit(
@@ -167,11 +172,55 @@ def test_rare_literal_in_a_pattern_fails_the_k_audit(
 
 def test_broad_patterns_are_not_flagged(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:
     broad = _with_patterns(profile, "products", "sku", [r"[A-Z]{3}-\d{4}"])
-    broad = _with_patterns(
-        broad, "customers", "email", [r"[a-z]+\.[a-z]+[0-9]+@(example\.com|mail\.test|corp\.example)"]
-    )
+    broad = _with_patterns(broad, "customers", "email", [r"[^\s]+"])
     score = score_privacy(real, _independent(spark), broad, materialize("retail", "xs", 0).manifest)
     assert score.passed, [c for c in score.checks if not c.passed]
+
+
+def test_literal_email_pattern_fails_structural_on_sensitive(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    leaky = _with_patterns(profile, "customers", "email", [r"[a-z0-9]{3,12}@[a-z]{2,8}\.[a-z]{2,3}"])
+    score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+    detail = {c.name: c for c in score.checks}
+    assert detail["profile.sensitive_value_leaks"].detail["sensitive_pattern_not_generalized"] >= 1.0
+    assert detail["profile.k_threshold"].detail["sensitive_pattern_not_generalized"] >= 1.0
+    assert not score.passed
+
+
+def test_decoy_alternation_fails_structural_and_per_branch(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    decoy = r"(?:(j)(o)(h)(n)[@](x)[.](c)(o)(m)|[a-z0-9@.]{10})"
+    sensitive = score_privacy(
+        real,
+        _independent(spark),
+        _with_patterns(profile, "customers", "email", [decoy]),
+        materialize("retail", "xs", 0).manifest,
+    )
+    detail = {c.name: c for c in sensitive.checks}
+    assert detail["profile.sensitive_value_leaks"].detail["sensitive_pattern_not_generalized"] >= 1.0
+    assert detail["profile.k_threshold"].detail["sensitive_pattern_not_generalized"] >= 1.0
+    assert not sensitive.passed
+
+    planted = real["products"].withColumn(
+        "sku",
+        F.when(F.row_number().over(Window.orderBy("product_id")) == 1, F.lit("john@x.com")).otherwise(F.col("sku")),
+    )
+    real_planted = {**real, "products": planted}
+    non_sensitive = score_privacy(
+        real_planted,
+        _independent(spark),
+        _with_patterns(profile, "products", "sku", [decoy]),
+        materialize("retail", "xs", 0).manifest,
+    )
+    detail = {c.name: c for c in non_sensitive.checks}
+    assert not non_sensitive.passed
+    assert (
+        detail["profile.k_threshold"].detail.get("products.sku pattern 0", 0.0) >= 1.0
+        or detail["profile.k_threshold"].detail.get("products.sku pattern 0 literals", 0.0) >= 1.0
+        or detail["profile.sensitive_value_leaks"].detail.get("customers.email", 0.0) >= 1.0
+    ), detail["profile.k_threshold"].detail
 
 
 def test_dfa_budget_rejects_adversarial_pattern(
@@ -185,12 +234,25 @@ def test_dfa_budget_rejects_adversarial_pattern(
     assert first is regex.BUDGET_EXCEEDED
     assert second is regex.BUDGET_EXCEEDED
 
+    # Sensitive column: literal `a` fails the structural rule.
     leaky = _with_patterns(profile, "customers", "email", [adversarial])
     score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
     detail = {c.name: c for c in score.checks}
-    assert detail["profile.sensitive_value_leaks"].detail["regex_budget_exceeded"] == 1.0
-    assert detail["profile.k_threshold"].detail["regex_budget_exceeded"] == 1.0
+    assert detail["profile.sensitive_value_leaks"].detail["sensitive_pattern_not_generalized"] >= 1.0
+    assert detail["profile.k_threshold"].detail["sensitive_pattern_not_generalized"] >= 1.0
     assert not score.passed
+
+    # Non-sensitive column: the length-cap probe still hits the shared budget.
+    budgeted = score_privacy(
+        real,
+        _independent(spark),
+        _with_patterns(profile, "products", "sku", [adversarial]),
+        materialize("retail", "xs", 0).manifest,
+    )
+    detail = {c.name: c for c in budgeted.checks}
+    assert detail["profile.sensitive_value_leaks"].detail["regex_budget_exceeded"] >= 1.0
+    assert detail["profile.k_threshold"].detail["regex_budget_exceeded"] >= 1.0
+    assert not budgeted.passed
 
 
 def test_unbounded_declared_length_does_not_hide_or_iterate(
@@ -198,7 +260,7 @@ def test_unbounded_declared_length_does_not_hide_or_iterate(
 ) -> None:
     broad = _with_patterns(profile, "products", "sku", [r"a*"], length_max=10**12)
     started = time.perf_counter()
-    risks = privacy._pattern_risks(broad, load_config())
+    risks = privacy._pattern_risks(broad, load_config(), set())
     assert time.perf_counter() - started < 1.0
     sku_risks = [r for (table, path, _), r in risks.items() if table == "products" and path == "sku"]
     assert sku_risks and all(not r.budget_exceeded for r in sku_risks)
@@ -207,34 +269,18 @@ def test_unbounded_declared_length_does_not_hide_or_iterate(
     assert "regex_budget_exceeded" not in {c.name: c for c in score.checks}["profile.k_threshold"].detail
 
 
-def _case_class_pattern(text: str) -> str:
-    return "".join(f"[{c.lower()}{c.upper()}]" if c.isalpha() else f"[{c}]" for c in text)
-
-
-def test_case_class_pattern_with_huge_declared_length_leaks(
+def test_case_class_pattern_fails_structural_on_sensitive(
     spark: SparkSession, real: dict[str, DataFrame], profile: Profile
 ) -> None:
-    planted = real["customers"].withColumn(
-        "email",
-        F.when(F.row_number().over(Window.orderBy("customer_id")) == 1, F.lit("john@x.com")).otherwise(F.col("email")),
-    )
-    real_planted = {**real, "customers": planted}
-    patterns = [
+    for pattern in (
         r"[jJ][oO][hH][nN][@][xX][.][cC][oO][mM]",
         r"[jJ][oO][hH][nN]@x\.com.*",
-        _case_class_pattern("john@x.com"),
-        _case_class_pattern("john@x.com") + ".*",
-    ]
-    for pattern in patterns:
+    ):
         leaky = _with_patterns(profile, "customers", "email", [pattern], length_max=10**12)
-        score = score_privacy(real_planted, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+        score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
         detail = {c.name: c for c in score.checks}
-        assert not score.passed, pattern
-        assert (
-            detail["profile.sensitive_value_leaks"].detail.get("customers.email", 0.0) >= 1.0
-            or detail["profile.k_threshold"].detail.get("customers.email pattern 0 literals", 0.0) >= 1.0
-            or detail["profile.k_threshold"].detail.get("customers.email pattern 0", 0.0) >= 1.0
-        ), (pattern, detail["profile.sensitive_value_leaks"].detail, detail["profile.k_threshold"].detail)
+        assert detail["profile.sensitive_value_leaks"].detail["sensitive_pattern_not_generalized"] >= 1.0, pattern
+        assert not score.passed
 
 
 def test_partial_row_copying_is_detected(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:
@@ -267,7 +313,7 @@ def test_dcr_weights_each_column_at_most_about_one() -> None:
     assert privacy._closest(encoder, shifted, row)[0] == pytest.approx(0.5)
 
 
-def test_literal_split_across_groups_with_an_optional_class_leaks(
+def test_literal_split_across_groups_fails_structural_on_sensitive(
     spark: SparkSession, real: dict[str, DataFrame], profile: Profile
 ) -> None:
     email = real["customers"].orderBy("customer_id").collect()[0]["email"]
@@ -280,18 +326,15 @@ def test_literal_split_across_groups_with_an_optional_class_leaks(
         leaky = _with_patterns(profile, "customers", "email", [pattern])
         score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
         detail = {c.name: c for c in score.checks}
-        assert detail["profile.sensitive_value_leaks"].detail["customers.email"] >= 1.0, pattern
-        assert detail["profile.k_threshold"].detail.get("customers.email pattern 0 literals", 0.0) >= 1.0, pattern
+        assert detail["profile.sensitive_value_leaks"].detail["sensitive_pattern_not_generalized"] >= 1.0, pattern
         assert not score.passed
 
 
-def test_shared_domain_literal_is_not_a_leak(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:
-    domains = sorted({r["email"].split("@")[1] for r in real["customers"].select("email").collect()})
-    patterns = [r"[a-z]+\.[a-z]+[0-9]+@" + re.escape(d) for d in domains]
-    score = score_privacy(
-        real,
-        _independent(spark),
-        _with_patterns(profile, "customers", "email", patterns),
-        materialize("retail", "xs", 0).manifest,
-    )
+def test_generalized_sensitive_pattern_and_shared_sku_literal_pass(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    broad = _with_patterns(profile, "customers", "email", [r"[^\s]+"])
+    # Non-sensitive SKU: a short shared punctuation literal is below min_literal_len and the language is large.
+    broad = _with_patterns(broad, "products", "sku", [r"[A-Z]{3}-\d{4}"])
+    score = score_privacy(real, _independent(spark), broad, materialize("retail", "xs", 0).manifest)
     assert score.passed, [c for c in score.checks if not c.passed]

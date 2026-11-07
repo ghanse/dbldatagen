@@ -86,15 +86,32 @@ def score_privacy(
             c for fk in manifest.foreign_keys if fk.child_table == table.name for c in fk.child_columns
         }
         checks += _table_checks(table, real[table.name], synth[table.name], holdout[table.name], keys, seed, config)
-    risks = _pattern_risks(profile, config)
+    sensitive = {
+        (table.name, path)
+        for table in manifest.tables
+        for path, category in sensitive_columns(table).items()
+        if category in VALUE_LEAK_CATEGORIES
+    }
+    risks = _pattern_risks(profile, config, sensitive)
     leaks = _profile_leaks(profile, manifest, real, risks, seed, config)
-    violations = _k_violations(profile, real, risks, seed, config)
+    violations = _k_violations(profile, real, risks, seed, config, sensitive)
     budget_hits = float(sum(1 for r in risks.values() if r.budget_exceeded))
+    structural_hits = float(sum(1 for r in risks.values() if r.not_generalized))
     if budget_hits:
         leaks = {**leaks, "regex_budget_exceeded": leaks.get("regex_budget_exceeded", 0.0) + budget_hits}
         violations = {
             **violations,
             "regex_budget_exceeded": violations.get("regex_budget_exceeded", 0.0) + budget_hits,
+        }
+    if structural_hits:
+        leaks = {
+            **leaks,
+            "sensitive_pattern_not_generalized": leaks.get("sensitive_pattern_not_generalized", 0.0) + structural_hits,
+        }
+        violations = {
+            **violations,
+            "sensitive_pattern_not_generalized": violations.get("sensitive_pattern_not_generalized", 0.0)
+            + structural_hits,
         }
     checks.append(_at_most("profile.sensitive_value_leaks", sum(leaks.values()), limits.max_profile_leaks, leaks))
     checks.append(_at_most("profile.k_threshold", sum(violations.values()), limits.max_k_violations, violations))
@@ -381,21 +398,28 @@ class _PatternRisk:
     """What a profile regex could give away.
 
     Attributes:
-        compiled: The regex.
-        pattern: The regex source, for value-anchored language counting.
-        literals: Literal factors at least `privacy.min_literal_len` long that every match contains (case-folded for
-            single-letter case classes such as `[jJ]`).
-        budget_exceeded: Whether a probe count up to `privacy.max_regex_length` exhausted the shared work budget;
-            treated as an unconditional privacy failure with reason `regex_budget_exceeded`.
+        compiled: The full regex.
+        pattern: The regex source.
+        branches: Alternation branches to check independently on non-sensitive columns; the full pattern alone on
+            sensitive columns (which use the structural rule instead).
+        branch_compiled: Compiled forms of `branches`.
+        literals: Per-branch required literals of length at least `privacy.min_literal_len`, flattened.
+        budget_exceeded: Whether branch expansion or a length-cap probe exhausted the shared work budget.
+        not_generalized: Whether a sensitive-column pattern failed the literal-free structural rule.
     """
 
     compiled: re.Pattern[str]
     pattern: str
+    branches: tuple[str, ...]
+    branch_compiled: tuple[re.Pattern[str], ...]
     literals: tuple[str, ...]
     budget_exceeded: bool = False
+    not_generalized: bool = False
 
 
-def _pattern_risks(profile: Profile, config: MetricsConfig) -> dict[tuple[str, str, int], _PatternRisk]:
+def _pattern_risks(
+    profile: Profile, config: MetricsConfig, sensitive: set[tuple[str, str]]
+) -> dict[tuple[str, str, int], _PatternRisk]:
     """Returns the risk of every profile regex, keyed by table, column path, and pattern index."""
     limits = config.privacy
     risks = {}
@@ -407,16 +431,42 @@ def _pattern_risks(profile: Profile, config: MetricsConfig) -> dict[tuple[str, s
                     compiled = re.compile(pattern.regex)
                 except re.error:
                     continue
-                # Probe with the config length cap only (never the profile's attacker-controlled length.max).
-                try:
-                    probed = regex.count_matches(
-                        pattern.regex, 0, limits.max_regex_length, max_dfa_states=limits.max_dfa_states
-                    )
-                    budget_exceeded = probed is regex.BUDGET_EXCEEDED
-                except regex.UnsupportedForCount:
-                    budget_exceeded = False
-                literals = tuple(f for f in regex.required_literals(pattern.regex) if len(f) >= limits.min_literal_len)
-                risks[(table.name, path, i)] = _PatternRisk(compiled, pattern.regex, literals, budget_exceeded)
+                on_sensitive = (table.name, path) in sensitive
+                not_generalized = on_sensitive and not regex.is_generalized(pattern.regex)
+                budget_exceeded = False
+                branches: tuple[str, ...]
+                if on_sensitive:
+                    branches = (pattern.regex,)
+                else:
+                    expanded = regex.expand_branches(pattern.regex, max_dfa_states=limits.max_dfa_states)
+                    if isinstance(expanded, list):
+                        branches = tuple(expanded)
+                    else:
+                        budget_exceeded = True
+                        branches = (pattern.regex,)
+                    try:
+                        probed = regex.count_matches(
+                            pattern.regex, 0, limits.max_regex_length, max_dfa_states=limits.max_dfa_states
+                        )
+                        budget_exceeded = budget_exceeded or probed is regex.BUDGET_EXCEEDED
+                    except regex.UnsupportedForCount:
+                        pass
+                literals = tuple(
+                    f
+                    for branch in branches
+                    for f in regex.required_literals(branch)
+                    if len(f) >= limits.min_literal_len
+                )
+                branch_compiled = tuple(re.compile(branch) for branch in branches)
+                risks[(table.name, path, i)] = _PatternRisk(
+                    compiled,
+                    pattern.regex,
+                    branches,
+                    branch_compiled,
+                    literals,
+                    budget_exceeded,
+                    not_generalized,
+                )
     return risks
 
 
@@ -487,11 +537,9 @@ def _profile_leaks(
 ) -> dict[str, float]:
     """Counts sensitive real values the profile gives away, per column.
 
-    A value leaks when it equals a string of the profile JSON or a literal run of a profile regex (checked on every
-    value), when a profile regex fully matches it and has fewer than max(k, `privacy.min_regex_language`) strings of
-    length at most min(len(value), `privacy.max_regex_length`), or when it contains a literal that some profile regex
-    requires of every match and that fewer than k real rows of the column contain (both checked on a seeded sample of
-    the column's values). A literal shared by k or more rows, such as an email domain, does not single a value out.
+    A value leaks when it equals a string of the profile JSON, when any alternation branch of a non-structural profile
+    regex fully matches it and that branch has fewer than max(k, `privacy.min_regex_language`) strings of length at
+    most min(len(value), `privacy.max_regex_length`), or when it contains a rare required literal of such a branch.
     """
     k = profile.privacy.min_value_count
     limits = config.privacy
@@ -502,7 +550,8 @@ def _profile_leaks(
         return {}
     session = next(iter(real.values())).sparkSession
     candidates = F.broadcast(session.createDataFrame([(s,) for s in strings], "c string"))
-    literals = {f for r in risks.values() for f in r.literals}
+    branch_risks = [r for r in risks.values() if not r.not_generalized]
+    literals = {f for r in branch_risks for f in r.literals}
     cache: dict[tuple[str, int], int | regex._BudgetExceeded] = {}
     budget_hits = 0
     leaks: dict[str, float] = {}
@@ -519,21 +568,22 @@ def _profile_leaks(
             sample = _sample_values(values, cap, seed)
             matched: set[str] = set()
             for value in sample:
-                for risk in risks.values():
-                    if not risk.compiled.fullmatch(value):
-                        continue
-                    verdict = _language_vs_value(
-                        risk.pattern,
-                        value,
-                        limit=limit,
-                        max_length=limits.max_regex_length,
-                        max_dfa_states=limits.max_dfa_states,
-                        cache=cache,
-                    )
-                    if verdict == "budget":
-                        budget_hits += 1
-                    elif verdict == "small":
-                        matched.add(value)
+                for risk in branch_risks:
+                    for branch, compiled in zip(risk.branches, risk.branch_compiled, strict=True):
+                        if not compiled.fullmatch(value):
+                            continue
+                        verdict = _language_vs_value(
+                            branch,
+                            value,
+                            limit=limit,
+                            max_length=limits.max_regex_length,
+                            max_dfa_states=limits.max_dfa_states,
+                            cache=cache,
+                        )
+                        if verdict == "budget":
+                            budget_hits += 1
+                        elif verdict == "small":
+                            matched.add(value)
             present = {f for f in literals if any(f.lower() in v.lower() for v in sample)}
             rare = _rare_literals(rows, present, k)
             contained = {v for v in sample if any(f.lower() in v.lower() for f in rare)}
@@ -549,11 +599,12 @@ def _k_violations(
     risks: Mapping[tuple[str, str, int], _PatternRisk],
     seed: int,
     config: MetricsConfig,
+    sensitive: set[tuple[str, str]],
 ) -> dict[str, float]:
     """Counts literal values of the profile held by fewer than `privacy.min_value_count` real rows, per source.
 
-    Sources are `top_values`, enumeration constraints, the matches of value-anchored small-language regexes among a
-    seeded sample of the column's values, and the literals a regex requires of every match (see `_PatternRisk`).
+    Sources are `top_values`, enumeration constraints, and — on non-sensitive columns — per-branch small-language
+    matches and required literals (see `_PatternRisk`). Sensitive-column patterns are gated by the structural rule.
     """
     k = profile.privacy.min_value_count
     limits = config.privacy
@@ -574,6 +625,8 @@ def _k_violations(
         for path, values, column in _literal_columns(df, table.columns):
             if column.string and column.string.top_values:
                 listed.append((f"{path} top_values", values, [v.value for v in column.string.top_values]))
+            if (table.name, path) in sensitive:
+                continue
             budget_hits += _pattern_k_sources(
                 table.name,
                 path,
@@ -629,11 +682,11 @@ def _pattern_k_sources(
     listed: list[tuple[str, DataFrame, list[str]]],
     violations: dict[str, float],
 ) -> int:
-    """Appends pattern-derived k-audit sources for one column; returns budget-exceeded hits."""
+    """Appends per-branch pattern k-audit sources for a non-sensitive column; returns budget-exceeded hits."""
     budget_hits = 0
     for i, _ in enumerate((column.string.patterns or []) if column.string else []):
         risk = risks.get((table, path, i))
-        if risk is None:
+        if risk is None or risk.not_generalized:
             continue
         hits, hit_budget = _pattern_literals(
             values,
@@ -665,24 +718,26 @@ def _pattern_literals(
     max_dfa_states: int,
     cache: dict[tuple[str, int], int | regex._BudgetExceeded],
 ) -> tuple[list[str], int]:
-    """Returns sampled values a value-anchored small-language regex matches, and a budget-exceeded hit count."""
+    """Returns sampled values any small-language alternation branch matches, and a budget-exceeded hit count."""
     hits: list[str] = []
     budget_hits = 0
     for value in _sample_values(values, cap, seed):
-        if not risk.compiled.fullmatch(value):
-            continue
-        verdict = _language_vs_value(
-            risk.pattern,
-            value,
-            limit=limit,
-            max_length=max_length,
-            max_dfa_states=max_dfa_states,
-            cache=cache,
-        )
-        if verdict == "budget":
-            budget_hits += 1
-        elif verdict == "small":
-            hits.append(value)
+        for branch, compiled in zip(risk.branches, risk.branch_compiled, strict=True):
+            if not compiled.fullmatch(value):
+                continue
+            verdict = _language_vs_value(
+                branch,
+                value,
+                limit=limit,
+                max_length=max_length,
+                max_dfa_states=max_dfa_states,
+                cache=cache,
+            )
+            if verdict == "budget":
+                budget_hits += 1
+            elif verdict == "small":
+                hits.append(value)
+                break
     return hits, budget_hits
 
 

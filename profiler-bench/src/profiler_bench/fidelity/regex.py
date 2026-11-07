@@ -500,3 +500,197 @@ def _required(items: Sequence[tuple[Any, Any]]) -> list[str]:
             factors += [f for f in branches[0] if all(any(f in g for g in other) for other in branches[1:])]
     factors.append(run)
     return factors
+
+
+def is_generalized(regex: str) -> bool:
+    """Returns whether `regex` is literal-free after normalization (spec 0.2.0 sensitive-column patterns).
+
+    Groups and anchors are ignored. Single-character classes and case-only classes such as `[jJ]` count as literals.
+    Any literal character, alternation, or back-reference fails. Allowed atoms are character classes with at least two
+    distinct case-folded members, `.`, `\\d` / `\\w` / `\\s` (and their negations), with any quantifier.
+    """
+    try:
+        items = _parser.parse(regex)
+    except re.error:
+        return False
+    try:
+        _assert_generalized(items)
+    except _NotGeneralized:
+        return False
+    return True
+
+
+class _NotGeneralized(Exception):
+    """Internal: the pattern embeds a literal, alternation, or back-reference."""
+
+
+def _assert_generalized(items: Sequence[tuple[Any, Any]]) -> None:
+    for op, av in items:
+        name = op.name
+        if name in ("AT",):
+            continue
+        if name in ("SUBPATTERN", "ATOMIC_GROUP"):
+            _assert_generalized(av[-1])
+            continue
+        if name in REPEATS:
+            _assert_generalized(av[2])
+            continue
+        if name == "ANY":
+            continue
+        if name == "CATEGORY" and _category_allowed(av.name):
+            continue
+        if name == "IN" and _class_generalized(av):
+            continue
+        if name in ("BRANCH", "LITERAL", "NOT_LITERAL", "GROUPREF", "GROUPREF_EXISTS", "ASSERT", "ASSERT_NOT"):
+            raise _NotGeneralized()
+        raise _NotGeneralized()
+
+
+def _category_allowed(name: str) -> bool:
+    base = name.replace("CATEGORY_NOT_", "CATEGORY_") if name.startswith("CATEGORY_NOT_") else name
+    return base in ("CATEGORY_DIGIT", "CATEGORY_WORD", "CATEGORY_SPACE")
+
+
+def _class_generalized(items: Sequence[tuple[Any, Any]]) -> bool:
+    """True when a character class is a broad set, not a folded literal."""
+    members: set[str] = set()
+    broad = False
+    for op, av in items:
+        name = op.name
+        if name == "NEGATE":
+            continue
+        if name == "CATEGORY" and _category_allowed(av.name):
+            broad = True
+        elif name == "RANGE":
+            if av[1] - av[0] >= 1:
+                broad = True
+            else:
+                members.add(_fold_char(chr(av[0])))
+        elif name == "LITERAL":
+            members.add(_fold_char(chr(av)))
+        else:
+            return False
+    return broad or len(members) >= 2
+
+
+def _fold_char(char: str) -> str:
+    return char.lower() if char.isalpha() else char
+
+
+def expand_branches(
+    regex: str, max_dfa_states: int = DEFAULT_MAX_DFA_STATES, budget: _WorkBudget | None = None
+) -> list[str] | _BudgetExceeded:
+    """Returns one regex per alternation branch of `regex`, charging `budget` (created from `max_dfa_states` if omitted).
+
+    Nested alternations are expanded into a cartesian product. Exhausting the shared work budget returns
+    `BUDGET_EXCEEDED`. A pattern with no alternation returns a one-element list containing `regex` itself when the
+    expansion equals the original parse, otherwise the serialized form of the normalized items.
+    """
+    try:
+        items = _parser.parse(regex)
+    except re.error as error:
+        raise UnsupportedForCount(str(error)) from error
+    work = budget if budget is not None else _WorkBudget(max_dfa_states)
+    try:
+        work.charge(1)
+        expanded = _expand_items(list(items), work)
+        return [_items_to_regex(branch) for branch in expanded]
+    except _Exhausted:
+        return BUDGET_EXCEEDED
+
+
+def _expand_items(items: list[tuple[Any, Any]], budget: _WorkBudget) -> list[list[tuple[Any, Any]]]:
+    results: list[list[tuple[Any, Any]]] = [[]]
+    for op, av in items:
+        budget.charge(1)
+        name = op.name
+        if name in ("SUBPATTERN", "ATOMIC_GROUP"):
+            inners = _expand_items(list(av[-1]), budget)
+            results = [prefix + inner for prefix in results for inner in inners]
+        elif name == "BRANCH":
+            alts: list[list[tuple[Any, Any]]] = []
+            for branch in av[1]:
+                alts.extend(_expand_items(list(branch), budget))
+            results = [prefix + alt for prefix in results for alt in alts]
+        elif name in REPEATS:
+            inners = _expand_items(list(av[2]), budget)
+            results = [[*prefix, (op, (av[0], av[1], inner))] for prefix in results for inner in inners]
+        else:
+            results = [[*prefix, (op, av)] for prefix in results]
+        budget.charge(len(results))
+        if len(results) > budget.max_states:
+            raise _Exhausted()
+    return results
+
+
+def _items_to_regex(items: Sequence[tuple[Any, Any]]) -> str:
+    parts: list[str] = []
+    for op, av in items:
+        name = op.name
+        if name == "LITERAL":
+            parts.append(re.escape(chr(av)))
+        elif name == "NOT_LITERAL":
+            parts.append(f"[^{re.escape(chr(av))}]")
+        elif name == "ANY":
+            parts.append(".")
+        elif name == "IN":
+            parts.append(_class_to_regex(av))
+        elif name == "CATEGORY":
+            parts.append(_category_to_regex(av.name))
+        elif name in ("SUBPATTERN", "ATOMIC_GROUP"):
+            parts.append(f"(?:{_items_to_regex(av[-1])})")
+        elif name == "BRANCH":
+            alts = "|".join(f"(?:{_items_to_regex(branch)})" for branch in av[1])
+            parts.append(f"(?:{alts})")
+        elif name in REPEATS:
+            inner = _items_to_regex(av[2])
+            wrapped = inner if len(av[2]) == 1 and av[2][0][0].name in ("IN", "ANY", "CATEGORY") else f"(?:{inner})"
+            parts.append(wrapped + _quantifier(av[0], av[1]))
+        elif name == "AT":
+            continue
+        else:
+            raise UnsupportedForCount(f"cannot serialize {name}")
+    return "".join(parts)
+
+
+def _quantifier(low: int, high: int) -> str:
+    if low == 0 and high == _parser.MAXREPEAT:
+        return "*"
+    if low == 1 and high == _parser.MAXREPEAT:
+        return "+"
+    if low == 0 and high == 1:
+        return "?"
+    if high == _parser.MAXREPEAT:
+        return f"{{{low},}}"
+    if low == high:
+        return f"{{{low}}}"
+    return f"{{{low},{high}}}"
+
+
+def _category_to_regex(name: str) -> str:
+    return {
+        "CATEGORY_DIGIT": r"\d",
+        "CATEGORY_NOT_DIGIT": r"\D",
+        "CATEGORY_WORD": r"\w",
+        "CATEGORY_NOT_WORD": r"\W",
+        "CATEGORY_SPACE": r"\s",
+        "CATEGORY_NOT_SPACE": r"\S",
+    }.get(name, ".")
+
+
+def _class_to_regex(items: Sequence[tuple[Any, Any]]) -> str:
+    negate = ""
+    body: list[str] = []
+    for op, av in items:
+        name = op.name
+        if name == "NEGATE":
+            negate = "^"
+        elif name == "LITERAL":
+            body.append(re.escape(chr(av)))
+        elif name == "RANGE":
+            body.append(f"{re.escape(chr(av[0]))}-{re.escape(chr(av[1]))}")
+        elif name == "CATEGORY":
+            body.append(_category_to_regex(av.name))
+        else:
+            raise UnsupportedForCount(f"cannot serialize class {name}")
+    return f"[{negate}{''.join(body)}]"

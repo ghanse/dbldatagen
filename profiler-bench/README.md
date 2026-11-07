@@ -185,22 +185,28 @@ standard errors. Reports carry counts and rates, never values.
 | `<table>.dcr_ratio` | median distance to closest real record, synth over holdout, is at least 0.5 (independent samples measured 0.68–1.27; a copy scores 0) |
 | `<table>.<column>.value_leak_rate_excess` | share of distinct sensitive real values found in the synth exceeds the holdout's by at most 0.001 |
 | `<table>.quasi_identifiers[...].match_rate_excess` | share of rows matching a real-unique quasi-identifier combination exceeds the holdout's by at most 0.01 |
-| `profile.sensitive_value_leaks` | no sensitive real value equals a string of the profile JSON or a literal run of its regexes; and none, in a seeded sample of 2,000 per column, is fully matched by a small-language profile regex or contains a rare required literal of one (see below) |
-| `profile.k_threshold` | the profile validates; every `top_values` entry, enumeration value, and sampled value matched by a small-language regex occurs in at least `privacy.min_value_count` (k) real rows; and no required literal of a regex occurs in fewer than k rows of its column |
+| `profile.sensitive_value_leaks` | no sensitive real value equals a string of the profile JSON; sensitive-column patterns pass the structural rule below; and no sensitive value in a seeded sample of 2,000 per column is fully matched by a small-language alternation branch of any other profile regex or contains a rare required literal of one |
+| `profile.k_threshold` | the profile validates; every `top_values` entry and enumeration value occurs in at least `privacy.min_value_count` (k) real rows; sensitive-column patterns pass the structural rule; and on non-sensitive columns no alternation branch is a small-language match or rare required literal against that column's values |
 
-Two checks look inside every profile regex:
+Profile regex privacy is three layers (synth-data leakage is the last):
 
-- **Exact size.** The regex is compiled to an automaton over character classes, determinized, and the distinct
-  strings it fully matches are counted for lengths within its column's `string.length` statistics (0 to 64 when
-  absent), capped at 10¹². Alternatives that match the same strings count once. A regex with fewer than
-  max(k, 10⁶) matches is **small**: its matches are as good as literals. `(j|J)(o)(h)(n)` counts 2 and is small;
-  `[A-Z]{3}-\d{4}` counts about 1.8 × 10⁸ and is not.
-- **Required literals.** After flattening groups, turning single-character classes such as `[j]` into literals, and
-  dropping anchors, the literal runs every match must contain are extracted (an optional or multi-character part
-  ends a run; an alternation keeps the runs all branches share). A required literal of at least 4 characters
-  (`privacy.min_literal_len`) that occurs in at least one but fewer than k rows of a column singles those rows out.
-  `(j)(o)(h)(n)[a-z]{0,20}@x\.com` requires `john` and is caught although its language is large. A literal shared by
-  k or more rows, such as an email domain, is not flagged, so `[a-z]+\.[a-z]+[0-9]+@example\.com` passes.
+1. **Structural generalization (sensitive columns).** Columns the manifest marks `direct_identifier`, `secret`, or
+   `free_text` may only carry literal-free patterns (spec 0.2.0). After dropping group syntax and anchors, and folding
+   single-character and case-only classes such as `[jJ]` into literals, the pattern must not contain a literal
+   character (escaped punctuation counts), an alternation, or a back-reference. Allowed atoms are character classes
+   with at least two distinct case-folded members, `.`, `\d` / `\w` / `\s`, and their negations, with any quantifier.
+   A violation fails both profile checks with reason `sensitive_pattern_not_generalized`. Generalized email patterns
+   must therefore use classes such as `[^\s]+`; forms like `[a-z]+@[a-z]+\.[a-z]+` fail because `@` and `.` are
+   literals.
+2. **Per-branch size and required literals (other columns).** Alternations are expanded into branches (bounded by the
+   shared regex work budget; exhaustion fails with `regex_budget_exceeded`). Each branch is checked on its own: if it
+   fully matches a real value and has fewer than max(k, 10⁶) distinct strings of length at most
+   min(len(value), `privacy.max_regex_length`), or if it requires a literal of at least 4 characters that occurs in
+   fewer than k rows, the regex fails. A decoy such as `(?:john@x\.com|[a-z0-9@.]{10})` is caught by the narrow
+   branch even though the whole language equals the broad decoy's.
+3. **Synth-data leakage.** Exact-row copy rate, partial-copy pairs, DCR, sensitive value reproduction, and
+   quasi-identifier matches compare the synth with a real holdout (see the table above) and remain the final backstop
+   when a profile pattern is generalized but a sampler still emits real values.
 
 Distance to closest record encodes each column so that it adds at most about 1 to the squared distance: a numeric
 column is its rank in the real sample (a gap of r adds r², plus 1 for a null mismatch); a categorical column is a

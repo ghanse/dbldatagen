@@ -132,15 +132,15 @@ class PrivacyThresholds(_Model):
             holdout's share.
         max_k_violations: Most literal values allowed below the profile's `min_value_count`.
         noise_z: Standard errors of sampling noise added to every rate-excess threshold.
-        min_regex_language: A profile regex that fully matches a real value leaks it, and is held to the k-threshold,
-            when it matches fewer than max(k, this) strings of length at most min(len(value), `max_regex_length`).
-        min_literal_len: Shortest literal that every match of a profile regex contains and that is checked against
-            real values (case-insensitively when folded from a single-letter case class).
-        max_regex_length: Cap on the real value length used when counting a regex's language for a matched value, and
+        min_regex_language: On non-sensitive columns, an alternation branch that fully matches a real value leaks it
+            (and is held to the k-threshold) when it matches fewer than max(k, this) strings of length at most
+            min(len(value), `max_regex_length`).
+        min_literal_len: Shortest required literal of a non-sensitive-column branch that is checked against real
+            values (case-insensitively when folded from a single-letter case class).
+        max_regex_length: Cap on the real value length used when counting a branch's language for a matched value, and
             the length used for the pathological-pattern budget probe. Default 1000.
-        max_dfa_states: Scales the shared work budget for regex language counting (NFA build, epsilon-closure, DFA
-            subset construction, and the length loop). A regex that exhausts the budget fails the privacy guard with
-            reason `regex_budget_exceeded`.
+        max_dfa_states: Scales the shared work budget for branch expansion and regex language counting. A regex that
+            exhausts the budget fails the privacy guard with reason `regex_budget_exceeded`.
         partial_copy_pairs: Most column pairs per table checked for row-aligned partial copying.
     """
 

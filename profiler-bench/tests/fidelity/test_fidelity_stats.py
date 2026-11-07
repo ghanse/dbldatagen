@@ -126,6 +126,28 @@ def test_every_count_entry_point_takes_the_budget() -> None:
 
 
 @pytest.mark.parametrize(
+    ("pattern", "generalized"),
+    [
+        (r"[^\s]+", True),
+        (r"[a-z0-9]+", True),
+        (r".+", True),
+        (r"[a-z0-9]{3,12}@[a-z]{2,8}\.[a-z]{2,3}", False),
+        (r"[jJ][oO][hH][nN]@x\.com.*", False),
+        (r"(?:(j)(o)(h)(n)[@](x)[.](c)(o)(m)|[a-z0-9@.]{10})", False),
+    ],
+)
+def test_is_generalized(pattern: str, generalized: bool) -> None:
+    assert regex.is_generalized(pattern) is generalized
+
+
+def test_expand_branches_splits_decoy_alternation() -> None:
+    branches = regex.expand_branches(r"(?:(j)(o)(h)(n)[@](x)[.](c)(o)(m)|[a-z0-9@.]{10})")
+    assert isinstance(branches, list) and len(branches) == 2
+    assert regex.required_literals(branches[0]) == ["john@x.com"]
+    assert regex.count_matches(branches[0], 0, 10) == 1
+
+
+@pytest.mark.parametrize(
     ("pattern", "required"),
     [
         (r"(j)(o)(h)(n)[a-z]{0,20}@x\.com", ["@x.com", "john"]),
