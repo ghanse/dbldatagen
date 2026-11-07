@@ -130,7 +130,9 @@ def _score_table(
     return TableStructure(name=truth.name, categories=present, weights=weights, score=score)
 
 
-def _category(items: list[StructureItem], claims: Sequence[float] | None) -> StructureCategory | None:
+def _category(
+    items: list[StructureItem], claims: Sequence[float] | None, verified: Sequence[bool] = ()
+) -> StructureCategory | None:
     """Returns a category's recall, precision, and score; recall is 1 when nothing is planted but claims were scored,
     so false claims about a table without planted structure still cost precision."""
     if not items and not claims:
@@ -142,7 +144,13 @@ def _category(items: list[StructureItem], claims: Sequence[float] | None) -> Str
     else:
         score = 2 * recall * precision / (recall + precision) if recall + precision else 0.0
     return StructureCategory(
-        recall=recall, precision=precision, score=score, items=items, claims=len(claims) if claims else 0
+        recall=recall,
+        precision=precision,
+        score=score,
+        items=items,
+        claims=len(claims) if claims else 0,
+        verified_true=sum(verified),
+        verified_false=len(verified) - sum(verified),
     )
 
 
@@ -151,9 +159,9 @@ def _item(target: str, credit: float, note: str | None = None) -> StructureItem:
     return StructureItem(target=target, status=status, credit=credit, note=None if credit >= 1.0 else note)
 
 
-def _unplanted(holds: bool) -> list[float]:
-    """Returns the precision entry of a claim about unplanted structure: none when it holds, 0 when it is false."""
-    return [] if holds else [0.0]
+def _unplanted(verified: Sequence[bool]) -> list[float]:
+    """Returns the precision entries of claims about unplanted structure: none for each true one, 0 for each false."""
+    return [0.0] * (len(verified) - sum(verified))
 
 
 def _keys(truth: Table, table: TableProfile | None, verifier: Verifier) -> StructureCategory | None:
@@ -171,9 +179,11 @@ def _keys(truth: Table, table: TableProfile | None, verifier: Verifier) -> Struc
     ]
     planted = unique | ({primary} if primary else set())
     claims = [1.0 for k in claimed_all if k in planted]
-    for key in sorted(claimed_all - planted, key=sorted):
-        claims += _unplanted(verifier.key(truth.name, sorted(key), primary=key == claimed_primary))
-    return _category(items, claims)
+    verified = [
+        verifier.key(truth.name, sorted(key), primary=key == claimed_primary)
+        for key in sorted(claimed_all - planted, key=sorted)
+    ]
+    return _category(items, claims + _unplanted(verified), verified)
 
 
 def _foreign_keys(truth: Table, profile: Profile, manifest: Manifest, verifier: Verifier) -> StructureCategory | None:
@@ -195,9 +205,8 @@ def _foreign_keys(truth: Table, profile: Profile, manifest: Manifest, verifier: 
         for s in sorted(planted)
     ]
     claims = [1.0 for s in relationships if s in planted]
-    for s in sorted(set(relationships) - planted):
-        claims += _unplanted(verifier.foreign_key(relationships[s]))
-    return _category(items, claims)
+    verified = [verifier.foreign_key(relationships[s]) for s in sorted(set(relationships) - planted)]
+    return _category(items, claims + _unplanted(verified), verified)
 
 
 def _number(value: Bound | bool) -> float | None:
@@ -300,10 +309,8 @@ def _checks(truth: Table, table: TableProfile | None, tolerance: float, verifier
             best[i] = max(best.get(i, 0.0), credit)
         items.append(_item(_check_target(check), max(credits.values(), default=0.0), "no matching constraint"))
     scored = [best[i] for i in sorted(best)]
-    for i, claim in enumerate(claims):
-        if i not in best:
-            scored += _unplanted(verifier.check(truth.name, claim))
-    return _category(items, scored)
+    verified = [verifier.check(truth.name, claim) for i, claim in enumerate(claims) if i not in best]
+    return _category(items, scored + _unplanted(verified), verified)
 
 
 def _functional_dependencies(truth: Table, table: TableProfile | None) -> StructureCategory | None:
@@ -345,10 +352,8 @@ def _dependencies(
         note = f"claimed {values}" if values else "not claimed"
         items.append(_item(f"{dep.measure}{list(dep.columns)} = {dep.value:.3f}", credit, note))
     scored = [float(abs(c.value - planted[k][0]) <= planted[k][1]) for c, k in claims if k in planted]
-    for claim, key in claims:
-        if key not in planted:
-            scored += _unplanted(verifier.dependency(truth.name, claim))
-    return _category(items, scored)
+    verified = [verifier.dependency(truth.name, claim) for claim, key in claims if key not in planted]
+    return _category(items, scored + _unplanted(verified), verified)
 
 
 def _children(column: ColumnProfile | None) -> dict[str, ColumnProfile]:

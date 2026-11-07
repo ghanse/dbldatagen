@@ -146,7 +146,10 @@ def test_rare_literal_in_a_pattern_fails_the_k_audit(
     leaky = _with_patterns(profile, "products", "sku", [pattern])
     score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
     detail = {c.name: c for c in score.checks}
-    assert detail["profile.k_threshold"].detail == {"products.sku pattern 0": 1.0}
+    assert detail["profile.k_threshold"].detail == {
+        "products.sku pattern 0": 1.0,
+        "products.sku pattern 0 literals": 1.0,
+    }
     assert detail["profile.sensitive_value_leaks"].passed
 
 
@@ -187,3 +190,33 @@ def test_dcr_weights_each_column_at_most_about_one() -> None:
     assert 1.0 <= one_string <= 2.0 + 1e-9
     shifted = row.assign(n=2.0)
     assert privacy._closest(encoder, shifted, row)[0] == pytest.approx(0.5)
+
+
+def test_literal_split_across_groups_with_an_optional_class_leaks(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    email = real["customers"].orderBy("customer_id").collect()[0]["email"]
+    local, domain = email.split("@")
+    patterns = [
+        "".join(f"({c})" for c in local[:4]) + r"[a-z.0-9]{0,30}@" + re.escape(domain),
+        f"({email[0]}|{email[0].upper()})" + "".join(f"({c})" if c.isalnum() else re.escape(c) for c in email[1:]),
+    ]
+    for pattern in patterns:
+        leaky = _with_patterns(profile, "customers", "email", [pattern])
+        score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+        detail = {c.name: c for c in score.checks}
+        assert detail["profile.sensitive_value_leaks"].detail["customers.email"] >= 1.0, pattern
+        assert detail["profile.k_threshold"].detail.get("customers.email pattern 0 literals", 0.0) >= 1.0, pattern
+        assert not score.passed
+
+
+def test_shared_domain_literal_is_not_a_leak(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:
+    domains = sorted({r["email"].split("@")[1] for r in real["customers"].select("email").collect()})
+    patterns = [r"[a-z]+\.[a-z]+[0-9]+@" + re.escape(d) for d in domains]
+    score = score_privacy(
+        real,
+        _independent(spark),
+        _with_patterns(profile, "customers", "email", patterns),
+        materialize("retail", "xs", 0).manifest,
+    )
+    assert score.passed, [c for c in score.checks if not c.passed]

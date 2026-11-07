@@ -135,7 +135,7 @@ by total score. A dataset's score is the mean of its table scores.
 | `null_fraction` | 0.10 | 1 - absolute null fraction error |
 | `distinct` | 0.10 | `(min+1)/(max+1)` of the distinct counts, i.e. exp(-abs(log ratio)) |
 | `dependence_declared` | 0.10 | 1 - abs(delta) of the manifest's declared measure for each declared pair |
-| `dependence_random` | 0.05 | 1 - abs(delta) over 20 seeded random pairs: Spearman (numeric), Cramér's V (categorical), correlation ratio (mixed). High-cardinality strings join the pairs through derived features: `#format` (index of the manifest format matched), `#chars` (length), and `#digits`, `#letters`, `#punctuation` counts; derived features of the same column are not paired with each other |
+| `dependence_random` | 0.05 | 1 - abs(delta) over 20 seeded random pairs: Spearman (numeric), Cramér's V (categorical), correlation ratio (mixed). High-cardinality strings join the pairs through derived features: `#format` (index of the manifest format matched), `#chars` (length), and `#digits`, `#letters`, `#punctuation` counts; derived features of the same column are not paired with each other. Up to 20 pairs of high-cardinality string columns also score value agreement: 1 - abs(exact-equality rate error) and the KS and Wasserstein distances of the per-row shared-prefix length, so two equal UUID columns or a copied id within a table must stay equal |
 | `constraints` | 0.10 | share of synth rows satisfying each check; for functional dependencies, the largest share of rows that can be kept so the dependency holds |
 | `keys` | 0.05 | distinct non-null keys over rows (primary) or over rows with a key (unique) |
 | `foreign_keys` | 0.10 | mean of 1 - abs(coverage error), 1 - fan-out KS, and 1 - fan-out Wasserstein |
@@ -155,6 +155,10 @@ catalog's share tolerance, keys exactly, dependencies within the dependency tole
 are left out of precision; false ones count as 0, including on tables with nothing planted in that category (recall
 is then 1). A category scores F1, or recall when there are no claims. Missing structure is reported as
 `not recovered`, never as an error. `TableStructure.weights` records the effective category weights.
+
+Verifying claims against the real data gives the profiler no new information: it reads the same data when it
+profiles. The score must not echo that data either, so a category records only how many unplanted claims held
+(`verified_true`) and how many did not (`verified_false`), never the claimed or real values.
 
 | Category | Weight | Recovered when |
 |---|---|---|
@@ -181,13 +185,22 @@ standard errors. Reports carry counts and rates, never values.
 | `<table>.dcr_ratio` | median distance to closest real record, synth over holdout, is at least 0.5 (independent samples measured 0.68–1.27; a copy scores 0) |
 | `<table>.<column>.value_leak_rate_excess` | share of distinct sensitive real values found in the synth exceeds the holdout's by at most 0.001 |
 | `<table>.quasi_identifiers[...].match_rate_excess` | share of rows matching a real-unique quasi-identifier combination exceeds the holdout's by at most 0.01 |
-| `profile.sensitive_value_leaks` | no sensitive real value equals a string of the profile JSON or a literal run of its regexes, and none, in a seeded sample of 2,000 per column, is fully matched by a profile regex whose language has fewer than max(k, 10⁶) strings |
-| `profile.k_threshold` | the profile validates, and every `top_values` entry, enumeration value, and sampled value matched by such a small-language regex occurs in at least `privacy.min_value_count` real rows |
+| `profile.sensitive_value_leaks` | no sensitive real value equals a string of the profile JSON or a literal run of its regexes; and none, in a seeded sample of 2,000 per column, is fully matched by a small-language profile regex or contains a rare required literal of one (see below) |
+| `profile.k_threshold` | the profile validates; every `top_values` entry, enumeration value, and sampled value matched by a small-language regex occurs in at least `privacy.min_value_count` (k) real rows; and no required literal of a regex occurs in fewer than k rows of its column |
 
-A regex's language size multiplies the sizes of its parts: a literal counts 1, a class its members (`.`, negated
-classes, and negated categories count 2¹⁶; `\d` 10, `\w` 63, `\s` 6), an alternation the sum of its branches, a
-bounded repeat the sum of the powers, and an unbounded repeat infinity. `(j)(o)(h)(n)@x\.com` and `[j][o]hn` have
-size 1 and are caught; `[A-Z]{3}-\d{4}` has about 1.8 × 10⁸ and is not.
+Two checks look inside every profile regex:
+
+- **Exact size.** The regex is compiled to an automaton over character classes, determinized, and the distinct
+  strings it fully matches are counted for lengths within its column's `string.length` statistics (0 to 64 when
+  absent), capped at 10¹². Alternatives that match the same strings count once. A regex with fewer than
+  max(k, 10⁶) matches is **small**: its matches are as good as literals. `(j|J)(o)(h)(n)` counts 2 and is small;
+  `[A-Z]{3}-\d{4}` counts about 1.8 × 10⁸ and is not.
+- **Required literals.** After flattening groups, turning single-character classes such as `[j]` into literals, and
+  dropping anchors, the literal runs every match must contain are extracted (an optional or multi-character part
+  ends a run; an alternation keeps the runs all branches share). A required literal of at least 4 characters
+  (`privacy.min_literal_len`) that occurs in at least one but fewer than k rows of a column singles those rows out.
+  `(j)(o)(h)(n)[a-z]{0,20}@x\.com` requires `john` and is caught although its language is large. A literal shared by
+  k or more rows, such as an email domain, is not flagged, so `[a-z]+\.[a-z]+[0-9]+@example\.com` passes.
 
 Distance to closest record encodes each column so that it adds at most about 1 to the squared distance: a numeric
 column is its rank in the real sample (a gap of r adds r², plus 1 for a null mismatch); a categorical column is a

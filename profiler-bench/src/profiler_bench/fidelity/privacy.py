@@ -12,6 +12,7 @@ import math
 import re
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -85,10 +86,10 @@ def score_privacy(
             c for fk in manifest.foreign_keys if fk.child_table == table.name for c in fk.child_columns
         }
         checks += _table_checks(table, real[table.name], synth[table.name], holdout[table.name], keys, seed, config)
-    patterns = _small_patterns(profile, profile.privacy.min_value_count, limits.min_regex_language)
-    leaks = _profile_leaks(profile, manifest, real, patterns, seed, config.sampling.privacy_rows)
+    risks = _pattern_risks(profile, config)
+    leaks = _profile_leaks(profile, manifest, real, risks, seed, config.sampling.privacy_rows)
     checks.append(_at_most("profile.sensitive_value_leaks", sum(leaks.values()), limits.max_profile_leaks, leaks))
-    violations = _k_violations(profile, real, patterns, seed, config.sampling.privacy_rows)
+    violations = _k_violations(profile, real, risks, seed, config.sampling.privacy_rows)
     checks.append(_at_most("profile.k_threshold", sum(violations.values()), limits.max_k_violations, violations))
     return PrivacyScore(
         dataset=manifest.dataset,
@@ -368,19 +369,63 @@ def _profile_columns(columns: Sequence[ColumnProfile]) -> Iterator[ColumnProfile
         yield from _profile_columns(column.children or [])
 
 
-def _small_patterns(profile: Profile, k: int, minimum: float) -> list[tuple[str, re.Pattern[str]]]:
-    """Returns the profile's regexes that match fewer than max(k, minimum) strings, so they can single out values."""
-    limit = max(float(k), minimum)
-    found = []
+@dataclass(frozen=True)
+class _PatternRisk:
+    """What a profile regex could give away.
+
+    Attributes:
+        compiled: The regex.
+        small: Whether it matches fewer than max(k, `privacy.min_regex_language`) strings within its column's length
+            range, so its matches are as good as literals.
+        literals: Literal factors at least `privacy.min_literal_len` long that every match contains.
+    """
+
+    compiled: re.Pattern[str]
+    small: bool
+    literals: tuple[str, ...]
+
+
+def _pattern_risks(profile: Profile, config: MetricsConfig) -> dict[tuple[str, str, int], _PatternRisk]:
+    """Returns the risk of every profile regex, keyed by table, column path, and pattern index."""
+    limits = config.privacy
+    limit = max(float(profile.privacy.min_value_count), limits.min_regex_language)
+    risks = {}
     for table in profile.tables:
-        for column in _profile_columns(table.columns):
-            for pattern in (column.string.patterns or []) if column.string else []:
-                if regex.language_size(pattern.regex) < limit:
-                    try:
-                        found.append((pattern.regex, re.compile(pattern.regex)))
-                    except re.error:
-                        continue
-    return found
+        for path, column in _profile_paths(table.columns, ""):
+            stats_ = column.string
+            for i, pattern in enumerate((stats_.patterns or []) if stats_ else []):
+                try:
+                    compiled = re.compile(pattern.regex)
+                except re.error:
+                    continue
+                length = stats_.length if stats_ else None
+                low = length.min if length and length.min is not None else 0
+                high = length.max if length and length.max is not None else limits.max_regex_length
+                try:
+                    small = regex.count_matches(pattern.regex, low, high) < limit
+                except regex.UnsupportedForCount:
+                    small = True
+                literals = tuple(f for f in regex.required_literals(pattern.regex) if len(f) >= limits.min_literal_len)
+                risks[(table.name, path, i)] = _PatternRisk(compiled, small, literals)
+    return risks
+
+
+def _profile_paths(columns: Sequence[ColumnProfile], prefix: str) -> Iterator[tuple[str, ColumnProfile]]:
+    for column in columns:
+        yield f"{prefix}{column.name}", column
+        yield from _profile_paths(column.children or [], f"{prefix}{column.name}.")
+
+
+def _rare_literals(rows: DataFrame, literals: set[str], k: int) -> set[str]:
+    """Returns the literals contained in at least one but fewer than `k` of the rows' values (column `v`)."""
+    if not literals:
+        return set()
+    text = rows.selectExpr("CAST(v AS STRING) AS v").dropna()
+    counts = text.agg(
+        *(F.sum((F.instr("v", F.lit(f)) > 0).cast("long")).alias(f"l{i}") for i, f in enumerate(literals))
+    )
+    row = counts.collect()[0]
+    return {f for i, f in enumerate(literals) if 0 < (row[f"l{i}"] or 0) < k}
 
 
 def _sample_values(values: DataFrame, cap: int, seed: int) -> list[str]:
@@ -393,21 +438,26 @@ def _profile_leaks(
     profile: Profile,
     manifest: Manifest,
     real: Mapping[str, DataFrame],
-    patterns: Sequence[tuple[str, re.Pattern[str]]],
+    risks: Mapping[tuple[str, str, int], _PatternRisk],
     seed: int,
     cap: int,
 ) -> dict[str, float]:
     """Counts sensitive real values the profile gives away, per column.
 
     A value leaks when it equals a string of the profile JSON or a literal run of a profile regex (checked on every
-    value), or when a profile regex with a small language (see `_small_patterns`) fully matches it (checked on a
-    seeded sample of the column's values).
+    value), when a small-language profile regex fully matches it, or when it contains a literal that some profile
+    regex requires of every match and that fewer than k real rows of the column contain (both checked on a seeded
+    sample of the column's values). A literal shared by k or more rows, such as an email domain, does not single a
+    value out.
     """
+    k = profile.privacy.min_value_count
     strings = sorted(_profile_strings(profile))
     if not real:
         return {}
     session = next(iter(real.values())).sparkSession
     candidates = F.broadcast(session.createDataFrame([(s,) for s in strings], "c string"))
+    small = [r.compiled for r in risks.values() if r.small]
+    literals = {f for r in risks.values() for f in r.literals}
     leaks: dict[str, float] = {}
     for table in manifest.tables:
         if table.name not in real:
@@ -416,27 +466,31 @@ def _profile_leaks(
             if category not in VALUE_LEAK_CATEGORIES:
                 continue
             expr = ".".join(identifier(p) for p in path.split("."))
-            values = real[table.name].selectExpr(f"CAST({expr} AS STRING) AS v").dropna().distinct()
+            rows = real[table.name].selectExpr(f"CAST({expr} AS STRING) AS v").dropna()
+            values = rows.distinct()
             exact = {r["v"] for r in values.join(candidates, F.col("c") == F.col("v"), "left_semi").collect()}
-            matched = {v for v in _sample_values(values, cap, seed) for _, p in patterns if p.fullmatch(v)}
-            leaks[f"{table.name}.{path}"] = float(len(exact | matched))
+            sample = _sample_values(values, cap, seed)
+            matched = {v for v in sample for p in small if p.fullmatch(v)}
+            present = {f for f in literals if any(f in v for v in sample)}
+            rare = _rare_literals(rows, present, k)
+            contained = {v for v in sample if any(f in v for f in rare)}
+            leaks[f"{table.name}.{path}"] = float(len(exact | matched | contained))
     return leaks
 
 
 def _k_violations(
     profile: Profile,
     real: Mapping[str, DataFrame],
-    patterns: Sequence[tuple[str, re.Pattern[str]]],
+    risks: Mapping[tuple[str, str, int], _PatternRisk],
     seed: int,
     cap: int,
 ) -> dict[str, float]:
     """Counts literal values of the profile held by fewer than `privacy.min_value_count` real rows, per source.
 
-    Sources are `top_values`, enumeration constraints, and regexes with a small language (see `_small_patterns`),
-    whose matches among a seeded sample of the column's values are treated as literals.
+    Sources are `top_values`, enumeration constraints, the matches of small-language regexes among a seeded sample
+    of the column's values, and the literals a regex requires of every match (see `_PatternRisk`).
     """
     k = profile.privacy.min_value_count
-    small = {source for source, _ in patterns}
     violations: dict[str, float] = {}
     try:
         Profile.model_validate(profile.model_dump(mode="json"))
@@ -450,12 +504,13 @@ def _k_violations(
         for path, values, column in _literal_columns(df, table.columns):
             if column.string and column.string.top_values:
                 listed.append((f"{path} top_values", values, [v.value for v in column.string.top_values]))
-            for i, pattern in enumerate((column.string.patterns or []) if column.string else []):
-                if pattern.regex in small:
-                    compiled = re.compile(pattern.regex)
-                    hits = [v for v in _sample_values(values, cap, seed) if compiled.fullmatch(v)]
-                    if hits:
-                        listed.append((f"{path} pattern {i}", values, hits))
+            for i, _ in enumerate((column.string.patterns or []) if column.string else []):
+                risk = risks.get((table.name, path, i))
+                if risk is not None:
+                    listed += _pattern_literals(f"{path} pattern {i}", values, risk, seed, cap)
+                    rare_literals = _rare_literals(values, set(risk.literals), k)
+                    if rare_literals:
+                        violations[f"{table.name}.{path} pattern {i} literals"] = float(len(rare_literals))
         top_level = {c.name for c in table.columns}
         for constraint in table.check_constraints or []:
             if isinstance(constraint, EnumerationConstraint) and constraint.column in top_level:
@@ -475,6 +530,16 @@ def _k_violations(
             if rare:
                 violations[f"{table.name}.{label}"] = float(rare)
     return violations
+
+
+def _pattern_literals(
+    label: str, values: DataFrame, risk: _PatternRisk, seed: int, cap: int
+) -> list[tuple[str, DataFrame, list[str]]]:
+    """Returns the sampled values a small-language regex matches, to be held to the k-threshold like literals."""
+    if not risk.small:
+        return []
+    hits = [v for v in _sample_values(values, cap, seed) if risk.compiled.fullmatch(v)]
+    return [(label, values, hits)] if hits else []
 
 
 def _literal_columns(df: DataFrame, columns: Sequence[ColumnProfile]) -> Iterator[tuple[str, DataFrame, ColumnProfile]]:

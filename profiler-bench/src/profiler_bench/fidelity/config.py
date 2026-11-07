@@ -133,7 +133,10 @@ class PrivacyThresholds(_Model):
         max_k_violations: Most literal values allowed below the profile's `min_value_count`.
         noise_z: Standard errors of sampling noise added to every rate-excess threshold.
         min_regex_language: A profile regex that fully matches a real value leaks it, and is held to the k-threshold,
-            when it matches fewer than max(k, this) strings.
+            when it matches fewer than max(k, this) strings within its column's length range.
+        min_literal_len: Shortest literal that every match of a profile regex contains and that is checked against
+            real values.
+        max_regex_length: Longest string counted for a regex whose column has no length statistics.
         partial_copy_pairs: Most column pairs per table checked for row-aligned partial copying.
     """
 
@@ -145,6 +148,8 @@ class PrivacyThresholds(_Model):
     max_k_violations: int = Field(ge=0)
     noise_z: float = Field(ge=0.0)
     min_regex_language: float = Field(gt=0)
+    min_literal_len: int = Field(gt=0)
+    max_regex_length: int = Field(gt=0)
     partial_copy_pairs: int = Field(gt=0)
 
 

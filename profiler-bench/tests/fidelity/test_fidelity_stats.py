@@ -77,16 +77,36 @@ def test_literals_split_alternatives() -> None:
 
 
 @pytest.mark.parametrize(
-    ("pattern", "size"),
+    ("pattern", "count"),
     [
-        (r"(j)(o)(h)(n)@x\.com", 1.0),
-        (r"[j][o]hn", 1.0),
-        (r"john|jane", 2.0),
+        (r"(j)(o)(h)(n)@x\.com", 1),
+        (r"[j][o]hn", 1),
+        (r"(j|J)(o)(h)(n)", 2),
+        (r"(j|j)ohn", 1),
+        (r"a|aa|a{1,2}", 2),
         (r"[A-Z]{3}-\d{4}", 26**3 * 10**4),
-        (r"[ab]{1,2}", 6.0),
-        (r"[a-z]+", float("inf")),
-        (r"\w{1000}", float("inf")),
+        (r"[ab]{1,2}", 6),
+        (r"[a-z]+", regex.COUNT_CAP),
     ],
 )
-def test_language_size(pattern: str, size: float) -> None:
-    assert regex.language_size(pattern) == size
+def test_count_matches_counts_distinct_strings(pattern: str, count: int) -> None:
+    assert regex.count_matches(pattern, 0, 40) == count
+
+
+def test_count_matches_respects_length_bounds() -> None:
+    assert regex.count_matches(r"[ab]+", 2, 3) == 4 + 8
+
+
+@pytest.mark.parametrize(
+    ("pattern", "required"),
+    [
+        (r"(j)(o)(h)(n)[a-z]{0,20}@x\.com", ["@x.com", "john"]),
+        (r"^[j][o](h)n$", ["john"]),
+        (r"(j|J)(o)(h)(n)", ["ohn"]),
+        (r"(ab){2}c|xababc", ["ababc"]),
+        (r"[A-Z]{3}-\d{4}", ["-"]),
+        (r"x?(abcd)+", ["abcd"]),
+    ],
+)
+def test_required_literals(pattern: str, required: list[str]) -> None:
+    assert regex.required_literals(pattern) == required

@@ -7,11 +7,10 @@ alternation, and repeats; lookarounds and back-references are not supported.
 from __future__ import annotations
 
 import importlib
-import math
 import re
 import string
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -141,75 +140,278 @@ def _literals(items: Sequence[tuple[Any, Any]], runs: list[str]) -> None:
 
 
 UNICODE = 2**16
-MAX_EXPONENT = 300
-CLASS_SIZES = {"CATEGORY_DIGIT": 10, "CATEGORY_WORD": 63, "CATEGORY_SPACE": 6}
+COUNT_CAP = 10**12
+WIDE_RANGE = 256
+CATEGORY_CHARS = {
+    "CATEGORY_DIGIT": string.digits,
+    "CATEGORY_WORD": string.ascii_letters + string.digits + "_",
+    "CATEGORY_SPACE": " \t\n\r\f\v",
+}
+
+CharSet = tuple[bool, frozenset[str]]
 
 
-def language_size(regex: str) -> float:
-    """Returns an estimate of how many strings fully match `regex`; `inf` when a repeat is unbounded.
+class UnsupportedForCount(ValueError):
+    """The regex uses a construct (such as a back-reference) whose language cannot be counted."""
 
-    Character classes count their members, with `.`, negated classes, and negated categories counted as 2**16
-    characters, `\\d` as 10, `\\w` as 63, and `\\s` as 6. Anchors and lookarounds count as one. A regex that does not
-    parse counts as the single literal string it is.
+
+def count_matches(regex: str, min_length: int, max_length: int, cap: int = COUNT_CAP) -> int:
+    """Returns how many distinct strings with a length in [min_length, max_length] fully match `regex`, at most `cap`.
+
+    The regex is compiled to an automaton over character classes and determinized, so each string is one path and
+    syntactic alternatives that match the same strings are not counted twice. Characters outside the regex's explicit
+    characters count as one class of 2**16 minus those; a range wider than 256 characters, `.`, and lookarounds are
+    widened to every character, which can only overcount.
+
+    Raises:
+        UnsupportedForCount: If the regex does not parse or uses back-references.
+    """
+    try:
+        items = _parser.parse(regex)
+    except re.error as error:
+        raise UnsupportedForCount(str(error)) from error
+    nfa = _Nfa(max_length)
+    start = nfa.state()
+    end = nfa.build(items, start)
+    classes = _classes(nfa.sets)
+    return _count(nfa, start, end, classes, min_length, max_length, cap)
+
+
+class _Nfa:
+    def __init__(self, max_length: int) -> None:
+        self.max_length = max_length
+        self.epsilon: list[list[int]] = []
+        self.edges: list[list[tuple[int, int]]] = []
+        self.sets: list[CharSet] = []
+
+    def state(self) -> int:
+        self.epsilon.append([])
+        self.edges.append([])
+        return len(self.epsilon) - 1
+
+    def char(self, start: int, charset: CharSet) -> int:
+        end = self.state()
+        self.sets.append(charset)
+        self.edges[start].append((len(self.sets) - 1, end))
+        return end
+
+    def build(self, items: Sequence[tuple[Any, Any]], start: int) -> int:
+        current = start
+        for op, av in items:
+            current = self._item((op, av), current)
+        return current
+
+    def _item(self, item: tuple[Any, Any], start: int) -> int:
+        op, av = item
+        name = op.name
+        if name in ("AT", "ASSERT", "ASSERT_NOT"):
+            return start
+        if name in ("SUBPATTERN", "ATOMIC_GROUP"):
+            return self.build(av[-1], start)
+        if name == "BRANCH":
+            end = self.state()
+            for branch in av[1]:
+                self.epsilon[self.build(branch, start)].append(end)
+            return end
+        if name in REPEATS:
+            return self._repeat(av, start)
+        charset = _charset(item)
+        if charset is None:
+            raise UnsupportedForCount(f"cannot count {name}")
+        return self.char(start, charset)
+
+    def _repeat(self, av: tuple[Any, Any, Any], start: int) -> int:
+        low, high, inner = av
+        low = min(low, self.max_length + 1)
+        current = start
+        for _ in range(low):
+            current = self.build(inner, current)
+        if high == _parser.MAXREPEAT or high > self.max_length:
+            loop_end = self.build(inner, current)
+            self.epsilon[loop_end].append(current)
+            return current
+        end = self.state()
+        self.epsilon[current].append(end)
+        for _ in range(high - low):
+            current = self.build(inner, current)
+            self.epsilon[current].append(end)
+        return end
+
+
+def _charset(item: tuple[Any, Any]) -> CharSet | None:
+    op, av = item
+    name = op.name
+    if name == "LITERAL":
+        return False, frozenset(chr(av))
+    if name == "NOT_LITERAL":
+        return True, frozenset(chr(av))
+    if name == "ANY":
+        return True, frozenset()
+    if name == "CATEGORY":
+        return _category_set(av.name)
+    if name == "IN":
+        return _class_set(av)
+    return None
+
+
+def _category_set(name: str) -> CharSet:
+    negated = name.startswith("CATEGORY_NOT_")
+    return negated, frozenset(CATEGORY_CHARS.get(name.replace("_NOT", ""), ""))
+
+
+def _class_set(items: Sequence[tuple[Any, Any]]) -> CharSet:
+    members: set[str] = set()
+    excluded: set[str] | None = None
+    negate = False
+    for op, av in items:
+        name = op.name
+        if name == "NEGATE":
+            negate = True
+        elif name == "LITERAL":
+            members.add(chr(av))
+        elif name == "RANGE":
+            if av[1] - av[0] >= WIDE_RANGE:
+                excluded = set()
+            else:
+                members.update(chr(c) for c in range(av[0], av[1] + 1))
+        elif name == "CATEGORY":
+            category_negated, chars = _category_set(av.name)
+            if category_negated:
+                excluded = (excluded or set(chars)) & set(chars)
+            else:
+                members.update(chars)
+        else:
+            excluded = set()
+    if excluded is not None:
+        result: CharSet = (True, frozenset(excluded - members))
+    else:
+        result = (False, frozenset(members))
+    return (not result[0], result[1]) if negate else result
+
+
+def _classes(sets: Sequence[CharSet]) -> list[tuple[int, tuple[bool, ...]]]:
+    """Returns each class of characters that every set treats alike, as its size and per-set membership."""
+    explicit = sorted({c for _, chars in sets for c in chars})
+    groups: dict[tuple[bool, ...], int] = {}
+    for c in explicit:
+        signature = tuple((c in chars) != negated for negated, chars in sets)
+        groups[signature] = groups.get(signature, 0) + 1
+    rest = tuple(negated for negated, _ in sets)
+    groups[rest] = groups.get(rest, 0) + UNICODE - len(explicit)
+    return [(size, signature) for signature, size in groups.items() if size > 0]
+
+
+def _closure(nfa: _Nfa, states: set[int]) -> frozenset[int]:
+    stack, seen = list(states), set(states)
+    while stack:
+        for target in nfa.epsilon[stack.pop()]:
+            if target not in seen:
+                seen.add(target)
+                stack.append(target)
+    return frozenset(seen)
+
+
+def _count(
+    nfa: _Nfa,
+    start: int,
+    end: int,
+    classes: Sequence[tuple[int, tuple[bool, ...]]],
+    min_length: int,
+    max_length: int,
+    cap: int,
+) -> int:
+    transitions: dict[frozenset[int], list[tuple[frozenset[int], int]]] = {}
+
+    def step(state: frozenset[int]) -> list[tuple[frozenset[int], int]]:
+        if state not in transitions:
+            moves: dict[frozenset[int], int] = {}
+            for size, member in classes:
+                targets = {t for s in state for setid, t in nfa.edges[s] if member[setid]}
+                if targets:
+                    target = _closure(nfa, targets)
+                    moves[target] = moves.get(target, 0) + size
+            transitions[state] = list(moves.items())
+        return transitions[state]
+
+    counts = {_closure(nfa, {start}): 1}
+    total = 0
+    for length in range(max_length + 1):
+        if length >= min_length:
+            total += sum(n for state, n in counts.items() if end in state)
+            if total >= cap:
+                return cap
+        following: dict[frozenset[int], int] = {}
+        for state, n in counts.items():
+            for target, size in step(state):
+                following[target] = min(cap, following.get(target, 0) + n * size)
+        counts = following
+        if not counts:
+            break
+    return min(total, cap)
+
+
+def required_literals(regex: str) -> list[str]:
+    """Returns literal strings that every full match of `regex` contains, longest runs first.
+
+    Groups are flattened, single-character classes such as `[j]` become literals, anchors are dropped, and a repeat
+    with a fixed count of an exact string becomes that string repeated. A repeat that may occur zero times, a class
+    of several characters, or an alternation ends a run; an alternation contributes the runs every branch shares.
+    A regex that does not parse requires itself.
     """
     try:
         items = _parser.parse(regex)
     except re.error:
-        return 1.0
-    return _size(items)
+        return [regex]
+    return sorted({f for f in _required(items) if f}, key=lambda f: (-len(f), f))
 
 
-def _size(items: Sequence[tuple[Any, Any]]) -> float:
-    total = 1.0
-    for item in items:
-        total *= _item_size(item)
-        if total == float("inf"):
-            return total
-    return total
-
-
-def _repeat_size(av: tuple[Any, Any, Any]) -> float:
-    low, high, inner = av
-    if high == _parser.MAXREPEAT:
-        return float("inf")
-    base = _size(inner)
-    if base <= 1:
-        return 1.0
-    if high * math.log10(base) > MAX_EXPONENT:
-        return float("inf")
-    return float(sum(base**count for count in range(low, high + 1)))
-
-
-ONE_SIZED = frozenset({"LITERAL", "AT", "ASSERT", "ASSERT_NOT", "GROUPREF", "GROUPREF_EXISTS"})
-SIZES: dict[str, Callable[[Any], float]] = {
-    "CATEGORY": lambda av: float(CLASS_SIZES.get(av.name, UNICODE)),
-    "IN": lambda av: _class_size(av),
-    "BRANCH": lambda av: sum(_size(branch) for branch in av[1]),
-    "SUBPATTERN": lambda av: _size(av[-1]),
-    "ATOMIC_GROUP": lambda av: _size(av[-1]),
-    **dict.fromkeys(REPEATS, _repeat_size),
-}
-
-
-def _item_size(item: tuple[Any, Any]) -> float:
-    op, av = item
-    if op.name in ONE_SIZED:
-        return 1.0
-    return SIZES[op.name](av) if op.name in SIZES else float(UNICODE)
-
-
-def _class_size(items: Sequence[tuple[Any, Any]]) -> float:
-    if any(op.name == "NEGATE" for op, _ in items):
-        return float(UNICODE)
-    size = 0.0
+def _flatten(items: Sequence[tuple[Any, Any]]) -> list[tuple[Any, Any]]:
+    flat: list[tuple[Any, Any]] = []
     for op, av in items:
-        name = op.name
-        if name == "LITERAL":
-            size += 1
-        elif name == "RANGE":
-            size += av[1] - av[0] + 1
-        elif name == "CATEGORY":
-            size += CLASS_SIZES.get(av.name, UNICODE)
+        if op.name in ("SUBPATTERN", "ATOMIC_GROUP"):
+            flat += _flatten(av[-1])
         else:
-            size += UNICODE
-    return size
+            flat.append((op, av))
+    return flat
+
+
+def _exact(item: tuple[Any, Any]) -> str | None:
+    op, av = item
+    name = op.name
+    if name == "LITERAL":
+        return chr(av)
+    if name in ("AT", "ASSERT", "ASSERT_NOT"):
+        return ""
+    if name == "IN" and len(av) == 1 and av[0][0].name == "LITERAL":
+        return chr(av[0][1])
+    if name == "BRANCH":
+        options = {_exact_sequence(branch) for branch in av[1]}
+        return options.pop() if len(options) == 1 and None not in options else None
+    if name in REPEATS and av[0] == av[1]:
+        inner = _exact_sequence(av[2])
+        return inner * av[0] if inner is not None else None
+    return None
+
+
+def _exact_sequence(items: Sequence[tuple[Any, Any]]) -> str | None:
+    parts = [_exact(item) for item in _flatten(items)]
+    return None if any(p is None for p in parts) else "".join(p for p in parts if p is not None)
+
+
+def _required(items: Sequence[tuple[Any, Any]]) -> list[str]:
+    factors: list[str] = []
+    run = ""
+    for op, av in _flatten(items):
+        literal = _exact((op, av))
+        if literal is not None:
+            run += literal
+            continue
+        factors.append(run)
+        run = ""
+        if op.name in REPEATS and av[0] >= 1:
+            factors += _required(av[2])
+        elif op.name == "BRANCH":
+            branches = [_required(branch) for branch in av[1]]
+            factors += [f for f in branches[0] if all(any(f in g for g in other) for other in branches[1:])]
+    factors.append(run)
+    return factors

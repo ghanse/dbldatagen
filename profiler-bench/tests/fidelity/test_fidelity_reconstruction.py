@@ -248,3 +248,31 @@ def test_effective_weights_are_renormalized_over_present_groups(numeric_identica
     assert sum(table.weights.values()) == pytest.approx(1.0)
     total = sum(config[g] for g in table.groups)
     assert table.weights["marginal"] == pytest.approx(config["marginal"] / total)
+
+
+def test_shuffling_one_of_two_equal_uuid_columns_drops_the_score(spark: SparkSession) -> None:
+    rng = np.random.default_rng(0)
+    n = 4000
+    uuids = ["".join(rng.choice(list("0123456789abcdef"), 32)) for _ in range(n)]
+    real_pdf = pd.DataFrame({"id": np.arange(n), "a": uuids, "b": uuids})
+    synth_pdf = real_pdf.assign(b=rng.permutation(real_pdf["b"].to_numpy()))
+    table = Table(
+        name="t",
+        row_count=n,
+        primary_key=("id",),
+        columns=(
+            Column(name="id", type="bigint", unique=True),
+            Column(name="a", type="string", unique=True),
+            Column(name="b", type="string", unique=True),
+        ),
+    )
+    manifest = Manifest(dataset="uuids", tier="xs", structure_seed=0, description="", tables=(table,))
+    real = {"t": spark.createDataFrame(real_pdf)}
+    same = score_reconstruction(real, {"t": spark.createDataFrame(real_pdf)}, manifest, seed=0).tables[0]
+    broken = score_reconstruction(real, {"t": spark.createDataFrame(synth_pdf)}, manifest, seed=0).tables[0]
+    pair = next(p for p in broken.pairs if p.measure == "value_agreement")
+    assert pair.real == 1.0 and pair.synth is not None and pair.synth < 0.01
+    assert pair.score < 0.4
+    assert same.score == pytest.approx(1.0)
+    assert broken.groups["dependence_random"] < same.groups["dependence_random"] - 0.2
+    assert broken.score < same.score - 0.02

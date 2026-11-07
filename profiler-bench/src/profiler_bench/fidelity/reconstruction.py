@@ -8,6 +8,7 @@ aggregates over the full tables.
 from __future__ import annotations
 
 import itertools
+import os
 import re
 import zlib
 from collections.abc import Mapping
@@ -403,7 +404,7 @@ def _pairs(
     random_pairs = [
         ((b, a), m) if m == "correlation_ratio" and kinds[a] == "numeric" else ((a, b), m) for (a, b), m in random_pairs
     ]
-    result = []
+    result = _agreement_pairs(truth.name, kinds, real, synth, seed, config.dependence.random_pairs)
     for (columns, measure), is_declared in [*((d, True) for d in declared), *((r, False) for r in random_pairs)]:
         real_value = pair_measure(real, columns, measure, kinds, config)
         present = set(columns) <= set(synth.columns)
@@ -415,6 +416,52 @@ def _pairs(
             )
         )
     return result
+
+
+def _agreement_pairs(
+    table: str, kinds: Mapping[str, str], real: pd.DataFrame, synth: pd.DataFrame, seed: int, limit: int
+) -> list[PairScore]:
+    """Returns the value agreement of seeded pairs of high-cardinality row-level string columns.
+
+    Two such columns can share values (a copied id, two equal UUIDs) without any marginal or derived feature showing
+    it. A pair scores the mean of 1 - |exact-equality rate error| and 1 - KS and 1 - normalized Wasserstein-1 of the
+    per-row shared-prefix length, real vs synth. `real` and `synth` on the pair are the exact-equality rates.
+    """
+    strings = sorted(p for p, k in kinds.items() if k == "string" and "." not in p and "#" not in p)
+    pairs = list(itertools.combinations(strings, 2))
+    if len(pairs) > limit:
+        rng = np.random.default_rng([seed, zlib.crc32(f"{table}#agreement".encode())])
+        pairs = [pairs[i] for i in sorted(rng.choice(len(pairs), size=limit, replace=False))]
+    result = []
+    for pair in pairs:
+        real_equal, real_prefix = _agreement(real, pair)
+        if not set(pair) <= set(synth.columns):
+            result.append(
+                PairScore(
+                    columns=pair, measure="value_agreement", declared=False, real=real_equal, synth=None, score=0.0
+                )
+            )
+            continue
+        synth_equal, synth_prefix = _agreement(synth, pair)
+        if len(real_prefix) and len(synth_prefix):
+            ks, w1 = stats.ks_wasserstein(real_prefix, synth_prefix)
+        else:
+            ks = w1 = 0.0 if len(real_prefix) == len(synth_prefix) == 0 else 1.0
+        score = ((1 - abs(real_equal - synth_equal)) + (1 - ks) + (1 - w1)) / 3
+        result.append(
+            PairScore(
+                columns=pair, measure="value_agreement", declared=False, real=real_equal, synth=synth_equal, score=score
+            )
+        )
+    return result
+
+
+def _agreement(frame: pd.DataFrame, pair: tuple[str, str]) -> tuple[float, np.ndarray]:
+    both = frame[list(pair)].dropna().astype(str)
+    left, right = both[pair[0]].tolist(), both[pair[1]].tolist()
+    prefix = np.array([len(os.path.commonprefix([a, b])) for a, b in zip(left, right, strict=True)], dtype=np.float64)
+    equal = float(np.mean([a == b for a, b in zip(left, right, strict=True)])) if left else 0.0
+    return equal, prefix
 
 
 def _root(path: str) -> str:

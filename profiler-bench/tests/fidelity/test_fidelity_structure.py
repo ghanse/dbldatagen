@@ -1,3 +1,5 @@
+import json
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -278,3 +280,25 @@ def test_false_unplanted_claims_lower_precision_and_true_ones_do_not(
     assert _precision(false_score, "customers", "keys") < 1.0
     assert _precision(false_score, "orders", "foreign_keys") < 1.0
     assert false_score.score < base.score
+    assert _category(false_score, "customers", "checks").verified_false == 1
+    assert _category(true_score, "customers", "keys").verified_true == 1
+
+    secrets = {str(low), str(high), str(high + 1), str(high + 2), "nowhere", *regions}
+    for column in ("email", "sku"):
+        table = "customers" if column == "email" else "products"
+        secrets |= {r[column] for r in real[table].select(column).collect()}
+    for score in (true_score, false_score):
+        leaves = set(_strings(json.loads(score.model_dump_json())))
+        assert not leaves & secrets, leaves & secrets
+
+
+def _strings(node: object) -> Iterator[str]:
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            yield key
+            yield from _strings(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _strings(value)

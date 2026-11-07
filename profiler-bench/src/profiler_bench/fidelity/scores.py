@@ -41,11 +41,12 @@ class PairScore(_Score):
 
     Attributes:
         columns: The two columns; for `correlation_ratio` the first is the conditioning column.
-        measure: `pearson`, `spearman`, `cramers_v`, or `correlation_ratio`.
+        measure: `pearson`, `spearman`, `cramers_v`, `correlation_ratio`, or `value_agreement` (two high-cardinality
+            string columns; `real` and `synth` are their exact-equality rates).
         declared: Whether the manifest declares the pair; otherwise it was drawn at random.
         real: Measure on the real sample.
         synth: Measure on the synth sample, or None when the synth lacks a column.
-        score: 1 - min(1, |real - synth|).
+        score: 1 - min(1, |real - synth|); for `value_agreement`, also the shared-prefix length distance.
     """
 
     columns: tuple[str, str]
@@ -223,6 +224,9 @@ class StructureCategory(_Score):
         score: F1 of recall and precision, or the recall when precision is None.
         items: Planted items.
         claims: Number of claims counted in the precision.
+        verified_true: Claims about unplanted structure that hold on the real data (left out of precision).
+        verified_false: Claims about unplanted structure that do not hold (counted as 0 in precision). Only these
+            counts are kept: neither the claimed nor the real values are recorded.
     """
 
     recall: Score
@@ -230,6 +234,8 @@ class StructureCategory(_Score):
     score: Score
     items: list[StructureItem]
     claims: int = 0
+    verified_true: int = 0
+    verified_false: int = 0
 
 
 class TableStructure(_Score):
