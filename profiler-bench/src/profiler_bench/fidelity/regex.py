@@ -694,3 +694,148 @@ def _class_to_regex(items: Sequence[tuple[Any, Any]]) -> str:
         else:
             raise UnsupportedForCount(f"cannot serialize class {name}")
     return f"[{negate}{''.join(body)}]"
+
+
+# --- Allowlisted portable dialect (raw-source tokenizer; not sre_parse) ---
+
+_DIALECT_CATEGORIES = frozenset("dDwWsS")
+_DIALECT_META = frozenset(".^$*+?{}[]\\|()")
+_DIALECT_ESCAPE_LITERALS = frozenset(".^$*+?{}[]\\|()-")
+
+
+class _DialectError(Exception):
+    """The pattern is outside the allowlisted portable dialect."""
+
+
+def in_dialect(source: str) -> bool:
+    """Returns whether `source` is exactly one pattern in the allowlisted portable dialect.
+
+    The check uses a strict tokenizer over the raw string (not Python's `sre_parse`). Allowed forms are literals and
+    escaped literals, classes `[...]` (including negation and ranges), `.`, `\\d`/`\\D`/`\\w`/`\\W`/`\\s`/`\\S`,
+    quantifiers `?`/`*`/`+`/`{m}`/`{m,}`/`{m,n}` (no lazy forms), groups `(...)` and `(?:...)`, alternation, and
+    anchors `^`/`$`. Comments, inline flags, lookarounds, named groups, backreferences, `\\p`/`\\N`/`\\x`/`\\u`,
+    verbose whitespace, conditionals, and NUL/control characters fail. The source must equal the concatenation of the
+    token texts so ignored or hidden bytes cannot carry data.
+    """
+    if any(ord(c) < 32 or ord(c) == 127 for c in source):
+        return False
+    try:
+        tokens, pos = _dialect_disjunction(source, 0)
+    except _DialectError:
+        return False
+    return pos == len(source) and "".join(tokens) == source
+
+
+def _dialect_disjunction(source: str, pos: int) -> tuple[list[str], int]:
+    tokens, pos = _dialect_term(source, pos)
+    while pos < len(source) and source[pos] == "|":
+        tokens.append("|")
+        pos += 1
+        more, pos = _dialect_term(source, pos)
+        tokens.extend(more)
+    return tokens, pos
+
+
+def _dialect_term(source: str, pos: int) -> tuple[list[str], int]:
+    tokens: list[str] = []
+    while pos < len(source) and source[pos] not in ")|":
+        atom, pos = _dialect_atom(source, pos)
+        tokens.extend(atom)
+        if pos < len(source) and source[pos] in "?*+{":
+            quant, pos = _dialect_quantifier(source, pos)
+            tokens.append(quant)
+            if pos < len(source) and source[pos] == "?":
+                raise _DialectError("lazy quantifier")
+    return tokens, pos
+
+
+def _dialect_atom(source: str, pos: int) -> tuple[list[str], int]:
+    if pos >= len(source):
+        raise _DialectError("truncated")
+    char = source[pos]
+    if char in " \t\r\n\f\v":
+        raise _DialectError("whitespace")
+    if char in "^$.":
+        return [char], pos + 1
+    if char == "\\":
+        return _dialect_escape(source, pos, in_class=False)
+    if char == "[":
+        return _dialect_class(source, pos)
+    if char == "(":
+        return _dialect_group(source, pos)
+    if char in _DIALECT_META:
+        raise _DialectError(f"bare metacharacter {char}")
+    return [char], pos + 1
+
+
+def _dialect_escape(source: str, pos: int, *, in_class: bool) -> tuple[list[str], int]:
+    if pos + 1 >= len(source):
+        raise _DialectError("trailing backslash")
+    nxt = source[pos + 1]
+    if ord(nxt) < 32 or ord(nxt) == 127:
+        raise _DialectError("control escape")
+    if nxt in _DIALECT_CATEGORIES:
+        return [source[pos : pos + 2]], pos + 2
+    if nxt in _DIALECT_ESCAPE_LITERALS or (in_class and nxt in "^-]"):
+        return [source[pos : pos + 2]], pos + 2
+    raise _DialectError(f"unsupported escape \\{nxt}")
+
+
+def _dialect_class(source: str, pos: int) -> tuple[list[str], int]:
+    start = pos
+    pos += 1
+    if pos < len(source) and source[pos] == "^":
+        pos += 1
+    if pos >= len(source):
+        raise _DialectError("unterminated class")
+    # First body character may be ] or - without closing/range meaning.
+    if source[pos] in "]-":
+        pos += 1
+    while pos < len(source) and source[pos] != "]":
+        if source[pos] == "\\":
+            _, pos = _dialect_escape(source, pos, in_class=True)
+            continue
+        if source[pos] == "[":
+            raise _DialectError("nested class or POSIX class")
+        if ord(source[pos]) < 32 or ord(source[pos]) == 127:
+            raise _DialectError("control in class")
+        pos += 1
+    if pos >= len(source) or source[pos] != "]":
+        raise _DialectError("unterminated class")
+    return [source[start : pos + 1]], pos + 1
+
+
+def _dialect_group(source: str, pos: int) -> tuple[list[str], int]:
+    start = pos
+    pos += 1
+    if pos < len(source) and source[pos] == "?":
+        if pos + 1 < len(source) and source[pos + 1] == ":":
+            pos += 2
+        else:
+            raise _DialectError("unsupported group extension")
+    _, pos = _dialect_disjunction(source, pos)
+    if pos >= len(source) or source[pos] != ")":
+        raise _DialectError("unterminated group")
+    return [source[start : pos + 1]], pos + 1
+
+
+def _dialect_quantifier(source: str, pos: int) -> tuple[str, int]:
+    char = source[pos]
+    if char in "?*+":
+        return char, pos + 1
+    # {m}, {m,}, {m,n}
+    if char != "{":
+        raise _DialectError("quantifier")
+    start = pos
+    pos += 1
+    if pos >= len(source) or not source[pos].isdigit():
+        raise _DialectError("braced quantifier")
+    while pos < len(source) and source[pos].isdigit():
+        pos += 1
+    if pos < len(source) and source[pos] == ",":
+        pos += 1
+        while pos < len(source) and source[pos].isdigit():
+            pos += 1
+    if pos >= len(source) or source[pos] != "}":
+        raise _DialectError("braced quantifier")
+    return source[start : pos + 1], pos + 1

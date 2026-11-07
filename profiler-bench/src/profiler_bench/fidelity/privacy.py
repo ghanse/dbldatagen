@@ -8,6 +8,7 @@ Every check is pass/fail against a threshold of the metrics configuration; value
 from __future__ import annotations
 
 import itertools
+import json
 import math
 import re
 import zlib
@@ -95,24 +96,19 @@ def score_privacy(
     risks = _pattern_risks(profile, config, sensitive)
     leaks = _profile_leaks(profile, manifest, real, risks, seed, config)
     violations = _k_violations(profile, real, risks, seed, config, sensitive)
-    budget_hits = float(sum(1 for r in risks.values() if r.budget_exceeded))
-    structural_hits = float(sum(1 for r in risks.values() if r.not_generalized))
-    if budget_hits:
-        leaks = {**leaks, "regex_budget_exceeded": leaks.get("regex_budget_exceeded", 0.0) + budget_hits}
-        violations = {
-            **violations,
-            "regex_budget_exceeded": violations.get("regex_budget_exceeded", 0.0) + budget_hits,
-        }
-    if structural_hits:
-        leaks = {
-            **leaks,
-            "sensitive_pattern_not_generalized": leaks.get("sensitive_pattern_not_generalized", 0.0) + structural_hits,
-        }
-        violations = {
-            **violations,
-            "sensitive_pattern_not_generalized": violations.get("sensitive_pattern_not_generalized", 0.0)
-            + structural_hits,
-        }
+    text_hits = _sensitive_values_in_profile_text(profile, manifest, real, seed, config)
+    if text_hits:
+        leaks = {**leaks, "sensitive_value_in_profile_text": text_hits}
+        violations = {**violations, "sensitive_value_in_profile_text": text_hits}
+    for reason, flag in (
+        ("regex_budget_exceeded", "budget_exceeded"),
+        ("sensitive_pattern_not_generalized", "not_generalized"),
+        ("pattern_not_in_dialect", "not_in_dialect"),
+    ):
+        hits = float(sum(1 for r in risks.values() if getattr(r, flag)))
+        if hits:
+            leaks = {**leaks, reason: leaks.get(reason, 0.0) + hits}
+            violations = {**violations, reason: violations.get(reason, 0.0) + hits}
     checks.append(_at_most("profile.sensitive_value_leaks", sum(leaks.values()), limits.max_profile_leaks, leaks))
     checks.append(_at_most("profile.k_threshold", sum(violations.values()), limits.max_k_violations, violations))
     return PrivacyScore(
@@ -398,7 +394,7 @@ class _PatternRisk:
     """What a profile regex could give away.
 
     Attributes:
-        compiled: The full regex.
+        compiled: The full regex, or a never-matching stand-in when the source is outside the dialect.
         pattern: The regex source.
         branches: Alternation branches to check independently on non-sensitive columns; the full pattern alone on
             sensitive columns (which use the structural rule instead).
@@ -406,6 +402,7 @@ class _PatternRisk:
         literals: Per-branch required literals of length at least `privacy.min_literal_len`, flattened.
         budget_exceeded: Whether branch expansion or a length-cap probe exhausted the shared work budget.
         not_generalized: Whether a sensitive-column pattern failed the literal-free structural rule.
+        not_in_dialect: Whether the raw source failed the allowlisted portable dialect check.
     """
 
     compiled: re.Pattern[str]
@@ -415,6 +412,10 @@ class _PatternRisk:
     literals: tuple[str, ...]
     budget_exceeded: bool = False
     not_generalized: bool = False
+    not_in_dialect: bool = False
+
+
+_NEVER = re.compile(r"(?!)")
 
 
 def _pattern_risks(
@@ -427,26 +428,31 @@ def _pattern_risks(
         for path, column in _profile_paths(table.columns, ""):
             stats_ = column.string
             for i, pattern in enumerate((stats_.patterns or []) if stats_ else []):
+                source = pattern.regex
+                if not regex.in_dialect(source):
+                    risks[(table.name, path, i)] = _PatternRisk(_NEVER, source, (), (), (), not_in_dialect=True)
+                    continue
                 try:
-                    compiled = re.compile(pattern.regex)
+                    compiled = re.compile(source)
                 except re.error:
+                    risks[(table.name, path, i)] = _PatternRisk(_NEVER, source, (), (), (), not_in_dialect=True)
                     continue
                 on_sensitive = (table.name, path) in sensitive
-                not_generalized = on_sensitive and not regex.is_generalized(pattern.regex)
+                not_generalized = on_sensitive and not regex.is_generalized(source)
                 budget_exceeded = False
                 branches: tuple[str, ...]
                 if on_sensitive:
-                    branches = (pattern.regex,)
+                    branches = (source,)
                 else:
-                    expanded = regex.expand_branches(pattern.regex, max_dfa_states=limits.max_dfa_states)
+                    expanded = regex.expand_branches(source, max_dfa_states=limits.max_dfa_states)
                     if isinstance(expanded, list):
                         branches = tuple(expanded)
                     else:
                         budget_exceeded = True
-                        branches = (pattern.regex,)
+                        branches = (source,)
                     try:
                         probed = regex.count_matches(
-                            pattern.regex, 0, limits.max_regex_length, max_dfa_states=limits.max_dfa_states
+                            source, 0, limits.max_regex_length, max_dfa_states=limits.max_dfa_states
                         )
                         budget_exceeded = budget_exceeded or probed is regex.BUDGET_EXCEEDED
                     except regex.UnsupportedForCount:
@@ -460,7 +466,7 @@ def _pattern_risks(
                 branch_compiled = tuple(re.compile(branch) for branch in branches)
                 risks[(table.name, path, i)] = _PatternRisk(
                     compiled,
-                    pattern.regex,
+                    source,
                     branches,
                     branch_compiled,
                     literals,
@@ -468,6 +474,45 @@ def _pattern_risks(
                     not_generalized,
                 )
     return risks
+
+
+def _sensitive_values_in_profile_text(
+    profile: Profile,
+    manifest: Manifest,
+    real: Mapping[str, DataFrame],
+    seed: int,
+    config: MetricsConfig,
+) -> float:
+    """Returns how many sampled sensitive values appear as substrings of the serialized profile JSON.
+
+    The JSON is case-folded and backslashes are stripped so escaped spellings still match. Values shorter than
+    `privacy.min_literal_len` are ignored.
+    """
+    if not real:
+        return 0.0
+    blob = json.dumps(profile.model_dump(mode="json"), sort_keys=True, ensure_ascii=False).casefold().replace("\\", "")
+    min_len = config.privacy.min_literal_len
+    cap = config.sampling.privacy_rows
+    hits = 0
+    seen: set[str] = set()
+    for table in manifest.tables:
+        if table.name not in real:
+            continue
+        for path, category in sensitive_columns(table).items():
+            if category not in VALUE_LEAK_CATEGORIES:
+                continue
+            expr = ".".join(identifier(p) for p in path.split("."))
+            values = real[table.name].selectExpr(f"CAST({expr} AS STRING) AS v").dropna()
+            for value in _sample_values(values, cap, seed):
+                if len(value) < min_len:
+                    continue
+                key = value.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                if key.replace("\\", "") in blob:
+                    hits += 1
+    return float(hits)
 
 
 def _language_vs_value(
@@ -550,7 +595,7 @@ def _profile_leaks(
         return {}
     session = next(iter(real.values())).sparkSession
     candidates = F.broadcast(session.createDataFrame([(s,) for s in strings], "c string"))
-    branch_risks = [r for r in risks.values() if not r.not_generalized]
+    branch_risks = [r for r in risks.values() if not r.not_generalized and not r.not_in_dialect]
     literals = {f for r in branch_risks for f in r.literals}
     cache: dict[tuple[str, int], int | regex._BudgetExceeded] = {}
     budget_hits = 0
@@ -686,7 +731,7 @@ def _pattern_k_sources(
     budget_hits = 0
     for i, _ in enumerate((column.string.patterns or []) if column.string else []):
         risk = risks.get((table, path, i))
-        if risk is None or risk.not_generalized:
+        if risk is None or risk.not_generalized or risk.not_in_dialect:
             continue
         hits, hit_budget = _pattern_literals(
             values,

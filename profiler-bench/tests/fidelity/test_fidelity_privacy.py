@@ -283,6 +283,39 @@ def test_case_class_pattern_fails_structural_on_sensitive(
         assert not score.passed
 
 
+def test_dialect_rejects_comments_flags_lookarounds_and_named_groups(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    for pattern in (
+        r"(?#john@x.com)[^\s]+",
+        r"(?i)JOHN@X\.COM",
+        r"(?=john)[^\s]+",
+        r"(?P<john_x_com>a)",
+    ):
+        leaky = _with_patterns(profile, "customers", "email", [pattern])
+        score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+        detail = {c.name: c for c in score.checks}
+        assert detail["profile.sensitive_value_leaks"].detail["pattern_not_in_dialect"] >= 1.0, pattern
+        assert detail["profile.k_threshold"].detail["pattern_not_in_dialect"] >= 1.0, pattern
+        assert not score.passed
+
+
+def test_sensitive_value_in_non_regex_profile_field_fails_raw_scan(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    email = real["customers"].orderBy("customer_id").collect()[0]["email"]
+    data = profile.model_dump(mode="json")
+    products = next(t for t in data["tables"] if t["name"] == "products")
+    sku = next(c for c in products["columns"] if c["name"] == "sku")
+    sku["string"] = {**(sku.get("string") or {}), "top_values": [{"value": email, "frequency": 0.1}]}
+    leaky = Profile.model_validate(data)
+    score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+    detail = {c.name: c for c in score.checks}
+    assert detail["profile.sensitive_value_leaks"].detail["sensitive_value_in_profile_text"] >= 1.0
+    assert detail["profile.k_threshold"].detail["sensitive_value_in_profile_text"] >= 1.0
+    assert not score.passed
+
+
 def test_partial_row_copying_is_detected(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:
     synth = _independent(spark)
     copied = ["email", "signup_date", "country"]

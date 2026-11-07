@@ -140,6 +140,24 @@ def test_is_generalized(pattern: str, generalized: bool) -> None:
     assert regex.is_generalized(pattern) is generalized
 
 
+@pytest.mark.parametrize(
+    ("pattern", "allowed"),
+    [
+        (r"[^\s]+", True),
+        (r"[A-Z]{3}-\d{4}", True),
+        (r"\d{3}-\d{4}", True),
+        (r"(?#john@x.com)[^\s]+", False),
+        (r"(?i)JOHN@X\.COM", False),
+        (r"(?=john)[^\s]+", False),
+        (r"(?P<john_x_com>a)", False),
+        (r"a*?", False),
+        (r"\x41", False),
+    ],
+)
+def test_in_dialect(pattern: str, allowed: bool) -> None:
+    assert regex.in_dialect(pattern) is allowed
+
+
 def test_expand_branches_splits_decoy_alternation() -> None:
     branches = regex.expand_branches(r"(?:(j)(o)(h)(n)[@](x)[.](c)(o)(m)|[a-z0-9@.]{10})")
     assert isinstance(branches, list) and len(branches) == 2
