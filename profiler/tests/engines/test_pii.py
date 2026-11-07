@@ -229,6 +229,57 @@ def test_nested_map_phone_value_is_detected_and_substituted(spark: SparkSession)
     assert row.phones["mobile"].startswith("+1415")
 
 
+def test_nested_and_top_level_values_use_same_resolved_mapping_after_rehash(spark: SparkSession) -> None:
+    options = SubstitutionOptions(
+        domains={"shared-email": ["t.contacts.element.email", "t.primary_email"]}, surrogate_bits=2
+    )
+    candidates = [f"a{index}@example.com" for index in range(10)]
+    by_surrogate: dict[str, list[str]] = {}
+    for value in candidates:
+        surrogate = _mapping_surrogate(PiiClass.EMAIL, value, "shared-email", b"nested-rehash-key", options, 0)
+        by_surrogate.setdefault(surrogate, []).append(value)
+    first, second = next(values[:2] for values in by_surrogate.values() if len(values) >= 2)
+    frame = spark.createDataFrame(
+        [([Row(email=first), Row(email=second), Row(email=first)], first)],
+        "contacts array<struct<email:string>>, primary_email string",
+    )
+    profile = profile_dataframe("t", frame)
+    result = substitute({"t": frame}, profile, key=b"nested-rehash-key", options=options)
+    row = result.tables["t"].first()
+    assert row is not None
+    nested = [item.email for item in row.contacts]
+    assert nested[0] == row.primary_email == nested[2]
+    assert len(set(nested)) == 2
+    assert set(nested).isdisjoint({first, second})
+    assert all(item["collisions_resolved"] >= 2 for item in result.report["columns"])
+
+
+def test_nested_map_keys_and_null_containers_preserve_shape_and_order(spark: SparkSession) -> None:
+    first, second = "a@example.com", "b@example.com"
+    frame = spark.createDataFrame(
+        [
+            ([Row(email=first), None, Row(email=second)], {first: "first", second: "second"}),
+            (None, None),
+            ([], {}),
+        ],
+        "contacts array<struct<email:string>>, lookup map<string,string>",
+    )
+    profile = profile_dataframe("t", frame)
+    options = SubstitutionOptions(
+        domains={"nested-email": ["t.contacts.element.email", "t.lookup.key"]}, surrogate_bits=2
+    )
+    rows = substitute({"t": frame}, profile, key=b"nested-shape-key", options=options).tables["t"].collect()
+    populated = next(row for row in rows if row.contacts)
+    assert populated.contacts[1] is None
+    assert [item is None for item in populated.contacts] == [False, True, False]
+    ordered_surrogates = [populated.contacts[0].email, populated.contacts[2].email]
+    assert len(populated.lookup) == 2
+    assert set(populated.lookup) == set(ordered_surrogates)
+    assert set(populated.lookup.values()) == {"first", "second"}
+    assert any(row.contacts is None and row.lookup is None for row in rows)
+    assert any(row.contacts == [] and row.lookup == {} for row in rows)
+
+
 def test_substitution_preserves_relationships_and_card_validity(spark: SparkSession) -> None:
     parents = spark.createDataFrame(
         [("a@example.com", "4532015112830366"), ("b@example.com", "4532015112830366")],

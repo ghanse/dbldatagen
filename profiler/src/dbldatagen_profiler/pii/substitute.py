@@ -11,12 +11,16 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
+from pyspark.broadcast import Broadcast
 from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 from pyspark.sql.window import Window
 
 from dbldatagen_profiler.model import ColumnProfile, PiiClass, Profile, Semantic, Sensitivity
+
+
+MAX_NESTED_BROADCAST_VALUES = 100_000
 
 
 @dataclass(frozen=True)
@@ -63,13 +67,27 @@ def substitute(  # noqa: PLR0912, PLR0915
         if column.semantic is not None and _requires_substitution(column.semantic):
             domain_semantics.setdefault(domains[f"{table_name}.{path}"], column.semantic)
     mappings: dict[str, DataFrame] = {}
+    nested_mappings: dict[str, Broadcast[dict[str, str]]] = {}
     collision_counts: dict[str, int] = {}
+    nested_domains = {
+        domains[f"{table}.{path}"]
+        for table, path, column in _profile_columns(profile)
+        if "." in path and column.semantic is not None and _requires_mapping(column.semantic)
+    }
     for domain, semantic in domain_semantics.items():
         if semantic.pii_class in {PiiClass.FREE_TEXT_PII, PiiClass.DATE_OF_BIRTH}:
             continue
         members = [reference for reference, member_domain in domains.items() if member_domain == domain]
         mapping, collisions = _build_mapping(tables, members, semantic, domain, key, opts)
         mappings[domain], collision_counts[domain] = mapping, collisions
+        if domain in nested_domains:
+            rows = mapping.limit(MAX_NESTED_BROADCAST_VALUES + 1).collect()
+            if len(rows) > MAX_NESTED_BROADCAST_VALUES:
+                raise ValueError(f"nested substitution domain {domain!r} exceeds the broadcast limit")
+            session = next(iter(tables.values())).sparkSession
+            nested_mappings[domain] = session.sparkContext.broadcast(
+                {str(row.original): str(row.surrogate) for row in rows}
+            )
     output: dict[str, DataFrame] = {}
     reports: list[dict[str, Any]] = []
     for table_name, frame in tables.items():
@@ -96,7 +114,8 @@ def substitute(  # noqa: PLR0912, PLR0915
                 )
             elif nested:
                 result = result.withColumn(
-                    name, _nested_substitution_udf(frame.schema[name].dataType, nested, key, opts)(name)
+                    name,
+                    _nested_substitution_udf(frame.schema[name].dataType, nested, nested_mappings, key, opts)(name),
                 )
                 for path, semantic, domain in nested:
                     count = _leaf_values(frame, f"{name}.{path}").count()
@@ -179,6 +198,13 @@ def substitute(  # noqa: PLR0912, PLR0915
 
 def _requires_substitution(semantic: Semantic) -> bool:
     return semantic.sensitivity != Sensitivity.QUASI_IDENTIFIER or semantic.pii_class == PiiClass.DATE_OF_BIRTH
+
+
+def _requires_mapping(semantic: Semantic) -> bool:
+    return _requires_substitution(semantic) and semantic.pii_class not in {
+        PiiClass.FREE_TEXT_PII,
+        PiiClass.DATE_OF_BIRTH,
+    }
 
 
 def _profile_columns(profile: Profile) -> Iterator[tuple[str, str, ColumnProfile]]:
@@ -419,20 +445,30 @@ def _date_shift_udf(domain: str, key: bytes, date_shift_days: int) -> Callable[.
 def _nested_substitution_udf(
     data_type: T.DataType,
     specifications: list[tuple[str, Semantic, str]],
+    mappings: dict[str, Broadcast[dict[str, str]]],
     key: bytes,
     options: SubstitutionOptions,
 ) -> Callable[..., Column]:
     semantics = {tuple(path.split(".")): (semantic, domain) for path, semantic, domain in specifications}
 
     def transform(value: object, kind: T.DataType, path: tuple[str, ...]) -> object:  # noqa: PLR0911
+        if value is None:
+            return None
         specification = semantics.get(path)
         if specification is not None:
             semantic, domain = specification
-            if value is None or str(value) == "":
+            if str(value) == "":
                 return value
             if semantic.pii_class == PiiClass.FREE_TEXT_PII:
                 return _replace_spans(str(value), domain, key, options)
-            return _mapping_surrogate(semantic.pii_class, str(value), domain, key, options, 0)
+            mapping = mappings.get(domain)
+            if mapping is not None:
+                surrogate = mapping.value.get(str(value))
+                if surrogate is None:
+                    raise ValueError(f"nested value is absent from resolved domain {domain!r}")
+                return _coerce_nested_value(surrogate, kind)
+            surrogate = _mapping_surrogate(semantic.pii_class, str(value), domain, key, options, 0)
+            return _coerce_nested_value(surrogate, kind)
         if isinstance(kind, T.StructType):
             source = value.asDict(recursive=False) if hasattr(value, "asDict") else value
             return {
@@ -446,12 +482,15 @@ def _nested_substitution_udf(
             )
         if isinstance(kind, T.MapType):
             if isinstance(value, dict):
-                return {
+                transformed = {
                     transform(item_key, kind.keyType, (*path, "key")): transform(
                         item_value, kind.valueType, (*path, "value")
                     )
                     for item_key, item_value in value.items()
                 }
+                if len(transformed) != len(value):
+                    raise ValueError("nested map substitution changed the entry count")
+                return transformed
             return value
         return value
 
@@ -459,6 +498,16 @@ def _nested_substitution_udf(
         return None if value is None else transform(value, data_type, ())
 
     return F.udf(replace, data_type, useArrow=False)
+
+
+def _coerce_nested_value(value: str, data_type: T.DataType) -> object:
+    if isinstance(data_type, (T.ByteType, T.ShortType, T.IntegerType, T.LongType)):
+        return int(value)
+    if isinstance(data_type, (T.FloatType, T.DoubleType)):
+        return float(value)
+    if isinstance(data_type, T.DateType):
+        return date.fromisoformat(value)
+    return value
 
 
 def _digest(key: bytes, domain: str, value: str, bits: int = 256, counter: int = 0) -> bytes:
