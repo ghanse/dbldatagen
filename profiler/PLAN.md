@@ -94,6 +94,13 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P1.3b | Register real public datasets in the catalog (download + checksum hook exists; none registered) — needs a decision on which datasets are reachable through the proxy | P1.3 | todo |
 | P1.9 | Rust engine scaffold (Polars vs DataFusion decision, CLI binary, spec-valid output for the baseline features) | P1.1, Rust toolchain | deferred (human decision 2026-11-06: PySpark-only Phase 1; Rust engine later) |
 
+### Phase 1b — PII (human request 2026-11-07)
+
+| ID | Item | Depends on | Status |
+|----|------|------------|--------|
+| P2.1 | PII detection (spec 0.2.0 `semantic` + quasi-identifier sets) and keyed, format-preserving, join-consistent substitution of real data (contract: `.polly/contracts/p2-1-pii.md`) | P1.2 | in-progress |
+| P2.2 | Benchmark side: catalog PII ground truth for every PII class, detection precision/recall metric, substitution fidelity (stats + relational integrity preserved) and leakage metrics, sampler consumes `semantic.pii_class` | P1.5, P2.1 | todo |
+
 ### Phase 2 — RSI iterations (Step 2)
 
 Candidate proposal areas (they enter the log as proposals when triaged):
