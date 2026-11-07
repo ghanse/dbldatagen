@@ -108,6 +108,7 @@ Candidate proposal areas (they enter the log as proposals when triaged):
 - Quantile / histogram marginals; heavy-tail and multimodal fits
 - Cardinality: exact vs HLL, bucketed frequency profiles, top-k with a privacy threshold
 - String structure: regex inference (character-class tokenization, multiple patterns with coverage weights), length distributions
+- Spec 0.3 candidate: make the profile regex dialect (allowlisted, portable to Rust; enforced by the bench in P1.5) part of the spec and validate it in the model
 - Spec 0.2 candidates: functional dependencies (no field in 0.1.0, so the metrics score them 'not recovered'); correlation_ratio consumption in the sampler
 - Keys: PK / unique / composite key discovery; FK inclusion-dependency discovery across tables; FK fan-out distributions
 - Check constraints: ranges, enumerations, cross-column inequalities (`a <= b`), functional dependencies
