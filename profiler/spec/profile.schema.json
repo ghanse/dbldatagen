@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "dbldatagen profile spec 0.1.0. Generated from dbldatagen_profiler.model; do not edit.",
+  "$comment": "dbldatagen profile spec 0.2.0. Generated from dbldatagen_profiler.model; do not edit.",
   "$defs": {
     "BooleanStats": {
       "description": "Statistics for a boolean column.\n\nAttributes:\n    true_fraction: Fraction of non-null values that are true.",
@@ -185,6 +185,17 @@
           ],
           "default": null,
           "title": "Value Count"
+        },
+        "semantic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Semantic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -771,6 +782,28 @@
       "title": "Pattern",
       "type": "object"
     },
+    "PiiClass": {
+      "description": "Semantic class of personally identifying data.",
+      "enum": [
+        "email",
+        "phone",
+        "person_name",
+        "street_address",
+        "city",
+        "postal_code",
+        "national_id",
+        "credit_card",
+        "iban",
+        "ip_address",
+        "date_of_birth",
+        "account_id",
+        "secret_token",
+        "free_text_pii",
+        "other"
+      ],
+      "title": "PiiClass",
+      "type": "string"
+    },
     "PrivacyPolicy": {
       "description": "Privacy policy that the producer applied when writing the profile.\n\nAttributes:\n    min_value_count: Fewest rows a literal value must occur in before it may appear in `top_values` or an\n        enumeration constraint, and fewest rows a string pattern must match (default 10). Literals embedded in\n        regexes are checked by the benchmark's privacy guard, not by this model.\n    extremes: Treatment of data extremes (default \"exact\"). When \"suppressed\", numeric and temporal `min` and\n        `max`, quantiles at q=0 and q=1, and range constraint bounds may not appear, and histograms must set\n        `generalized_outer_edges`.\n    enumerations: Treatment of `top_values` and enumeration constraints (default \"exact\"). When \"suppressed\",\n        none of them may appear.\n    allow_expression_constraints: Whether SQL expression constraints, which may embed literal values, may\n        appear (default false).",
       "properties": {
@@ -829,6 +862,38 @@
         "value"
       ],
       "title": "Quantile",
+      "type": "object"
+    },
+    "QuasiIdentifierSet": {
+      "description": "Sampled uniqueness and k-anonymity estimate for a column combination.",
+      "properties": {
+        "columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 2,
+          "title": "Columns",
+          "type": "array"
+        },
+        "unique_fraction": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Unique Fraction",
+          "type": "number"
+        },
+        "k_anonymity": {
+          "minimum": 1,
+          "title": "K Anonymity",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "columns",
+        "unique_fraction",
+        "k_anonymity"
+      ],
+      "title": "QuasiIdentifierSet",
       "type": "object"
     },
     "RangeConstraint": {
@@ -1014,6 +1079,70 @@
       },
       "title": "SamplingInfo",
       "type": "object"
+    },
+    "Semantic": {
+      "description": "Detected semantic meaning and sensitivity of a column.",
+      "properties": {
+        "pii_class": {
+          "$ref": "#/$defs/PiiClass"
+        },
+        "sensitivity": {
+          "$ref": "#/$defs/Sensitivity"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/SemanticEvidence"
+          },
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "pii_class",
+        "sensitivity",
+        "confidence"
+      ],
+      "title": "Semantic",
+      "type": "object"
+    },
+    "SemanticEvidence": {
+      "description": "Detection method and its sampled match rate, without source values.",
+      "properties": {
+        "method": {
+          "minLength": 1,
+          "title": "Method",
+          "type": "string"
+        },
+        "match_rate": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Match Rate",
+          "type": "number"
+        }
+      },
+      "required": [
+        "method",
+        "match_rate"
+      ],
+      "title": "SemanticEvidence",
+      "type": "object"
+    },
+    "Sensitivity": {
+      "description": "Privacy sensitivity taxonomy shared with the benchmark catalog.",
+      "enum": [
+        "direct_identifier",
+        "quasi_identifier",
+        "secret",
+        "free_text"
+      ],
+      "title": "Sensitivity",
+      "type": "string"
     },
     "SourceInfo": {
       "description": "Metadata about the profiled source. Holds no data values.\n\nAttributes:\n    name: Optional dataset name.\n    format: Optional storage format, e.g. \"delta\" or \"parquet\".\n    location: Optional path, URI, or catalog name of the source.\n    sampling: Optional sampling applied before profiling.",
@@ -1215,6 +1344,21 @@
           ],
           "default": null,
           "title": "Dependencies"
+        },
+        "quasi_identifier_sets": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/QuasiIdentifierSet"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Quasi Identifier Sets"
         }
       },
       "required": [
