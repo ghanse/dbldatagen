@@ -143,8 +143,9 @@ UNICODE = 2**16
 COUNT_CAP = 10**12
 WIDE_RANGE = 256
 DEFAULT_MAX_DFA_STATES = 10_000
-# Transition expansions checked per DFA state; keeps subset construction bounded even when few states fan out widely.
-DFA_WORK_PER_STATE = 64
+DEFAULT_MAX_REGEX_LENGTH = 1_000
+# Work units allotted per allowed automaton state; NFA build, epsilon-closure, DFA steps, and the length loop share it.
+WORK_PER_STATE = 64
 CATEGORY_CHARS = {
     "CATEGORY_DIGIT": string.digits,
     "CATEGORY_WORD": string.ascii_letters + string.digits + "_",
@@ -159,7 +160,7 @@ class UnsupportedForCount(ValueError):
 
 
 class _BudgetExceeded:
-    """Sentinel returned when DFA subset construction exhausts its state or transition-work budget."""
+    """Sentinel returned when language counting exhausts its shared work budget."""
 
     def __repr__(self) -> str:
         return "BUDGET_EXCEEDED"
@@ -168,21 +169,42 @@ class _BudgetExceeded:
 BUDGET_EXCEEDED = _BudgetExceeded()
 
 
+class _Exhausted(Exception):
+    """Internal: the shared work budget was exhausted."""
+
+
+class _WorkBudget:
+    """Single counter for NFA construction, epsilon-closure, DFA subset construction, and length iteration."""
+
+    def __init__(self, max_states: int) -> None:
+        self.max_states = max_states
+        self.limit = max_states * WORK_PER_STATE
+        self.used = 0
+        self.nfa_states = 0
+        self.dfa_states = 0
+
+    def charge(self, amount: int = 1) -> None:
+        self.used += amount
+        if self.used > self.limit:
+            raise _Exhausted()
+
+
 def count_matches(
     regex: str,
     min_length: int,
     max_length: int,
     cap: int = COUNT_CAP,
     max_dfa_states: int = DEFAULT_MAX_DFA_STATES,
+    budget: _WorkBudget | None = None,
 ) -> int | _BudgetExceeded:
     """Returns how many distinct strings with a length in [min_length, max_length] fully match `regex`, at most `cap`.
 
     The regex is compiled to an automaton over character classes and determinized, so each string is one path and
     syntactic alternatives that match the same strings are not counted twice. Characters outside the regex's explicit
     characters count as one class of 2**16 minus those; a range wider than 256 characters, `.`, and lookarounds are
-    widened to every character, which can only overcount. Subset construction is bounded by `max_dfa_states` and a
-    transition-work budget of `max_dfa_states * DFA_WORK_PER_STATE`; when either is exhausted the sentinel
-    `BUDGET_EXCEEDED` is returned.
+    widened to every character, which can only overcount. NFA construction (including expanded repeats), epsilon
+    closure, DFA subset construction, and every length-loop iteration charge one shared `_WorkBudget` sized from
+    `max_dfa_states`; when it is exhausted the sentinel `BUDGET_EXCEEDED` is returned.
 
     Raises:
         UnsupportedForCount: If the regex does not parse or uses back-references.
@@ -191,21 +213,31 @@ def count_matches(
         items = _parser.parse(regex)
     except re.error as error:
         raise UnsupportedForCount(str(error)) from error
-    nfa = _Nfa(max_length)
-    start = nfa.state()
-    end = nfa.build(items, start)
-    classes = _classes(nfa.sets)
-    return _count(nfa, start, end, classes, min_length, max_length, cap, max_dfa_states)
+    work = budget if budget is not None else _WorkBudget(max_dfa_states)
+    try:
+        work.charge(1)
+        nfa = _Nfa(max_length, work)
+        start = nfa.state()
+        end = nfa.build(items, start)
+        classes = _classes(nfa.sets)
+        return _count(nfa, start, end, classes, min_length, max_length, cap, work)
+    except _Exhausted:
+        return BUDGET_EXCEEDED
 
 
 class _Nfa:
-    def __init__(self, max_length: int) -> None:
+    def __init__(self, max_length: int, budget: _WorkBudget) -> None:
         self.max_length = max_length
+        self.budget = budget
         self.epsilon: list[list[int]] = []
         self.edges: list[list[tuple[int, int]]] = []
         self.sets: list[CharSet] = []
 
     def state(self) -> int:
+        self.budget.charge(1)
+        self.budget.nfa_states += 1
+        if self.budget.nfa_states > self.budget.max_states:
+            raise _Exhausted()
         self.epsilon.append([])
         self.edges.append([])
         return len(self.epsilon) - 1
@@ -223,6 +255,7 @@ class _Nfa:
         return current
 
     def _item(self, item: tuple[Any, Any], start: int) -> int:
+        self.budget.charge(1)
         op, av = item
         name = op.name
         if name in ("AT", "ASSERT", "ASSERT_NOT"):
@@ -243,6 +276,9 @@ class _Nfa:
 
     def _repeat(self, av: tuple[Any, Any, Any], start: int) -> int:
         low, high, inner = av
+        # Charge the syntactic repeat size before truncating to max_length so a{100000} fails without building it.
+        span = low if high == _parser.MAXREPEAT else high
+        self.budget.charge(max(span, 1))
         low = min(low, self.max_length + 1)
         current = start
         for _ in range(low):
@@ -322,9 +358,10 @@ def _classes(sets: Sequence[CharSet]) -> list[tuple[int, tuple[bool, ...]]]:
     return [(size, signature) for signature, size in groups.items() if size > 0]
 
 
-def _closure(nfa: _Nfa, states: set[int]) -> frozenset[int]:
+def _closure(nfa: _Nfa, states: set[int], budget: _WorkBudget) -> frozenset[int]:
     stack, seen = list(states), set(states)
     while stack:
+        budget.charge(1)
         for target in nfa.epsilon[stack.pop()]:
             if target not in seen:
                 seen.add(target)
@@ -340,46 +377,40 @@ def _count(
     min_length: int,
     max_length: int,
     cap: int,
-    max_dfa_states: int,
+    budget: _WorkBudget,
 ) -> int | _BudgetExceeded:
     transitions: dict[frozenset[int], list[tuple[frozenset[int], int]]] = {}
-    max_work = max_dfa_states * DFA_WORK_PER_STATE
-    work = 0
-    exceeded = False
 
     def step(state: frozenset[int]) -> list[tuple[frozenset[int], int]]:
-        nonlocal work, exceeded
         if state in transitions:
             return transitions[state]
-        if len(transitions) >= max_dfa_states:
-            exceeded = True
-            return []
+        budget.dfa_states += 1
+        if budget.dfa_states > budget.max_states:
+            raise _Exhausted()
+        budget.charge(1)
         moves: dict[frozenset[int], int] = {}
         for size, member in classes:
-            work += max(1, len(state))
-            if work > max_work:
-                exceeded = True
-                return []
+            budget.charge(max(1, len(state)))
             targets = {t for s in state for setid, t in nfa.edges[s] if member[setid]}
             if targets:
-                target = _closure(nfa, targets)
+                target = _closure(nfa, targets, budget)
                 moves[target] = moves.get(target, 0) + size
         transitions[state] = list(moves.items())
         return transitions[state]
 
-    counts = {_closure(nfa, {start}): 1}
+    counts = {_closure(nfa, {start}, budget): 1}
     total = 0
     for length in range(max_length + 1):
+        budget.charge(1)
         if length >= min_length:
             total += sum(n for state, n in counts.items() if end in state)
             if total >= cap:
                 return cap
         following: dict[frozenset[int], int] = {}
         for state, n in counts.items():
+            budget.charge(1)
             for target, size in step(state):
                 following[target] = min(cap, following.get(target, 0) + n * size)
-            if exceeded:
-                return BUDGET_EXCEEDED
         counts = following
         if not counts:
             break

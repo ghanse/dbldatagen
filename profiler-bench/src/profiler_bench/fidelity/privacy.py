@@ -407,7 +407,10 @@ def _pattern_risks(profile: Profile, config: MetricsConfig) -> dict[tuple[str, s
                     continue
                 length = stats_.length if stats_ else None
                 low = length.min if length and length.min is not None else 0
-                high = length.max if length and length.max is not None else limits.max_regex_length
+                declared_high = length.max if length and length.max is not None else None
+                # Clamp the counting bound; a declared max above the clamp is unbounded / "large".
+                high = limits.max_regex_length if declared_high is None else min(declared_high, limits.max_regex_length)
+                above_clamp = declared_high is not None and declared_high > limits.max_regex_length
                 budget_exceeded = False
                 try:
                     counted = regex.count_matches(pattern.regex, low, high, max_dfa_states=limits.max_dfa_states)
@@ -415,7 +418,8 @@ def _pattern_risks(profile: Profile, config: MetricsConfig) -> dict[tuple[str, s
                     small = True
                 else:
                     if isinstance(counted, int):
-                        small = counted < limit
+                        # Cap hits and lengths above the clamp are "large": safe, must not be treated as small.
+                        small = not above_clamp and counted < limit and counted < regex.COUNT_CAP
                     else:
                         small, budget_exceeded = False, True
                 literals = tuple(f for f in regex.required_literals(pattern.regex) if len(f) >= limits.min_literal_len)

@@ -136,10 +136,11 @@ class PrivacyThresholds(_Model):
             when it matches fewer than max(k, this) strings within its column's length range.
         min_literal_len: Shortest literal that every match of a profile regex contains and that is checked against
             real values.
-        max_regex_length: Longest string counted for a regex whose column has no length statistics.
-        max_dfa_states: Most DFA states the regex language counter may build; together with a transition-work budget
-            of this many times a fixed per-state allowance, bounds subset construction. A regex that exhausts the
-            budget fails the privacy guard with reason `regex_budget_exceeded`.
+        max_regex_length: Longest string length the regex language counter will iterate; also clamps a profile-declared
+            `length.max`. A declared max above this is treated as unbounded (language "large"). Default 1000.
+        max_dfa_states: Scales the shared work budget for regex language counting (NFA build, epsilon-closure, DFA
+            subset construction, and the length loop). A regex that exhausts the budget fails the privacy guard with
+            reason `regex_budget_exceeded`.
         partial_copy_pairs: Most column pairs per table checked for row-aligned partial copying.
     """
 

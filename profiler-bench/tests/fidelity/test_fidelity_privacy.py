@@ -10,6 +10,7 @@ from dbldatagen_profiler.engines.spark import profile_tables
 from dbldatagen_profiler.model import Profile
 from profiler_bench.catalog import load, materialize
 from profiler_bench.fidelity import PrivacyScore, privacy, regex, score_privacy, stats
+from profiler_bench.fidelity.config import load_config
 
 
 def _checks(score: PrivacyScore) -> dict[str, bool]:
@@ -94,10 +95,20 @@ def _independent(spark: SparkSession) -> dict[str, DataFrame]:
     return load("retail", "xs", 0, spark, sample_seed=3)
 
 
-def _with_patterns(profile: Profile, table: str, column: str, regexes: list[str]) -> Profile:
+def _with_patterns(
+    profile: Profile,
+    table: str,
+    column: str,
+    regexes: list[str],
+    *,
+    length_max: int | None = None,
+) -> Profile:
     data = profile.model_dump(mode="json")
     target = next(c for t in data["tables"] if t["name"] == table for c in t["columns"] if c["name"] == column)
-    target["string"] = {**(target.get("string") or {}), "patterns": [{"regex": r, "coverage": 0.5} for r in regexes]}
+    string = {**(target.get("string") or {}), "patterns": [{"regex": r, "coverage": 0.5} for r in regexes]}
+    if length_max is not None:
+        string["length"] = {**(string.get("length") or {}), "min": 0, "max": length_max}
+    target["string"] = string
     return Profile.model_validate(data)
 
 
@@ -180,6 +191,20 @@ def test_dfa_budget_rejects_adversarial_pattern(
     assert detail["profile.sensitive_value_leaks"].detail["regex_budget_exceeded"] == 1.0
     assert detail["profile.k_threshold"].detail["regex_budget_exceeded"] == 1.0
     assert not score.passed
+
+
+def test_unbounded_declared_length_is_large_not_iterated(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    broad = _with_patterns(profile, "products", "sku", [r"a*"], length_max=10**12)
+    started = time.perf_counter()
+    risks = privacy._pattern_risks(broad, load_config())
+    assert time.perf_counter() - started < 1.0
+    sku_risks = [r for (table, path, _), r in risks.items() if table == "products" and path == "sku"]
+    assert sku_risks and all(not r.small and not r.budget_exceeded for r in sku_risks)
+    score = score_privacy(real, _independent(spark), broad, materialize("retail", "xs", 0).manifest)
+    assert score.passed, [c for c in score.checks if not c.passed]
+    assert "regex_budget_exceeded" not in {c.name: c for c in score.checks}["profile.k_threshold"].detail
 
 
 def test_partial_row_copying_is_detected(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:

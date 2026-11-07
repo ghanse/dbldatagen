@@ -1,4 +1,5 @@
 import re
+import time
 
 import numpy as np
 import pandas as pd
@@ -102,6 +103,26 @@ def test_count_matches_returns_budget_sentinel_deterministically() -> None:
     assert regex.count_matches(pattern, 0, 64, max_dfa_states=100) is regex.BUDGET_EXCEEDED
     assert regex.count_matches(pattern, 0, 64, max_dfa_states=100) is regex.BUDGET_EXCEEDED
     assert regex.count_matches(r"[A-Z]{3}-\d{4}", 0, 40) == 26**3 * 10**4
+
+
+def test_count_matches_budget_covers_nfa_and_length_loop() -> None:
+    started = time.perf_counter()
+    assert regex.count_matches(r"a{100000}", 0, 100000) is regex.BUDGET_EXCEEDED
+    assert regex.count_matches(r"(a{1000}){1000}", 0, 1000000) is regex.BUDGET_EXCEEDED
+    assert time.perf_counter() - started < 1.0
+    assert regex.count_matches(r"[A-Z]{3}-\d{4}", 0, 8) == 26**3 * 10**4
+    email_count = regex.count_matches(r"[a-z]+\.[a-z]+[0-9]+@(example\.com|mail\.test)", 0, 40)
+    assert isinstance(email_count, int) and email_count >= 1
+
+
+def test_every_count_entry_point_takes_the_budget() -> None:
+    empty = regex._WorkBudget(0)
+    assert regex.count_matches("a", 0, 1, budget=empty) is regex.BUDGET_EXCEEDED
+    spent = regex._WorkBudget(10_000)
+    assert regex.count_matches("a", 0, 1, budget=spent) == 1
+    assert spent.used > 0
+    assert spent.nfa_states > 0
+    assert spent.dfa_states > 0
 
 
 @pytest.mark.parametrize(
