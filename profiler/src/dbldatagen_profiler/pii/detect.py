@@ -55,6 +55,7 @@ _HINTS: tuple[tuple[PiiClass, Sensitivity, re.Pattern[str]], ...] = (
     (PiiClass.ACCOUNT_ID, Sensitivity.DIRECT_IDENTIFIER, re.compile(r"(^|_)(account|customer|user|member)_?id($|_)")),
     (PiiClass.SECRET_TOKEN, Sensitivity.SECRET, re.compile(r"(^|_)(secret|token|api_?key|password|credential)($|_)")),
     (PiiClass.FREE_TEXT_PII, Sensitivity.FREE_TEXT, re.compile(r"(^|_)(notes?|comments?|description|free_?text)($|_)")),
+    (PiiClass.OTHER, Sensitivity.DIRECT_IDENTIFIER, re.compile(r"(^|_)other_?pii($|_)")),
 )
 
 
@@ -74,14 +75,45 @@ def _detect_table(frame: DataFrame, sample_rows: int, seed: int) -> dict[str, Se
 
 def _detect_rows(frame: DataFrame, rows: Sequence[Row]) -> dict[str, Semantic]:
     result: dict[str, Semantic] = {}
-    values_by_column = {
-        field.name: [row[field.name] for row in rows if row[field.name] is not None] for field in frame.schema
-    }
     for field in frame.schema:
-        semantic = _classify(field, values_by_column[field.name])
-        if semantic is not None:
-            result[field.name] = semantic
+        values = [row[field.name] for row in rows if row[field.name] is not None]
+        _detect_field(field, values, field.name, result)
     return result
+
+
+def _detect_field(field: T.StructField, values: list[object], path: str, result: dict[str, Semantic]) -> None:
+    data_type = field.dataType
+    if not isinstance(data_type, (T.StructType, T.ArrayType, T.MapType)):
+        semantic = _classify(field, values)
+        if semantic is not None:
+            result[path] = semantic
+    if isinstance(data_type, T.StructType):
+        for child in data_type.fields:
+            child_values = [_struct_value(value, child.name) for value in values]
+            _detect_field(child, [value for value in child_values if value is not None], f"{path}.{child.name}", result)
+    elif isinstance(data_type, T.ArrayType):
+        elements = [element for value in values if isinstance(value, list | tuple) for element in value]
+        child = T.StructField("element", data_type.elementType, data_type.containsNull)
+        _detect_field(child, [value for value in elements if value is not None], f"{path}.element", result)
+    elif isinstance(data_type, T.MapType):
+        mappings = [value for value in values if isinstance(value, dict)]
+        keys = [key for value in mappings for key in value]
+        map_values = [item for value in mappings for item in value.values()]
+        _detect_field(T.StructField("key", data_type.keyType, False), keys, f"{path}.key", result)
+        _detect_field(
+            T.StructField("value", data_type.valueType, data_type.valueContainsNull),
+            [value for value in map_values if value is not None],
+            f"{path}.value",
+            result,
+        )
+
+
+def _struct_value(value: object, name: str) -> object:
+    if isinstance(value, Row):
+        return value[name]
+    if isinstance(value, dict):
+        return value.get(name)
+    return None
 
 
 def analyze_table(
@@ -112,6 +144,7 @@ def _classify(field: T.StructField, values: list[object]) -> Semantic | None:
         (PiiClass.IBAN, Sensitivity.DIRECT_IDENTIFIER, "iban_mod97", _is_iban),
         (PiiClass.NATIONAL_ID, Sensitivity.DIRECT_IDENTIFIER, "us_ssn", lambda value: bool(_SSN.fullmatch(str(value)))),
         (PiiClass.IP_ADDRESS, Sensitivity.DIRECT_IDENTIFIER, "ip_address", _is_ip),
+        (PiiClass.ACCOUNT_ID, Sensitivity.DIRECT_IDENTIFIER, "uuid", _is_uuid),
         (PiiClass.SECRET_TOKEN, Sensitivity.SECRET, "opaque_token_entropy", _is_opaque_token),
     ]
     matches = [
@@ -233,12 +266,14 @@ def _is_ip(value: object) -> bool:
 
 def _is_opaque_token(value: object) -> bool:
     text = str(value)
-    if _UUID.fullmatch(text):
-        return True
     if len(text) < 20 or any(char.isspace() for char in text):
         return False
     entropy = -sum((count / len(text)) * math.log2(count / len(text)) for count in Counter(text).values())
     return entropy >= 3.5 and len(set(text)) >= 10
+
+
+def _is_uuid(value: object) -> bool:
+    return _UUID.fullmatch(str(value)) is not None
 
 
 def _plausible_birth_date(value: object) -> bool:
@@ -252,13 +287,10 @@ def _plausible_birth_date(value: object) -> bool:
 
 def _contains_pii_span(value: object) -> bool:
     text = str(value)
-    basic = bool(
-        _EMAIL_SPAN.search(text)
-        or _PHONE_SPAN.search(text)
-        or _SSN_SPAN.search(text)
-        or any(_is_card(match.group()) for match in _CARD_SPAN.finditer(text))
-    )
+    basic_matches = [*_EMAIL_SPAN.finditer(text), *_PHONE_SPAN.finditer(text), *_SSN_SPAN.finditer(text)]
+    basic_matches.extend(match for match in _CARD_SPAN.finditer(text) if _is_card(match.group()))
+    basic = any(match.span() != (0, len(text)) for match in basic_matches)
     if basic:
         return True
     tokens = re.findall(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b|\b(?:\d{1,3}\.){3}\d{1,3}\b", text, re.I)
-    return any(_is_iban(token) or _is_ip(token) for token in tokens)
+    return any((_is_iban(token) or _is_ip(token)) and token != text for token in tokens)

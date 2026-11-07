@@ -111,13 +111,18 @@ def _profile_table(
         _column_from_aggregate(field, values, index, row_count, privacy, nested=False, df=df)
         for index, field in enumerate(df.schema.fields)
     ]
-    protected = []
-    for column in columns:
-        semantic = semantics.get(column.name)
-        if semantic is None:
-            protected.append(column)
-            continue
-        updates: dict[str, Any] = {"semantic": semantic}
+    protected = [_protect_column(column, column.name, semantics) for column in columns]
+    quasi = [
+        QuasiIdentifierSet(columns=names, unique_fraction=unique, k_anonymity=k) for names, unique, k in quasi_sets
+    ]
+    return TableProfile(name=name, row_count=row_count, columns=protected, quasi_identifier_sets=quasi or None)
+
+
+def _protect_column(column: ColumnProfile, path: str, semantics: Mapping[str, Any]) -> ColumnProfile:
+    updates: dict[str, Any] = {}
+    semantic = semantics.get(path)
+    if semantic is not None:
+        updates["semantic"] = semantic
         if semantic.sensitivity.value in {"direct_identifier", "secret"}:
             if column.numeric is not None:
                 updates["numeric"] = column.numeric.model_copy(
@@ -127,11 +132,9 @@ def _profile_table(
                 updates["temporal"] = column.temporal.model_copy(update={"min": None, "max": None, "quantiles": None})
             if column.string is not None:
                 updates["string"] = column.string.model_copy(update={"top_values": None})
-        protected.append(column.model_copy(update=updates))
-    quasi = [
-        QuasiIdentifierSet(columns=names, unique_fraction=unique, k_anonymity=k) for names, unique, k in quasi_sets
-    ]
-    return TableProfile(name=name, row_count=row_count, columns=protected, quasi_identifier_sets=quasi or None)
+    if column.children is not None:
+        updates["children"] = [_protect_column(child, f"{path}.{child.name}", semantics) for child in column.children]
+    return column.model_copy(update=updates) if updates else column
 
 
 @contextmanager

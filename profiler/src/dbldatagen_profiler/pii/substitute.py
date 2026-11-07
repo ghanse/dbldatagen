@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import ipaddress
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
@@ -16,7 +16,7 @@ from pyspark.sql import functions as F
 from pyspark.sql import types as T
 from pyspark.sql.window import Window
 
-from dbldatagen_profiler.model import PiiClass, Profile, Semantic, Sensitivity
+from dbldatagen_profiler.model import ColumnProfile, PiiClass, Profile, Semantic, Sensitivity
 
 
 @dataclass(frozen=True)
@@ -38,7 +38,7 @@ class SubstitutionResult:
     report: dict[str, Any]
 
 
-def substitute(  # noqa: PLR0912
+def substitute(  # noqa: PLR0912, PLR0915
     tables: dict[str, DataFrame],
     profile: Profile,
     *,
@@ -59,14 +59,13 @@ def substitute(  # noqa: PLR0912
         raise ValueError(f"tables are absent from profile: {missing}")
     domains = _domains(profile, opts)
     domain_semantics: dict[str, Semantic] = {}
-    for table in profile.tables:
-        for column in table.columns:
-            if column.semantic is not None and column.semantic.sensitivity != Sensitivity.QUASI_IDENTIFIER:
-                domain_semantics.setdefault(domains[f"{table.name}.{column.name}"], column.semantic)
+    for table_name, path, column in _profile_columns(profile):
+        if column.semantic is not None and _requires_substitution(column.semantic):
+            domain_semantics.setdefault(domains[f"{table_name}.{path}"], column.semantic)
     mappings: dict[str, DataFrame] = {}
     collision_counts: dict[str, int] = {}
     for domain, semantic in domain_semantics.items():
-        if semantic.pii_class == PiiClass.FREE_TEXT_PII:
+        if semantic.pii_class in {PiiClass.FREE_TEXT_PII, PiiClass.DATE_OF_BIRTH}:
             continue
         members = [reference for reference, member_domain in domains.items() if member_domain == domain]
         mapping, collisions = _build_mapping(tables, members, semantic, domain, key, opts)
@@ -82,14 +81,59 @@ def substitute(  # noqa: PLR0912
             current_semantic = current_column.semantic if current_column is not None else None
             effective_semantic = domain_semantics.get(domains[reference], current_semantic)
             generalization = opts.generalize.get(reference) or opts.generalize.get(name)
+            nested_all = [
+                (path.removeprefix(f"{name}."), column.semantic, domains[f"{table_name}.{path}"])
+                for nested_table, path, column in _profile_columns(profile)
+                if nested_table == table_name and path.startswith(f"{name}.") and column.semantic is not None
+            ]
+            nested = [item for item in nested_all if _requires_substitution(item[1])]
+            nested_skipped = [item for item in nested_all if not _requires_substitution(item[1])]
             if generalization:
                 result = result.withColumn(name, _generalize(F.col(name), generalization, frame.schema[name].dataType))
                 count = frame.where(F.col(name).isNotNull()).count()
                 reports.append(
                     _report(table_name, name, current_semantic, domains[reference], count, 0, generalization)
                 )
-            elif effective_semantic is not None and effective_semantic.sensitivity != Sensitivity.QUASI_IDENTIFIER:
-                if effective_semantic.pii_class == PiiClass.FREE_TEXT_PII:
+            elif nested:
+                result = result.withColumn(
+                    name, _nested_substitution_udf(frame.schema[name].dataType, nested, key, opts)(name)
+                )
+                for path, semantic, domain in nested:
+                    count = _leaf_values(frame, f"{name}.{path}").count()
+                    reports.append(
+                        _report(
+                            table_name,
+                            f"{name}.{path}",
+                            semantic,
+                            domain,
+                            count,
+                            collision_counts.get(domain, 0),
+                            None,
+                        )
+                    )
+                reports.extend(
+                    {
+                        **_report(table_name, f"{name}.{path}", semantic, domain, 0, 0, None),
+                        "skipped_reason": "quasi_identifier_unchanged",
+                    }
+                    for path, semantic, domain in nested_skipped
+                )
+            elif nested_skipped:
+                reports.extend(
+                    {
+                        **_report(table_name, f"{name}.{path}", semantic, domain, 0, 0, None),
+                        "skipped_reason": "quasi_identifier_unchanged",
+                    }
+                    for path, semantic, domain in nested_skipped
+                )
+            elif effective_semantic is not None and _requires_substitution(effective_semantic):
+                date_shift_key: str | None = None
+                if effective_semantic.pii_class == PiiClass.DATE_OF_BIRTH:
+                    entity_columns = _entity_columns(profile, table_name)
+                    date_shift_key = "entity" if entity_columns else "value"
+                    transform = _date_shift_udf(domains[reference], key, opts.date_shift_days)
+                    result = result.withColumn(name, transform(F.col(name), *(F.col(item) for item in entity_columns)))
+                elif effective_semantic.pii_class == PiiClass.FREE_TEXT_PII:
                     transform = _substitution_udf(
                         effective_semantic, domains[reference], key, opts, frame.schema[name].dataType
                     )
@@ -110,19 +154,58 @@ def substitute(  # noqa: PLR0912
                         .drop(original, surrogate)
                     )
                 count = frame.where(F.col(name).isNotNull() & (F.col(name).cast("string") != "")).count()
+                report = _report(
+                    table_name,
+                    name,
+                    effective_semantic,
+                    domains[reference],
+                    count,
+                    collision_counts.get(domains[reference], 0),
+                    None,
+                )
+                if date_shift_key is not None:
+                    report["date_shift_key"] = date_shift_key
+                reports.append(report)
+            elif current_semantic is not None:
                 reports.append(
-                    _report(
-                        table_name,
-                        name,
-                        effective_semantic,
-                        domains[reference],
-                        count,
-                        collision_counts.get(domains[reference], 0),
-                        None,
-                    )
+                    {
+                        **_report(table_name, name, current_semantic, domains[reference], 0, 0, None),
+                        "skipped_reason": "quasi_identifier_unchanged",
+                    }
                 )
         output[table_name] = result
     return SubstitutionResult(tables=output, report={"columns": reports})
+
+
+def _requires_substitution(semantic: Semantic) -> bool:
+    return semantic.sensitivity != Sensitivity.QUASI_IDENTIFIER or semantic.pii_class == PiiClass.DATE_OF_BIRTH
+
+
+def _profile_columns(profile: Profile) -> Iterator[tuple[str, str, ColumnProfile]]:
+    def descendants(table_name: str, path: str, column: ColumnProfile) -> Iterator[tuple[str, str, ColumnProfile]]:
+        yield table_name, path, column
+        for child in column.children or []:
+            yield from descendants(table_name, f"{path}.{child.name}", child)
+
+    for table in profile.tables:
+        for column in table.columns:
+            yield from descendants(table.name, column.name, column)
+
+
+def _entity_columns(profile: Profile, table_name: str) -> list[str]:
+    tables = {table.name: table for table in profile.tables}
+    table = tables[table_name]
+    if table.primary_key is not None:
+        return table.primary_key.columns
+    for relationship in profile.relationships or []:
+        parent = tables[relationship.parent_table]
+        if (
+            relationship.child_table == table_name
+            and parent.primary_key is not None
+            and relationship.parent_columns == parent.primary_key.columns
+        ):
+            return relationship.child_columns
+    return []
 
 
 def _build_mapping(
@@ -136,46 +219,114 @@ def _build_mapping(
     values: DataFrame | None = None
     for reference in members:
         table, column = reference.split(".", maxsplit=1)
-        selected = (
-            tables[table]
-            .select(F.col(column).cast("string").alias("original"))
-            .where(F.col("original").isNotNull() & (F.col("original") != ""))
-        )
+        selected = _leaf_values(tables[table], column)
         values = selected if values is None else values.union(selected)
     if values is None:
         raise ValueError(f"domain {domain!r} has no columns")
-    mapping = values.distinct().withColumn("counter", F.lit(0)).cache()
+    mapping = values.distinct().withColumn("counter", F.lit(0))
+    _check_surrogate_capacity(mapping, semantic, members)
     make = F.udf(
         lambda value, counter: _mapping_surrogate(semantic.pii_class, value, domain, key, options, counter),
         T.StringType(),
     )
-    collisions_resolved = 0
-    for _ in range(100):
-        candidate = mapping.withColumn("surrogate", make("original", "counter"))
-        duplicates = candidate.groupBy("surrogate").count().where(F.col("count") > 1).select("surrogate")
-        originals = values.select(F.col("original").alias("existing_original")).distinct()
-        survivors = candidate.join(originals, F.col("surrogate") == F.col("existing_original"), "inner").select(
-            "surrogate"
+    candidate = mapping.withColumn("surrogate", make("original", "counter"))
+    duplicates = candidate.groupBy("surrogate").count().where(F.col("count") > 1).select("surrogate")
+    originals = values.select(F.col("original").alias("existing_original")).distinct()
+    survivors = candidate.join(originals, F.col("surrogate") == F.col("existing_original"), "inner").select("surrogate")
+    if duplicates.union(survivors).limit(1).count() == 0:
+        return candidate.select("original", "surrogate"), 0
+    return _resolve_collisions(values, semantic, domain, key, options, members[0])
+
+
+def _resolve_collisions(
+    values: DataFrame,
+    semantic: Semantic,
+    domain: str,
+    key: bytes,
+    options: SubstitutionOptions,
+    column: str,
+) -> tuple[DataFrame, int]:
+    originals = values.distinct().localCheckpoint(eager=True)
+    make = F.udf(
+        lambda value, counter: _mapping_surrogate(semantic.pii_class, value, domain, key, options, counter),
+        T.StringType(),
+    )
+    initial = originals.withColumn("counter", F.lit(0)).withColumn("surrogate", make("original", "counter"))
+    duplicate_surrogates = initial.groupBy("surrogate").count().where(F.col("count") > 1).select("surrogate")
+    duplicate_originals = initial.join(duplicate_surrogates, "surrogate", "inner").select("original")
+    survivor_originals = initial.join(
+        originals.select(F.col("original").alias("existing")), F.col("surrogate") == F.col("existing"), "inner"
+    ).select("original")
+    rehash = duplicate_originals.union(survivor_originals).distinct().localCheckpoint(eager=True)
+    collisions = rehash.count()
+    assigned = initial.join(rehash, "original", "left_anti").select("original", "surrogate").localCheckpoint(eager=True)
+    unresolved = rehash.withColumn("counter", F.lit(1)).select("original", "counter").localCheckpoint(eager=True)
+    attempts = min(100_000, max(256, 2 ** min(options.surrogate_bits, 16)))
+    for _ in range(attempts):
+        if unresolved.limit(1).count() == 0:
+            return assigned, collisions
+        proposals = unresolved.withColumn("surrogate", make("original", "counter"))
+        proposals = proposals.join(
+            originals.select(F.col("original").alias("existing")),
+            F.col("surrogate") == F.col("existing"),
+            "left_anti",
+        ).join(assigned.select("surrogate"), "surrogate", "left_anti")
+        winners = (
+            proposals.withColumn("rank", F.row_number().over(Window.partitionBy("surrogate").orderBy("original")))
+            .where(F.col("rank") == 1)
+            .select("original", "surrogate")
+            .localCheckpoint(eager=True)
         )
-        collided = duplicates.union(survivors).distinct()
-        collision_count = collided.count()
-        if collision_count == 0:
-            mapping.unpersist()
-            return candidate.select("original", "surrogate"), collisions_resolved
-        updated = candidate.join(collided.withColumn("collided", F.lit(True)), "surrogate", "left").withColumn(
-            "__rank", F.row_number().over(Window.partitionBy("surrogate").orderBy("original"))
+        next_unresolved = (
+            unresolved.join(winners.select("original"), "original", "left_anti")
+            .withColumn("counter", F.col("counter") + 1)
+            .localCheckpoint(eager=True)
         )
-        updated = updated.withColumn(
-            "counter",
-            F.when(F.col("collided") & (F.col("__rank") > 1), F.col("counter") + F.col("__rank") - 1).otherwise(
-                F.col("counter")
-            ),
-        )
-        collisions_resolved += updated.where(F.col("collided") & (F.col("__rank") > 1)).count()
-        mapping.unpersist()
-        mapping = updated.select("original", "counter").cache()
-    mapping.unpersist()
-    raise RuntimeError(f"could not resolve surrogate collisions in domain {domain!r}")
+        next_assigned = assigned.union(winners).localCheckpoint(eager=True)
+        unresolved.unpersist()
+        assigned.unpersist()
+        unresolved, assigned = next_unresolved, next_assigned
+    raise ValueError(f"surrogate space is too small to preserve distinct values for column {column!r}")
+
+
+def _leaf_values(frame: DataFrame, path: str) -> DataFrame:
+    parts = path.split(".")
+    data_type = frame.schema[parts[0]].dataType
+    values = frame.select(F.col(parts[0]).alias("__value"))
+    for part in parts[1:]:
+        if isinstance(data_type, T.StructType):
+            data_type = data_type[part].dataType
+            values = values.select(F.col("__value").getField(part).alias("__value"))
+        elif isinstance(data_type, T.ArrayType) and part == "element":
+            data_type = data_type.elementType
+            values = values.select(F.explode_outer("__value").alias("__value"))
+        elif isinstance(data_type, T.MapType) and part in {"key", "value"}:
+            data_type = data_type.keyType if part == "key" else data_type.valueType
+            values = values.select(F.explode_outer(F.map_entries("__value")).alias("__entry")).select(
+                F.col("__entry").getField(part).alias("__value")
+            )
+        else:
+            raise ValueError(f"invalid nested column path {path!r}")
+    return values.select(F.col("__value").cast("string").alias("original")).where(
+        F.col("original").isNotNull() & (F.col("original") != "")
+    )
+
+
+def _check_surrogate_capacity(mapping: DataFrame, semantic: Semantic, members: list[str]) -> None:
+    if semantic.pii_class not in {PiiClass.ACCOUNT_ID, PiiClass.SECRET_TOKEN}:
+        return
+    stats = mapping.agg(
+        F.count("original").alias("count"),
+        F.min(F.length("original")).alias("min_length"),
+        F.max(F.length("original")).alias("max_length"),
+        F.min(F.col("original").rlike(r"^\d+$").cast("int")).alias("all_digits"),
+    ).first()
+    if stats is None or not stats.all_digits or stats.min_length != stats.max_length:
+        return
+    count = int(stats["count"])
+    available = 10 ** int(stats["min_length"]) - count
+    if count > available:
+        raise ValueError(f"surrogate space is too small to preserve distinct values for column {members[0]!r}")
 
 
 def _mapping_surrogate(
@@ -195,7 +346,7 @@ def _mapping_surrogate(
 
 
 def _domains(profile: Profile, options: SubstitutionOptions) -> dict[str, str]:
-    references = {f"{table.name}.{column.name}" for table in profile.tables for column in table.columns}
+    references = {f"{table}.{path}" for table, path, _ in _profile_columns(profile)}
     parent = {reference: reference for reference in references}
 
     def find(reference: str) -> str:
@@ -246,7 +397,68 @@ def _substitution_udf(
             return value + timedelta(days=int.from_bytes(digest, "big") % width - options.date_shift_days)
         return _surrogate(semantic.pii_class, str(value), domain, key, options)
 
-    return F.udf(replace, data_type)
+    return F.udf(replace, data_type, useArrow=False)
+
+
+def _date_shift_udf(domain: str, key: bytes, date_shift_days: int) -> Callable[..., Column]:
+    def replace(value: date | None, *entity: object) -> date | None:
+        if value is None:
+            return None
+        identity = (
+            "\u001f".join(str(item) for item in entity)
+            if entity and all(item is not None for item in entity)
+            else value.isoformat()
+        )
+        digest = _digest(key, f"{domain}:entity", identity)
+        width = date_shift_days * 2 + 1
+        return value + timedelta(days=int.from_bytes(digest, "big") % width - date_shift_days)
+
+    return F.udf(replace, T.DateType(), useArrow=False)
+
+
+def _nested_substitution_udf(
+    data_type: T.DataType,
+    specifications: list[tuple[str, Semantic, str]],
+    key: bytes,
+    options: SubstitutionOptions,
+) -> Callable[..., Column]:
+    semantics = {tuple(path.split(".")): (semantic, domain) for path, semantic, domain in specifications}
+
+    def transform(value: object, kind: T.DataType, path: tuple[str, ...]) -> object:  # noqa: PLR0911
+        specification = semantics.get(path)
+        if specification is not None:
+            semantic, domain = specification
+            if value is None or str(value) == "":
+                return value
+            if semantic.pii_class == PiiClass.FREE_TEXT_PII:
+                return _replace_spans(str(value), domain, key, options)
+            return _mapping_surrogate(semantic.pii_class, str(value), domain, key, options, 0)
+        if isinstance(kind, T.StructType):
+            source = value.asDict(recursive=False) if hasattr(value, "asDict") else value
+            return {
+                field.name: transform(source[field.name], field.dataType, (*path, field.name)) for field in kind.fields
+            }
+        if isinstance(kind, T.ArrayType):
+            return (
+                [transform(item, kind.elementType, (*path, "element")) for item in value]
+                if isinstance(value, list | tuple)
+                else value
+            )
+        if isinstance(kind, T.MapType):
+            if isinstance(value, dict):
+                return {
+                    transform(item_key, kind.keyType, (*path, "key")): transform(
+                        item_value, kind.valueType, (*path, "value")
+                    )
+                    for item_key, item_value in value.items()
+                }
+            return value
+        return value
+
+    def replace(value: object) -> object:
+        return None if value is None else transform(value, data_type, ())
+
+    return F.udf(replace, data_type, useArrow=False)
 
 
 def _digest(key: bytes, domain: str, value: str, bits: int = 256, counter: int = 0) -> bytes:
@@ -267,19 +479,23 @@ def _surrogate(  # noqa: PLR0911
     token = digest.hex()
     if kind == PiiClass.EMAIL:
         domain_part = value.rpartition("@")[2] if options.keep_email_domain and "@" in value else "masked.invalid"
-        return f"u{token[: max(8, min(24, len(value) - len(domain_part) - 1))]}@{domain_part}"
+        if len(value) - len(domain_part) - 1 < 1:
+            domain_part = "x.co"
+        local_length = max(1, len(value) - len(domain_part) - 1)
+        local = ("u" + token * local_length)[:local_length]
+        return f"{local}@{domain_part}"
     if kind == PiiClass.PHONE:
         digits = re.sub(r"\D", "", value)
         generated = str(number).zfill(len(digits))[-len(digits) :]
+        country_length = 0
         if value.startswith("+"):
             country_length = max(1, len(digits) - 10)
-            generated = digits[:country_length] + generated[country_length:]
+        area_end = min(len(digits), country_length + 3)
+        generated = digits[:area_end] + generated[area_end:]
         nanp_offset = len(generated) - 10
         if len(generated) >= 10 and (len(generated) == 10 or generated[:nanp_offset] == "1"):
             generated = (
-                generated[:nanp_offset]
-                + str(int(generated[nanp_offset]) % 8 + 2)
-                + generated[nanp_offset + 1 : nanp_offset + 3]
+                generated[: nanp_offset + 3]
                 + str(int(generated[nanp_offset + 3]) % 8 + 2)
                 + generated[nanp_offset + 4 :]
             )

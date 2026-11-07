@@ -65,6 +65,11 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_input_arguments(substitute)
     substitute.add_argument("--profile", type=Path, required=True, help="Profile JSON file.")
     substitute.add_argument("--key-file", type=Path, required=True, help="File containing the substitution key.")
+    substitute.add_argument(
+        "--allow-insecure-key-file",
+        action="store_true",
+        help="Allow a key file readable by group or other users.",
+    )
     substitute.add_argument("-o", "--output", type=Path, required=True, help="Output directory.")
     substitute.set_defaults(handler=_pii_substitute)
     return parser
@@ -164,9 +169,9 @@ def _pii_detect(args: argparse.Namespace) -> int:
 def _pii_substitute(args: argparse.Namespace) -> int:
     """Substitutes PII in input tables and writes Parquet outputs and a report."""
     try:
+        key = _read_key(args.key_file, allow_insecure=args.allow_insecure_key_file)
         _, tables = _spark_inputs(args)
         profile = load_profile(args.profile.read_text(encoding="utf-8"), strict=True)
-        key = args.key_file.read_bytes()
         substitute = import_module("dbldatagen_profiler.pii").substitute
         result = substitute(tables, profile, key=key)
         args.output.mkdir(parents=True, exist_ok=True)
@@ -177,6 +182,16 @@ def _pii_substitute(args: argparse.Namespace) -> int:
         print(f"dbldatagen-profile pii substitute: {error}", file=sys.stderr)
         return 1
     return 0
+
+
+def _read_key(path: Path, *, allow_insecure: bool) -> bytes:
+    """Reads a substitution key after validating its length and file permissions."""
+    if path.stat().st_mode & 0o077 and not allow_insecure:
+        raise ValueError("key file is readable by group or other users; use --allow-insecure-key-file to override")
+    key = path.read_bytes()
+    if len(key) < 32:
+        raise ValueError("key file must contain at least 32 bytes")
+    return key
 
 
 def _parse_table(value: str) -> tuple[str, str]:

@@ -134,6 +134,12 @@ Substitution uses HMAC-SHA256 domains. Relationship-linked columns share a domai
 nulls and empty strings are unchanged. Quasi-identifiers remain unchanged unless explicitly generalized through the
 Python API. Email domains are replaced by default because they may identify a group.
 
+Format preservation also preserves value length, so length remains visible. HMAC substitution of low-entropy values
+such as SSNs and phone numbers is safe only while the key remains secret: keep the key under restricted custody and
+rotate it when access changes. The CLI requires a key of at least 32 bytes in a file unreadable by group or other
+users unless `--allow-insecure-key-file` is explicitly supplied. Names and street addresses embedded in free text are
+not currently detected or replaced; validator-shaped spans such as emails, phones, cards, IDs, and IP addresses are.
+
 ### Versioning
 
 `spec_version` follows `major.minor.patch`, and the major version is fixed by the JSON Schema (`^0\.` for this
