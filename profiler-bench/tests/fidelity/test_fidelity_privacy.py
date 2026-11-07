@@ -1,4 +1,5 @@
 import re
+import time
 
 import pandas as pd
 import pytest
@@ -8,7 +9,7 @@ from pyspark.sql import functions as F
 from dbldatagen_profiler.engines.spark import profile_tables
 from dbldatagen_profiler.model import Profile
 from profiler_bench.catalog import load, materialize
-from profiler_bench.fidelity import PrivacyScore, privacy, score_privacy, stats
+from profiler_bench.fidelity import PrivacyScore, privacy, regex, score_privacy, stats
 
 
 def _checks(score: PrivacyScore) -> dict[str, bool]:
@@ -160,6 +161,25 @@ def test_broad_patterns_are_not_flagged(spark: SparkSession, real: dict[str, Dat
     )
     score = score_privacy(real, _independent(spark), broad, materialize("retail", "xs", 0).manifest)
     assert score.passed, [c for c in score.checks if not c.passed]
+
+
+def test_dfa_budget_rejects_adversarial_pattern(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    adversarial = r"(a|b)*a(a|b){25}"
+    started = time.perf_counter()
+    first = regex.count_matches(adversarial, 21, 29, max_dfa_states=10_000)
+    second = regex.count_matches(adversarial, 21, 29, max_dfa_states=10_000)
+    assert time.perf_counter() - started < 1.0
+    assert first is regex.BUDGET_EXCEEDED
+    assert second is regex.BUDGET_EXCEEDED
+
+    leaky = _with_patterns(profile, "customers", "email", [adversarial])
+    score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+    detail = {c.name: c for c in score.checks}
+    assert detail["profile.sensitive_value_leaks"].detail["regex_budget_exceeded"] == 1.0
+    assert detail["profile.k_threshold"].detail["regex_budget_exceeded"] == 1.0
+    assert not score.passed
 
 
 def test_partial_row_copying_is_detected(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:

@@ -88,8 +88,12 @@ def score_privacy(
         checks += _table_checks(table, real[table.name], synth[table.name], holdout[table.name], keys, seed, config)
     risks = _pattern_risks(profile, config)
     leaks = _profile_leaks(profile, manifest, real, risks, seed, config.sampling.privacy_rows)
-    checks.append(_at_most("profile.sensitive_value_leaks", sum(leaks.values()), limits.max_profile_leaks, leaks))
     violations = _k_violations(profile, real, risks, seed, config.sampling.privacy_rows)
+    budget_hits = float(sum(1 for r in risks.values() if r.budget_exceeded))
+    if budget_hits:
+        leaks = {**leaks, "regex_budget_exceeded": budget_hits}
+        violations = {**violations, "regex_budget_exceeded": budget_hits}
+    checks.append(_at_most("profile.sensitive_value_leaks", sum(leaks.values()), limits.max_profile_leaks, leaks))
     checks.append(_at_most("profile.k_threshold", sum(violations.values()), limits.max_k_violations, violations))
     return PrivacyScore(
         dataset=manifest.dataset,
@@ -378,11 +382,14 @@ class _PatternRisk:
         small: Whether it matches fewer than max(k, `privacy.min_regex_language`) strings within its column's length
             range, so its matches are as good as literals.
         literals: Literal factors at least `privacy.min_literal_len` long that every match contains.
+        budget_exceeded: Whether language counting exhausted the DFA state/work budget; treated as an unconditional
+            privacy failure with reason `regex_budget_exceeded`.
     """
 
     compiled: re.Pattern[str]
     small: bool
     literals: tuple[str, ...]
+    budget_exceeded: bool = False
 
 
 def _pattern_risks(profile: Profile, config: MetricsConfig) -> dict[tuple[str, str, int], _PatternRisk]:
@@ -401,12 +408,18 @@ def _pattern_risks(profile: Profile, config: MetricsConfig) -> dict[tuple[str, s
                 length = stats_.length if stats_ else None
                 low = length.min if length and length.min is not None else 0
                 high = length.max if length and length.max is not None else limits.max_regex_length
+                budget_exceeded = False
                 try:
-                    small = regex.count_matches(pattern.regex, low, high) < limit
+                    counted = regex.count_matches(pattern.regex, low, high, max_dfa_states=limits.max_dfa_states)
                 except regex.UnsupportedForCount:
                     small = True
+                else:
+                    if isinstance(counted, int):
+                        small = counted < limit
+                    else:
+                        small, budget_exceeded = False, True
                 literals = tuple(f for f in regex.required_literals(pattern.regex) if len(f) >= limits.min_literal_len)
-                risks[(table.name, path, i)] = _PatternRisk(compiled, small, literals)
+                risks[(table.name, path, i)] = _PatternRisk(compiled, small, literals, budget_exceeded)
     return risks
 
 

@@ -97,6 +97,13 @@ def test_count_matches_respects_length_bounds() -> None:
     assert regex.count_matches(r"[ab]+", 2, 3) == 4 + 8
 
 
+def test_count_matches_returns_budget_sentinel_deterministically() -> None:
+    pattern = r"(a|b)*a(a|b){25}"
+    assert regex.count_matches(pattern, 0, 64, max_dfa_states=100) is regex.BUDGET_EXCEEDED
+    assert regex.count_matches(pattern, 0, 64, max_dfa_states=100) is regex.BUDGET_EXCEEDED
+    assert regex.count_matches(r"[A-Z]{3}-\d{4}", 0, 40) == 26**3 * 10**4
+
+
 @pytest.mark.parametrize(
     ("pattern", "required"),
     [

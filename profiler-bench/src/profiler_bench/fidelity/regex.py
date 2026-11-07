@@ -142,6 +142,9 @@ def _literals(items: Sequence[tuple[Any, Any]], runs: list[str]) -> None:
 UNICODE = 2**16
 COUNT_CAP = 10**12
 WIDE_RANGE = 256
+DEFAULT_MAX_DFA_STATES = 10_000
+# Transition expansions checked per DFA state; keeps subset construction bounded even when few states fan out widely.
+DFA_WORK_PER_STATE = 64
 CATEGORY_CHARS = {
     "CATEGORY_DIGIT": string.digits,
     "CATEGORY_WORD": string.ascii_letters + string.digits + "_",
@@ -155,13 +158,31 @@ class UnsupportedForCount(ValueError):
     """The regex uses a construct (such as a back-reference) whose language cannot be counted."""
 
 
-def count_matches(regex: str, min_length: int, max_length: int, cap: int = COUNT_CAP) -> int:
+class _BudgetExceeded:
+    """Sentinel returned when DFA subset construction exhausts its state or transition-work budget."""
+
+    def __repr__(self) -> str:
+        return "BUDGET_EXCEEDED"
+
+
+BUDGET_EXCEEDED = _BudgetExceeded()
+
+
+def count_matches(
+    regex: str,
+    min_length: int,
+    max_length: int,
+    cap: int = COUNT_CAP,
+    max_dfa_states: int = DEFAULT_MAX_DFA_STATES,
+) -> int | _BudgetExceeded:
     """Returns how many distinct strings with a length in [min_length, max_length] fully match `regex`, at most `cap`.
 
     The regex is compiled to an automaton over character classes and determinized, so each string is one path and
     syntactic alternatives that match the same strings are not counted twice. Characters outside the regex's explicit
     characters count as one class of 2**16 minus those; a range wider than 256 characters, `.`, and lookarounds are
-    widened to every character, which can only overcount.
+    widened to every character, which can only overcount. Subset construction is bounded by `max_dfa_states` and a
+    transition-work budget of `max_dfa_states * DFA_WORK_PER_STATE`; when either is exhausted the sentinel
+    `BUDGET_EXCEEDED` is returned.
 
     Raises:
         UnsupportedForCount: If the regex does not parse or uses back-references.
@@ -174,7 +195,7 @@ def count_matches(regex: str, min_length: int, max_length: int, cap: int = COUNT
     start = nfa.state()
     end = nfa.build(items, start)
     classes = _classes(nfa.sets)
-    return _count(nfa, start, end, classes, min_length, max_length, cap)
+    return _count(nfa, start, end, classes, min_length, max_length, cap, max_dfa_states)
 
 
 class _Nfa:
@@ -319,18 +340,31 @@ def _count(
     min_length: int,
     max_length: int,
     cap: int,
-) -> int:
+    max_dfa_states: int,
+) -> int | _BudgetExceeded:
     transitions: dict[frozenset[int], list[tuple[frozenset[int], int]]] = {}
+    max_work = max_dfa_states * DFA_WORK_PER_STATE
+    work = 0
+    exceeded = False
 
     def step(state: frozenset[int]) -> list[tuple[frozenset[int], int]]:
-        if state not in transitions:
-            moves: dict[frozenset[int], int] = {}
-            for size, member in classes:
-                targets = {t for s in state for setid, t in nfa.edges[s] if member[setid]}
-                if targets:
-                    target = _closure(nfa, targets)
-                    moves[target] = moves.get(target, 0) + size
-            transitions[state] = list(moves.items())
+        nonlocal work, exceeded
+        if state in transitions:
+            return transitions[state]
+        if len(transitions) >= max_dfa_states:
+            exceeded = True
+            return []
+        moves: dict[frozenset[int], int] = {}
+        for size, member in classes:
+            work += max(1, len(state))
+            if work > max_work:
+                exceeded = True
+                return []
+            targets = {t for s in state for setid, t in nfa.edges[s] if member[setid]}
+            if targets:
+                target = _closure(nfa, targets)
+                moves[target] = moves.get(target, 0) + size
+        transitions[state] = list(moves.items())
         return transitions[state]
 
     counts = {_closure(nfa, {start}): 1}
@@ -344,6 +378,8 @@ def _count(
         for state, n in counts.items():
             for target, size in step(state):
                 following[target] = min(cap, following.get(target, 0) + n * size)
+            if exceeded:
+                return BUDGET_EXCEEDED
         counts = following
         if not counts:
             break
