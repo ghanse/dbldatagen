@@ -130,10 +130,12 @@ def test_every_count_entry_point_takes_the_budget() -> None:
     [
         (r"(j)(o)(h)(n)[a-z]{0,20}@x\.com", ["@x.com", "john"]),
         (r"^[j][o](h)n$", ["john"]),
-        (r"(j|J)(o)(h)(n)", ["ohn"]),
+        (r"(j|J)(o)(h)(n)", ["john"]),
         (r"(ab){2}c|xababc", ["ababc"]),
         (r"[A-Z]{3}-\d{4}", ["-"]),
         (r"x?(abcd)+", ["abcd"]),
+        (r"[jJ][oO][hH][nN][@][xX][.][cC][oO][mM]", ["john@x.com"]),
+        (r"[jJ][oO][hH][nN]@x\.com.*", ["john@x.com"]),
     ],
 )
 def test_required_literals(pattern: str, required: list[str]) -> None:

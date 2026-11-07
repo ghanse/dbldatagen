@@ -420,10 +420,11 @@ def _count(
 def required_literals(regex: str) -> list[str]:
     """Returns literal strings that every full match of `regex` contains, longest runs first.
 
-    Groups are flattened, single-character classes such as `[j]` become literals, anchors are dropped, and a repeat
-    with a fixed count of an exact string becomes that string repeated. A repeat that may occur zero times, a class
-    of several characters, or an alternation ends a run; an alternation contributes the runs every branch shares.
-    A regex that does not parse requires itself.
+    Groups are flattened, single-character classes such as `[j]` become literals, and a class of the two cases of one
+    letter such as `[jJ]` becomes that letter in lowercase (matched case-insensitively by callers). Anchors are
+    dropped, and a repeat with a fixed count of an exact string becomes that string repeated. A repeat that may occur
+    zero times, a class of several characters, or an alternation ends a run; an alternation contributes the runs every
+    branch shares. A regex that does not parse requires itself.
     """
     try:
         items = _parser.parse(regex)
@@ -442,6 +443,23 @@ def _flatten(items: Sequence[tuple[Any, Any]]) -> list[tuple[Any, Any]]:
     return flat
 
 
+def _exact_class(items: Sequence[tuple[Any, Any]]) -> str | None:
+    """Returns the literal a character class always matches, or None if it can match more than one character."""
+    if any(op.name == "NEGATE" for op, _ in items):
+        return None
+    chars: list[str] = []
+    for op, av in items:
+        if op.name == "LITERAL":
+            chars.append(chr(av))
+        else:
+            return None
+    if len(chars) == 1:
+        return chars[0]
+    if len(chars) == 2 and chars[0].isalpha() and chars[0].lower() == chars[1].lower():
+        return chars[0].lower()
+    return None
+
+
 def _exact(item: tuple[Any, Any]) -> str | None:
     op, av = item
     name = op.name
@@ -449,8 +467,8 @@ def _exact(item: tuple[Any, Any]) -> str | None:
         return chr(av)
     if name in ("AT", "ASSERT", "ASSERT_NOT"):
         return ""
-    if name == "IN" and len(av) == 1 and av[0][0].name == "LITERAL":
-        return chr(av[0][1])
+    if name == "IN":
+        return _exact_class(av)
     if name == "BRANCH":
         options = {_exact_sequence(branch) for branch in av[1]}
         return options.pop() if len(options) == 1 and None not in options else None

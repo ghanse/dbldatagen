@@ -87,12 +87,15 @@ def score_privacy(
         }
         checks += _table_checks(table, real[table.name], synth[table.name], holdout[table.name], keys, seed, config)
     risks = _pattern_risks(profile, config)
-    leaks = _profile_leaks(profile, manifest, real, risks, seed, config.sampling.privacy_rows)
-    violations = _k_violations(profile, real, risks, seed, config.sampling.privacy_rows)
+    leaks = _profile_leaks(profile, manifest, real, risks, seed, config)
+    violations = _k_violations(profile, real, risks, seed, config)
     budget_hits = float(sum(1 for r in risks.values() if r.budget_exceeded))
     if budget_hits:
-        leaks = {**leaks, "regex_budget_exceeded": budget_hits}
-        violations = {**violations, "regex_budget_exceeded": budget_hits}
+        leaks = {**leaks, "regex_budget_exceeded": leaks.get("regex_budget_exceeded", 0.0) + budget_hits}
+        violations = {
+            **violations,
+            "regex_budget_exceeded": violations.get("regex_budget_exceeded", 0.0) + budget_hits,
+        }
     checks.append(_at_most("profile.sensitive_value_leaks", sum(leaks.values()), limits.max_profile_leaks, leaks))
     checks.append(_at_most("profile.k_threshold", sum(violations.values()), limits.max_k_violations, violations))
     return PrivacyScore(
@@ -379,15 +382,15 @@ class _PatternRisk:
 
     Attributes:
         compiled: The regex.
-        small: Whether it matches fewer than max(k, `privacy.min_regex_language`) strings within its column's length
-            range, so its matches are as good as literals.
-        literals: Literal factors at least `privacy.min_literal_len` long that every match contains.
-        budget_exceeded: Whether language counting exhausted the DFA state/work budget; treated as an unconditional
-            privacy failure with reason `regex_budget_exceeded`.
+        pattern: The regex source, for value-anchored language counting.
+        literals: Literal factors at least `privacy.min_literal_len` long that every match contains (case-folded for
+            single-letter case classes such as `[jJ]`).
+        budget_exceeded: Whether a probe count up to `privacy.max_regex_length` exhausted the shared work budget;
+            treated as an unconditional privacy failure with reason `regex_budget_exceeded`.
     """
 
     compiled: re.Pattern[str]
-    small: bool
+    pattern: str
     literals: tuple[str, ...]
     budget_exceeded: bool = False
 
@@ -395,7 +398,6 @@ class _PatternRisk:
 def _pattern_risks(profile: Profile, config: MetricsConfig) -> dict[tuple[str, str, int], _PatternRisk]:
     """Returns the risk of every profile regex, keyed by table, column path, and pattern index."""
     limits = config.privacy
-    limit = max(float(profile.privacy.min_value_count), limits.min_regex_language)
     risks = {}
     for table in profile.tables:
         for path, column in _profile_paths(table.columns, ""):
@@ -405,26 +407,44 @@ def _pattern_risks(profile: Profile, config: MetricsConfig) -> dict[tuple[str, s
                     compiled = re.compile(pattern.regex)
                 except re.error:
                     continue
-                length = stats_.length if stats_ else None
-                low = length.min if length and length.min is not None else 0
-                declared_high = length.max if length and length.max is not None else None
-                # Clamp the counting bound; a declared max above the clamp is unbounded / "large".
-                high = limits.max_regex_length if declared_high is None else min(declared_high, limits.max_regex_length)
-                above_clamp = declared_high is not None and declared_high > limits.max_regex_length
-                budget_exceeded = False
+                # Probe with the config length cap only (never the profile's attacker-controlled length.max).
                 try:
-                    counted = regex.count_matches(pattern.regex, low, high, max_dfa_states=limits.max_dfa_states)
+                    probed = regex.count_matches(
+                        pattern.regex, 0, limits.max_regex_length, max_dfa_states=limits.max_dfa_states
+                    )
+                    budget_exceeded = probed is regex.BUDGET_EXCEEDED
                 except regex.UnsupportedForCount:
-                    small = True
-                else:
-                    if isinstance(counted, int):
-                        # Cap hits and lengths above the clamp are "large": safe, must not be treated as small.
-                        small = not above_clamp and counted < limit and counted < regex.COUNT_CAP
-                    else:
-                        small, budget_exceeded = False, True
+                    budget_exceeded = False
                 literals = tuple(f for f in regex.required_literals(pattern.regex) if len(f) >= limits.min_literal_len)
-                risks[(table.name, path, i)] = _PatternRisk(compiled, small, literals, budget_exceeded)
+                risks[(table.name, path, i)] = _PatternRisk(compiled, pattern.regex, literals, budget_exceeded)
     return risks
+
+
+def _language_vs_value(
+    pattern: str,
+    value: str,
+    *,
+    limit: float,
+    max_length: int,
+    max_dfa_states: int,
+    cache: dict[tuple[str, int], int | regex._BudgetExceeded],
+) -> str:
+    """Returns `small`, `large`, or `budget` for `pattern` relative to a real value it fully matches.
+
+    Counts distinct matches of length at most min(len(value), max_length). A count below `limit` is a leak; exhausting
+    the shared work budget is reported as `budget`.
+    """
+    high = min(len(value), max_length)
+    key = (pattern, high)
+    if key not in cache:
+        try:
+            cache[key] = regex.count_matches(pattern, 0, high, max_dfa_states=max_dfa_states)
+        except regex.UnsupportedForCount:
+            cache[key] = 0
+    counted = cache[key]
+    if counted is regex.BUDGET_EXCEEDED:
+        return "budget"
+    return "small" if isinstance(counted, int) and counted < limit else "large"
 
 
 def _profile_paths(columns: Sequence[ColumnProfile], prefix: str) -> Iterator[tuple[str, ColumnProfile]]:
@@ -434,12 +454,18 @@ def _profile_paths(columns: Sequence[ColumnProfile], prefix: str) -> Iterator[tu
 
 
 def _rare_literals(rows: DataFrame, literals: set[str], k: int) -> set[str]:
-    """Returns the literals contained in at least one but fewer than `k` of the rows' values (column `v`)."""
+    """Returns the literals contained in at least one but fewer than `k` of the rows' values (column `v`).
+
+    Comparison is case-insensitive so single-letter case classes folded by `required_literals` still match.
+    """
     if not literals:
         return set()
     text = rows.selectExpr("CAST(v AS STRING) AS v").dropna()
     counts = text.agg(
-        *(F.sum((F.instr("v", F.lit(f)) > 0).cast("long")).alias(f"l{i}") for i, f in enumerate(literals))
+        *(
+            F.sum((F.instr(F.lower("v"), F.lit(f.lower())) > 0).cast("long")).alias(f"l{i}")
+            for i, f in enumerate(literals)
+        )
     )
     row = counts.collect()[0]
     return {f for i, f in enumerate(literals) if 0 < (row[f"l{i}"] or 0) < k}
@@ -457,24 +483,28 @@ def _profile_leaks(
     real: Mapping[str, DataFrame],
     risks: Mapping[tuple[str, str, int], _PatternRisk],
     seed: int,
-    cap: int,
+    config: MetricsConfig,
 ) -> dict[str, float]:
     """Counts sensitive real values the profile gives away, per column.
 
     A value leaks when it equals a string of the profile JSON or a literal run of a profile regex (checked on every
-    value), when a small-language profile regex fully matches it, or when it contains a literal that some profile
-    regex requires of every match and that fewer than k real rows of the column contain (both checked on a seeded
-    sample of the column's values). A literal shared by k or more rows, such as an email domain, does not single a
-    value out.
+    value), when a profile regex fully matches it and has fewer than max(k, `privacy.min_regex_language`) strings of
+    length at most min(len(value), `privacy.max_regex_length`), or when it contains a literal that some profile regex
+    requires of every match and that fewer than k real rows of the column contain (both checked on a seeded sample of
+    the column's values). A literal shared by k or more rows, such as an email domain, does not single a value out.
     """
     k = profile.privacy.min_value_count
+    limits = config.privacy
+    limit = max(float(k), limits.min_regex_language)
+    cap = config.sampling.privacy_rows
     strings = sorted(_profile_strings(profile))
     if not real:
         return {}
     session = next(iter(real.values())).sparkSession
     candidates = F.broadcast(session.createDataFrame([(s,) for s in strings], "c string"))
-    small = [r.compiled for r in risks.values() if r.small]
     literals = {f for r in risks.values() for f in r.literals}
+    cache: dict[tuple[str, int], int | regex._BudgetExceeded] = {}
+    budget_hits = 0
     leaks: dict[str, float] = {}
     for table in manifest.tables:
         if table.name not in real:
@@ -487,11 +517,29 @@ def _profile_leaks(
             values = rows.distinct()
             exact = {r["v"] for r in values.join(candidates, F.col("c") == F.col("v"), "left_semi").collect()}
             sample = _sample_values(values, cap, seed)
-            matched = {v for v in sample for p in small if p.fullmatch(v)}
-            present = {f for f in literals if any(f in v for v in sample)}
+            matched: set[str] = set()
+            for value in sample:
+                for risk in risks.values():
+                    if not risk.compiled.fullmatch(value):
+                        continue
+                    verdict = _language_vs_value(
+                        risk.pattern,
+                        value,
+                        limit=limit,
+                        max_length=limits.max_regex_length,
+                        max_dfa_states=limits.max_dfa_states,
+                        cache=cache,
+                    )
+                    if verdict == "budget":
+                        budget_hits += 1
+                    elif verdict == "small":
+                        matched.add(value)
+            present = {f for f in literals if any(f.lower() in v.lower() for v in sample)}
             rare = _rare_literals(rows, present, k)
-            contained = {v for v in sample if any(f in v for f in rare)}
+            contained = {v for v in sample if any(f.lower() in v.lower() for f in rare)}
             leaks[f"{table.name}.{path}"] = float(len(exact | matched | contained))
+    if budget_hits:
+        leaks["regex_budget_exceeded"] = float(budget_hits)
     return leaks
 
 
@@ -500,15 +548,20 @@ def _k_violations(
     real: Mapping[str, DataFrame],
     risks: Mapping[tuple[str, str, int], _PatternRisk],
     seed: int,
-    cap: int,
+    config: MetricsConfig,
 ) -> dict[str, float]:
     """Counts literal values of the profile held by fewer than `privacy.min_value_count` real rows, per source.
 
-    Sources are `top_values`, enumeration constraints, the matches of small-language regexes among a seeded sample
-    of the column's values, and the literals a regex requires of every match (see `_PatternRisk`).
+    Sources are `top_values`, enumeration constraints, the matches of value-anchored small-language regexes among a
+    seeded sample of the column's values, and the literals a regex requires of every match (see `_PatternRisk`).
     """
     k = profile.privacy.min_value_count
+    limits = config.privacy
+    limit = max(float(k), limits.min_regex_language)
+    cap = config.sampling.privacy_rows
     violations: dict[str, float] = {}
+    cache: dict[tuple[str, int], int | regex._BudgetExceeded] = {}
+    budget_hits = 0
     try:
         Profile.model_validate(profile.model_dump(mode="json"))
     except ValidationError as error:
@@ -521,13 +574,22 @@ def _k_violations(
         for path, values, column in _literal_columns(df, table.columns):
             if column.string and column.string.top_values:
                 listed.append((f"{path} top_values", values, [v.value for v in column.string.top_values]))
-            for i, _ in enumerate((column.string.patterns or []) if column.string else []):
-                risk = risks.get((table.name, path, i))
-                if risk is not None:
-                    listed += _pattern_literals(f"{path} pattern {i}", values, risk, seed, cap)
-                    rare_literals = _rare_literals(values, set(risk.literals), k)
-                    if rare_literals:
-                        violations[f"{table.name}.{path} pattern {i} literals"] = float(len(rare_literals))
+            budget_hits += _pattern_k_sources(
+                table.name,
+                path,
+                values,
+                column,
+                risks,
+                seed,
+                cap,
+                k,
+                limit,
+                limits.max_regex_length,
+                limits.max_dfa_states,
+                cache,
+                listed,
+                violations,
+            )
         top_level = {c.name for c in table.columns}
         for constraint in table.check_constraints or []:
             if isinstance(constraint, EnumerationConstraint) and constraint.column in top_level:
@@ -546,17 +608,82 @@ def _k_violations(
             rare = sum(1 for literal in set(literals) if counts.get(literal, 0) < k)
             if rare:
                 violations[f"{table.name}.{label}"] = float(rare)
+    if budget_hits:
+        violations["regex_budget_exceeded"] = float(budget_hits)
     return violations
 
 
+def _pattern_k_sources(
+    table: str,
+    path: str,
+    values: DataFrame,
+    column: ColumnProfile,
+    risks: Mapping[tuple[str, str, int], _PatternRisk],
+    seed: int,
+    cap: int,
+    k: int,
+    limit: float,
+    max_length: int,
+    max_dfa_states: int,
+    cache: dict[tuple[str, int], int | regex._BudgetExceeded],
+    listed: list[tuple[str, DataFrame, list[str]]],
+    violations: dict[str, float],
+) -> int:
+    """Appends pattern-derived k-audit sources for one column; returns budget-exceeded hits."""
+    budget_hits = 0
+    for i, _ in enumerate((column.string.patterns or []) if column.string else []):
+        risk = risks.get((table, path, i))
+        if risk is None:
+            continue
+        hits, hit_budget = _pattern_literals(
+            values,
+            risk,
+            seed,
+            cap,
+            limit=limit,
+            max_length=max_length,
+            max_dfa_states=max_dfa_states,
+            cache=cache,
+        )
+        budget_hits += hit_budget
+        if hits:
+            listed.append((f"{path} pattern {i}", values, hits))
+        rare_literals = _rare_literals(values, set(risk.literals), k)
+        if rare_literals:
+            violations[f"{table}.{path} pattern {i} literals"] = float(len(rare_literals))
+    return budget_hits
+
+
 def _pattern_literals(
-    label: str, values: DataFrame, risk: _PatternRisk, seed: int, cap: int
-) -> list[tuple[str, DataFrame, list[str]]]:
-    """Returns the sampled values a small-language regex matches, to be held to the k-threshold like literals."""
-    if not risk.small:
-        return []
-    hits = [v for v in _sample_values(values, cap, seed) if risk.compiled.fullmatch(v)]
-    return [(label, values, hits)] if hits else []
+    values: DataFrame,
+    risk: _PatternRisk,
+    seed: int,
+    cap: int,
+    *,
+    limit: float,
+    max_length: int,
+    max_dfa_states: int,
+    cache: dict[tuple[str, int], int | regex._BudgetExceeded],
+) -> tuple[list[str], int]:
+    """Returns sampled values a value-anchored small-language regex matches, and a budget-exceeded hit count."""
+    hits: list[str] = []
+    budget_hits = 0
+    for value in _sample_values(values, cap, seed):
+        if not risk.compiled.fullmatch(value):
+            continue
+        verdict = _language_vs_value(
+            risk.pattern,
+            value,
+            limit=limit,
+            max_length=max_length,
+            max_dfa_states=max_dfa_states,
+            cache=cache,
+        )
+        if verdict == "budget":
+            budget_hits += 1
+        elif verdict == "small":
+            hits.append(value)
+    return hits, budget_hits
 
 
 def _literal_columns(df: DataFrame, columns: Sequence[ColumnProfile]) -> Iterator[tuple[str, DataFrame, ColumnProfile]]:

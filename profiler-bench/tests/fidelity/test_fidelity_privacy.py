@@ -193,7 +193,7 @@ def test_dfa_budget_rejects_adversarial_pattern(
     assert not score.passed
 
 
-def test_unbounded_declared_length_is_large_not_iterated(
+def test_unbounded_declared_length_does_not_hide_or_iterate(
     spark: SparkSession, real: dict[str, DataFrame], profile: Profile
 ) -> None:
     broad = _with_patterns(profile, "products", "sku", [r"a*"], length_max=10**12)
@@ -201,10 +201,40 @@ def test_unbounded_declared_length_is_large_not_iterated(
     risks = privacy._pattern_risks(broad, load_config())
     assert time.perf_counter() - started < 1.0
     sku_risks = [r for (table, path, _), r in risks.items() if table == "products" and path == "sku"]
-    assert sku_risks and all(not r.small and not r.budget_exceeded for r in sku_risks)
+    assert sku_risks and all(not r.budget_exceeded for r in sku_risks)
     score = score_privacy(real, _independent(spark), broad, materialize("retail", "xs", 0).manifest)
     assert score.passed, [c for c in score.checks if not c.passed]
     assert "regex_budget_exceeded" not in {c.name: c for c in score.checks}["profile.k_threshold"].detail
+
+
+def _case_class_pattern(text: str) -> str:
+    return "".join(f"[{c.lower()}{c.upper()}]" if c.isalpha() else f"[{c}]" for c in text)
+
+
+def test_case_class_pattern_with_huge_declared_length_leaks(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    planted = real["customers"].withColumn(
+        "email",
+        F.when(F.row_number().over(Window.orderBy("customer_id")) == 1, F.lit("john@x.com")).otherwise(F.col("email")),
+    )
+    real_planted = {**real, "customers": planted}
+    patterns = [
+        r"[jJ][oO][hH][nN][@][xX][.][cC][oO][mM]",
+        r"[jJ][oO][hH][nN]@x\.com.*",
+        _case_class_pattern("john@x.com"),
+        _case_class_pattern("john@x.com") + ".*",
+    ]
+    for pattern in patterns:
+        leaky = _with_patterns(profile, "customers", "email", [pattern], length_max=10**12)
+        score = score_privacy(real_planted, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+        detail = {c.name: c for c in score.checks}
+        assert not score.passed, pattern
+        assert (
+            detail["profile.sensitive_value_leaks"].detail.get("customers.email", 0.0) >= 1.0
+            or detail["profile.k_threshold"].detail.get("customers.email pattern 0 literals", 0.0) >= 1.0
+            or detail["profile.k_threshold"].detail.get("customers.email pattern 0", 0.0) >= 1.0
+        ), (pattern, detail["profile.sensitive_value_leaks"].detail, detail["profile.k_threshold"].detail)
 
 
 def test_partial_row_copying_is_detected(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:
