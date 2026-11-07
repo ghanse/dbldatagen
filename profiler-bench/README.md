@@ -185,7 +185,7 @@ standard errors. Reports carry counts and rates, never values.
 | `<table>.dcr_ratio` | median distance to closest real record, synth over holdout, is at least 0.5 (independent samples measured 0.68–1.27; a copy scores 0) |
 | `<table>.<column>.value_leak_rate_excess` | share of distinct sensitive real values found in the synth exceeds the holdout's by at most 0.001 |
 | `<table>.quasi_identifiers[...].match_rate_excess` | share of rows matching a real-unique quasi-identifier combination exceeds the holdout's by at most 0.01 |
-| `profile.sensitive_value_leaks` | no sensitive real value equals a string of the profile JSON or appears in a scanned profile-text blob; every profile string is closed (below); every profile regex is in the allowlisted dialect; sensitive-column patterns pass the structural rule below; and no sensitive value in a seeded sample of 2,000 per column is fully matched by a small-language alternation branch of any other profile regex or contains a rare required literal of one |
+| `profile.sensitive_value_leaks` | no sensitive real value equals a string of the profile JSON or appears in a scanned profile-text blob; every sensitive value (all rows) is checked against a bounded profile candidate set (decoded strings, concat, required literals, and fully enumerated small branch languages) and fails with `sensitive_value_in_profile` on a hit; every profile string is closed (below); every profile regex is in the allowlisted dialect; sensitive-column patterns pass the structural rule below; and no sensitive value in a seeded sample of 2,000 per column is fully matched by a small-language alternation branch of any other profile regex or contains a rare required literal of one |
 | `profile.k_threshold` | the profile validates; every `top_values` entry and enumeration value occurs in at least `privacy.min_value_count` (k) real rows; closed-string, dialect, and structural pattern rules pass; and on non-sensitive columns no alternation branch is a small-language match or rare required literal against that column's values |
 
 Profile regex and text privacy is layered (synth-data leakage is the last):
@@ -208,7 +208,16 @@ Profile regex and text privacy is layered (synth-data leakage is the last):
    strings in document order — is searched for every sampled sensitive value of length at least
    `privacy.min_literal_len`, after case-folding and backslash stripping, and again after percent-decoding and
    unicode-unescaping. A hit fails with reason `sensitive_value_in_profile_text`.
-4. **Structural generalization (sensitive columns).** Columns the manifest marks `direct_identifier`, `secret`, or
+4. **Full sensitive-column candidate scan.** A bounded candidate set is built from every decoded profile string, the
+   concatenation of all strings, each pattern branch's normalized required literals of length at least
+   `privacy.min_literal_len`, and — when a branch's exact language has at most `privacy.max_enumerated_strings`
+   (default 10_000) strings — the full enumeration of that language under the shared regex work budget (exhaustion
+   fails conservatively). Every sensitive column is then scanned in Spark over **all** rows (case-folded): exact
+   semi-join against enumerated strings; sensitive values of length at least `min_literal_len` that are substrings of
+   any candidate text; and candidate factors that are substrings of sensitive values. A hit fails with reason
+   `sensitive_value_in_profile`, naming the sensitive column and JSON path, never the value. The sampled per-value
+   regex language check is kept as well.
+5. **Structural generalization (sensitive columns).** Columns the manifest marks `direct_identifier`, `secret`, or
    `free_text` may only carry literal-free patterns (spec 0.2.0). After dropping group syntax and anchors, and folding
    single-character and case-only classes such as `[jJ]` into literals, the pattern must not contain a literal
    character (escaped punctuation counts), an alternation, or a back-reference. Allowed atoms are character classes
@@ -216,13 +225,13 @@ Profile regex and text privacy is layered (synth-data leakage is the last):
    A violation fails both profile checks with reason `sensitive_pattern_not_generalized`. Generalized email patterns
    must therefore use classes such as `[^\s]+`; forms like `[a-z]+@[a-z]+\.[a-z]+` fail because `@` and `.` are
    literals.
-5. **Per-branch size and required literals (other columns).** Alternations are expanded into branches (bounded by the
+6. **Per-branch size and required literals (other columns).** Alternations are expanded into branches (bounded by the
    shared regex work budget; exhaustion fails with `regex_budget_exceeded`). Each branch is checked on its own: if it
    fully matches a real value and has fewer than max(k, 10⁶) distinct strings of length at most
    min(len(value), `privacy.max_regex_length`), or if it requires a literal of at least 4 characters that occurs in
    fewer than k rows, the regex fails. A decoy such as `(?:john@x\.com|[a-z0-9@.]{10})` is caught by the narrow
    branch even though the whole language equals the broad decoy's.
-6. **Synth-data leakage.** Exact-row copy rate, partial-copy pairs, DCR, sensitive value reproduction, and
+7. **Synth-data leakage.** Exact-row copy rate, partial-copy pairs, DCR, sensitive value reproduction, and
    quasi-identifier matches compare the synth with a real holdout (see the table above) and remain the final backstop
    when a profile pattern is generalized but a sampler still emits real values.
 

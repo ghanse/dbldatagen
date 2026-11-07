@@ -141,6 +141,8 @@ class PrivacyThresholds(_Model):
             the length used for the pathological-pattern budget probe. Default 1000.
         max_dfa_states: Scales the shared work budget for branch expansion and regex language counting. A regex that
             exhausts the budget fails the privacy guard with reason `regex_budget_exceeded`.
+        max_enumerated_strings: Largest exact language of a pattern branch that is fully enumerated into the profile
+            candidate set checked against every sensitive value. Default 10_000.
         partial_copy_pairs: Most column pairs per table checked for row-aligned partial copying.
     """
 
@@ -155,6 +157,7 @@ class PrivacyThresholds(_Model):
     min_literal_len: int = Field(gt=0)
     max_regex_length: int = Field(gt=0)
     max_dfa_states: int = Field(gt=0)
+    max_enumerated_strings: int = Field(gt=0)
     partial_copy_pairs: int = Field(gt=0)
 
 

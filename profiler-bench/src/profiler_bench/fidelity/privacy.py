@@ -133,6 +133,10 @@ def score_privacy(
     if text_hits:
         leaks = {**leaks, "sensitive_value_in_profile_text": text_hits}
         violations = {**violations, "sensitive_value_in_profile_text": text_hits}
+    profile_hits = _sensitive_values_in_profile(profile, manifest, real, risks, config)
+    if profile_hits:
+        leaks = {**leaks, **profile_hits}
+        violations = {**violations, **profile_hits}
     unexpected = _unexpected_profile_strings(profile, real)
     if unexpected:
         leaks = {**leaks, **unexpected}
@@ -766,6 +770,7 @@ class _PatternRisk:
             sensitive columns (which use the structural rule instead).
         branch_compiled: Compiled forms of `branches`.
         literals: Per-branch required literals of length at least `privacy.min_literal_len`, flattened.
+        json_path: Path of the pattern's `regex` field in the serialized profile JSON.
         budget_exceeded: Whether branch expansion or a length-cap probe exhausted the shared work budget.
         not_generalized: Whether a sensitive-column pattern failed the literal-free structural rule.
         not_in_dialect: Whether the raw source failed the allowlisted portable dialect check.
@@ -776,6 +781,7 @@ class _PatternRisk:
     branches: tuple[str, ...]
     branch_compiled: tuple[re.Pattern[str], ...]
     literals: tuple[str, ...]
+    json_path: str = ""
     budget_exceeded: bool = False
     not_generalized: bool = False
     not_in_dialect: bool = False
@@ -790,18 +796,25 @@ def _pattern_risks(
     """Returns the risk of every profile regex, keyed by table, column path, and pattern index."""
     limits = config.privacy
     risks = {}
+    dump = profile.model_dump(mode="json")
+    json_paths = _pattern_paths_from_dump(dump)
     for table in profile.tables:
         for path, column in _profile_paths(table.columns, ""):
             stats_ = column.string
             for i, pattern in enumerate((stats_.patterns or []) if stats_ else []):
                 source = pattern.regex
+                json_path = json_paths.get((table.name, path, i), "")
                 if not regex.in_dialect(source):
-                    risks[(table.name, path, i)] = _PatternRisk(_NEVER, source, (), (), (), not_in_dialect=True)
+                    risks[(table.name, path, i)] = _PatternRisk(
+                        _NEVER, source, (), (), (), json_path, not_in_dialect=True
+                    )
                     continue
                 try:
                     compiled = re.compile(source)
                 except re.error:
-                    risks[(table.name, path, i)] = _PatternRisk(_NEVER, source, (), (), (), not_in_dialect=True)
+                    risks[(table.name, path, i)] = _PatternRisk(
+                        _NEVER, source, (), (), (), json_path, not_in_dialect=True
+                    )
                     continue
                 on_sensitive = (table.name, path) in sensitive
                 not_generalized = on_sensitive and not regex.is_generalized(source)
@@ -836,10 +849,46 @@ def _pattern_risks(
                     branches,
                     branch_compiled,
                     literals,
+                    json_path,
                     budget_exceeded,
                     not_generalized,
                 )
     return risks
+
+
+def _pattern_paths_from_dump(dump: object) -> dict[tuple[str, str, int], str]:
+    """Walks serialized profile JSON and maps each pattern to `(table, column_path, index) -> JSON path`."""
+    found: dict[tuple[str, str, int], str] = {}
+    if not isinstance(dump, dict):
+        return found
+    for table_index, table in enumerate(dump.get("tables") or []):
+        if not isinstance(table, dict) or not isinstance(table.get("name"), str):
+            continue
+        table_name = table["name"]
+        _walk_pattern_columns(table.get("columns"), "", f"$.tables[{table_index}].columns", table_name, found)
+    return found
+
+
+def _walk_pattern_columns(
+    columns: object,
+    prefix: str,
+    base: str,
+    table_name: str,
+    found: dict[tuple[str, str, int], str],
+) -> None:
+    if not isinstance(columns, list):
+        return
+    for column_index, column in enumerate(columns):
+        if not isinstance(column, dict) or not isinstance(column.get("name"), str):
+            continue
+        path = f"{prefix}{column['name']}"
+        col_base = f"{base}[{column_index}]"
+        string = column.get("string")
+        patterns = string.get("patterns") if isinstance(string, dict) else None
+        if isinstance(patterns, list):
+            for pattern_index, _ in enumerate(patterns):
+                found[(table_name, path, pattern_index)] = f"{col_base}.string.patterns[{pattern_index}].regex"
+        _walk_pattern_columns(column.get("children"), f"{path}.", f"{col_base}.children", table_name, found)
 
 
 def _sensitive_values_in_profile_text(
@@ -880,6 +929,160 @@ def _sensitive_values_in_profile_text(
                 if any(key in blob for blob in blobs):
                     hits += 1
     return float(hits)
+
+
+@dataclass(frozen=True)
+class _TextCandidate:
+    """One case-folded profile text blob tagged with the JSON path it came from."""
+
+    text: str
+    path: str
+
+
+@dataclass
+class _CandidateSet:
+    """Bounded texts derived from the profile for the full sensitive-column scan."""
+
+    texts: list[_TextCandidate]
+    exacts: list[_TextCandidate]
+    factors: list[_TextCandidate]
+    budget_exceeded: bool = False
+
+
+def _string_entries(data: object, path: str = "$") -> list[tuple[str, str]]:
+    """Returns `(json_path, raw_string)` for every string value in document order."""
+    found: list[tuple[str, str]] = []
+    if isinstance(data, str):
+        found.append((path, data))
+    elif isinstance(data, dict):
+        for key, value in data.items():
+            found.extend(_string_entries(value, f"{path}.{key}"))
+    elif isinstance(data, list):
+        for index, value in enumerate(data):
+            found.extend(_string_entries(value, f"{path}[{index}]"))
+    return found
+
+
+def _build_candidate_set(
+    profile: Profile, risks: Mapping[tuple[str, str, int], _PatternRisk], config: MetricsConfig
+) -> _CandidateSet:
+    """Builds the bounded candidate set: decoded strings, concat, required literals, and small branch languages."""
+    limits = config.privacy
+    dump = profile.model_dump(mode="json")
+    entries = _string_entries(dump)
+    texts: list[_TextCandidate] = []
+    for json_path, raw in entries:
+        decoded = _decode_profile_text(raw).casefold().replace("\\", "")
+        texts.append(_TextCandidate(decoded, json_path))
+    joined = "".join(raw for _, raw in entries)
+    texts.append(_TextCandidate(_decode_profile_text(joined).casefold().replace("\\", ""), "$"))
+    exacts: list[_TextCandidate] = []
+    factors: list[_TextCandidate] = []
+    budget_exceeded = False
+    for risk in risks.values():
+        if risk.not_in_dialect or not risk.json_path:
+            continue
+        for factor in risk.literals:
+            folded = factor.casefold().replace("\\", "")
+            factors.append(_TextCandidate(folded, risk.json_path))
+            texts.append(_TextCandidate(folded, risk.json_path))
+        if risk.not_generalized:
+            continue
+        for branch in risk.branches:
+            enumerated = regex.enumerate_matches(
+                branch,
+                max_strings=limits.max_enumerated_strings,
+                max_length=limits.max_regex_length,
+                max_dfa_states=limits.max_dfa_states,
+            )
+            if enumerated is regex.BUDGET_EXCEEDED:
+                budget_exceeded = True
+                continue
+            if not isinstance(enumerated, list):
+                continue
+            for value in enumerated:
+                folded = value.casefold().replace("\\", "")
+                exacts.append(_TextCandidate(folded, risk.json_path))
+                texts.append(_TextCandidate(folded, risk.json_path))
+    return _CandidateSet(texts=texts, exacts=exacts, factors=factors, budget_exceeded=budget_exceeded)
+
+
+def _sensitive_values_in_profile(  # noqa: PLR0912
+    profile: Profile,
+    manifest: Manifest,
+    real: Mapping[str, DataFrame],
+    risks: Mapping[tuple[str, str, int], _PatternRisk],
+    config: MetricsConfig,
+) -> dict[str, float]:
+    """Checks every sensitive value (all rows) against the profile candidate set.
+
+    Exact matches use the enumerated branch languages; substring checks cover candidate texts and required-literal
+    factors. Hits are reported as `sensitive_value_in_profile` with the sensitive column and JSON path, never the
+    value. Budget exhaustion while building candidates fails conservatively.
+    """
+    if not real:
+        return {}
+    candidates = _build_candidate_set(profile, risks, config)
+    detail: dict[str, float] = {}
+    if candidates.budget_exceeded:
+        detail["regex_budget_exceeded"] = detail.get("regex_budget_exceeded", 0.0) + 1.0
+        detail["sensitive_value_in_profile"] = detail.get("sensitive_value_in_profile", 0.0) + 1.0
+    min_len = config.privacy.min_literal_len
+    session = next(iter(real.values())).sparkSession
+    exacts = list({(c.text, c.path) for c in candidates.exacts if c.text})
+    factors = list({(c.text, c.path) for c in candidates.factors if c.text})
+    texts = list({(c.text, c.path) for c in candidates.texts if c.text})
+    for table in manifest.tables:
+        if table.name not in real:
+            continue
+        for path, category in sensitive_columns(table).items():
+            if category not in VALUE_LEAK_CATEGORIES:
+                continue
+            column = f"{table.name}.{path}"
+            expr = ".".join(identifier(p) for p in path.split("."))
+            values = (
+                real[table.name]
+                .selectExpr(f"CAST({expr} AS STRING) AS v")
+                .dropna()
+                .select(F.lower(F.col("v")).alias("v"), F.length("v").alias("n"))
+            )
+            hit_paths: set[str] = set()
+            if exacts:
+                exact_df = F.broadcast(session.createDataFrame(exacts, "text string, path string"))
+                for row in (
+                    values.join(exact_df, values.v == exact_df.text, "inner").select("path").distinct().collect()
+                ):
+                    hit_paths.add(row["path"])
+            if texts:
+                blob = "\x1e".join(text for text, _ in texts)
+                text_paths = dict(texts)
+                matched = [
+                    r["v"]
+                    for r in values.where(F.col("n") >= min_len)
+                    .where(F.instr(F.lit(blob), F.col("v")) > 0)
+                    .select("v")
+                    .distinct()
+                    .limit(100)
+                    .collect()
+                ]
+                for value in matched:
+                    for text, json_path in text_paths.items():
+                        if value in text:
+                            hit_paths.add(json_path)
+            if factors:
+                factor_df = F.broadcast(session.createDataFrame(factors, "text string, path string"))
+                for row in (
+                    values.join(factor_df, F.instr(values.v, factor_df.text) > 0, "inner")
+                    .select("path")
+                    .distinct()
+                    .collect()
+                ):
+                    hit_paths.add(row["path"])
+            for json_path in sorted(hit_paths):
+                key = f"sensitive_value_in_profile:{column}:{json_path}"
+                detail[key] = 1.0
+                detail["sensitive_value_in_profile"] = detail.get("sensitive_value_in_profile", 0.0) + 1.0
+    return detail
 
 
 def _language_vs_value(

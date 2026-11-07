@@ -372,6 +372,28 @@ def test_source_type_not_matching_schema_fails_closed_strings(
     assert not score.passed
 
 
+def _grouped_literal_pattern(value: str) -> str:
+    return "".join(f"({c})" if c.isalnum() else re.escape(c) for c in value)
+
+
+def test_unsampled_sensitive_value_in_non_sensitive_pattern_fails(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    email = real["customers"].orderBy("customer_id").collect()[0]["email"]
+    monkeypatch.setattr(privacy, "_sample_values", lambda *args, **kwargs: [])
+    for pattern in (_grouped_literal_pattern(email), f"[{email[0]}{email[0].upper()}]{re.escape(email[1:])}"):
+        leaky = _with_patterns(profile, "products", "sku", [pattern])
+        score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+        detail = {c.name: c for c in score.checks}
+        assert detail["profile.sensitive_value_leaks"].detail["sensitive_value_in_profile"] >= 1.0, pattern
+        assert any(
+            key.startswith("sensitive_value_in_profile:customers.email:")
+            for key in detail["profile.sensitive_value_leaks"].detail
+        ), pattern
+        assert detail["profile.sensitive_value_leaks"].detail.get("sensitive_value_in_profile_text", 0.0) == 0.0
+        assert not score.passed
+
+
 def test_example_profiles_pass_closed_strings() -> None:
     for path in sorted(_EXAMPLES.glob("*.json")):
         raw = json.loads(path.read_text())

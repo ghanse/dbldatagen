@@ -225,6 +225,140 @@ def count_matches(
         return BUDGET_EXCEEDED
 
 
+def enumerate_matches(  # noqa: PLR0911
+    regex: str,
+    *,
+    max_strings: int,
+    max_length: int,
+    max_dfa_states: int = DEFAULT_MAX_DFA_STATES,
+    budget: _WorkBudget | None = None,
+) -> list[str] | _BudgetExceeded:
+    """Returns every distinct string of length at most `max_length` that fully matches `regex`, when few enough.
+
+    First counts the language (capped at `max_strings + 1`) under the shared work budget. Returns `BUDGET_EXCEEDED`
+    when that budget is exhausted, an empty list when the language is larger than `max_strings`, and otherwise every
+    matching string (as produced by expanding literals, small classes, groups, alternation, and bounded repeats).
+    """
+    work = budget if budget is not None else _WorkBudget(max_dfa_states)
+    try:
+        counted = count_matches(regex, 0, max_length, cap=max_strings + 1, max_dfa_states=max_dfa_states, budget=work)
+    except UnsupportedForCount:
+        return []
+    if counted is BUDGET_EXCEEDED:
+        return BUDGET_EXCEEDED
+    if not isinstance(counted, int) or counted > max_strings:
+        return []
+    if counted == 0:
+        return []
+    try:
+        items = _parser.parse(regex)
+        work.charge(1)
+        found = _enumerate_items(list(items), work, max_strings, max_length)
+        return sorted(set(found))
+    except _Exhausted:
+        return BUDGET_EXCEEDED
+    except UnsupportedForCount:
+        return []
+
+
+def _enumerate_items(
+    items: Sequence[tuple[Any, Any]], budget: _WorkBudget, max_strings: int, max_length: int
+) -> list[str]:
+    results = [""]
+    for op, av in items:
+        budget.charge(1)
+        name = op.name
+        if name == "AT":
+            continue
+        if name in ("SUBPATTERN", "ATOMIC_GROUP"):
+            tails = _enumerate_items(av[-1], budget, max_strings, max_length)
+            results = [prefix + tail for prefix in results for tail in tails]
+        elif name == "BRANCH":
+            tails = [tail for branch in av[1] for tail in _enumerate_items(branch, budget, max_strings, max_length)]
+            results = [prefix + tail for prefix in results for tail in tails]
+        elif name in REPEATS:
+            results = _enumerate_repeat(results, av, budget, max_strings, max_length)
+        else:
+            chars = _enumerate_atom((op, av))
+            results = [prefix + char for prefix in results for char in chars]
+        results = [s for s in results if len(s) <= max_length]
+        budget.charge(max(len(results), 1))
+        if len(results) > max_strings:
+            raise _Exhausted()
+    return results
+
+
+def _enumerate_repeat(
+    prefixes: list[str],
+    av: tuple[Any, Any, Any],
+    budget: _WorkBudget,
+    max_strings: int,
+    max_length: int,
+) -> list[str]:
+    low, high, inner = av
+    if high == _parser.MAXREPEAT:
+        raise UnsupportedForCount("cannot enumerate unbounded repeat")
+    pieces = _enumerate_items(inner, budget, max_strings, max_length)
+    current = list(prefixes)
+    for _ in range(low):
+        current = [prefix + piece for prefix in current for piece in pieces]
+        current = [s for s in current if len(s) <= max_length]
+        budget.charge(max(len(current), 1))
+        if len(current) > max_strings:
+            raise _Exhausted()
+    results = list(current)
+    for _ in range(high - low):
+        current = [prefix + piece for prefix in current for piece in pieces]
+        current = [s for s in current if len(s) <= max_length]
+        results.extend(current)
+        budget.charge(max(len(results), 1))
+        if len(results) > max_strings:
+            raise _Exhausted()
+    return results
+
+
+def _enumerate_atom(item: tuple[Any, Any]) -> list[str]:
+    op, av = item
+    name = op.name
+    if name == "LITERAL":
+        return [chr(av)]
+    if name == "IN":
+        return _enumerate_class(av)
+    if name == "CATEGORY":
+        chars = CATEGORY_CHARS.get(av.name.replace("CATEGORY_NOT_", "CATEGORY_"), "")
+        if av.name.startswith("CATEGORY_NOT_") or not chars:
+            raise UnsupportedForCount(f"cannot enumerate {av.name}")
+        return list(chars)
+    raise UnsupportedForCount(f"cannot enumerate {name}")
+
+
+def _enumerate_class(items: Sequence[tuple[Any, Any]]) -> list[str]:
+    members: set[str] = set()
+    negate = False
+    for op, av in items:
+        name = op.name
+        if name == "NEGATE":
+            negate = True
+        elif name == "LITERAL":
+            members.add(chr(av))
+        elif name == "RANGE":
+            if av[1] - av[0] >= WIDE_RANGE:
+                raise UnsupportedForCount("cannot enumerate wide range")
+            members.update(chr(c) for c in range(av[0], av[1] + 1))
+        elif name == "CATEGORY":
+            chars = CATEGORY_CHARS.get(av.name, "")
+            if av.name.startswith("CATEGORY_NOT_") or not chars:
+                raise UnsupportedForCount(f"cannot enumerate class {av.name}")
+            members.update(chars)
+        else:
+            raise UnsupportedForCount(f"cannot enumerate class {name}")
+    if negate:
+        raise UnsupportedForCount("cannot enumerate negated class")
+    if not members:
+        raise UnsupportedForCount("empty character class")
+    return sorted(members)
+
+
 class _Nfa:
     def __init__(self, max_length: int, budget: _WorkBudget) -> None:
         self.max_length = max_length

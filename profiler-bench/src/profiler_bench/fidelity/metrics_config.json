@@ -1,5 +1,5 @@
 {
-  "version": "1.6.0",
+  "version": "1.7.0",
   "sampling": {
     "max_rows": 20000,
     "discriminator_rows": 2000,
@@ -59,6 +59,7 @@
     "min_literal_len": 4,
     "max_regex_length": 1000,
     "max_dfa_states": 10000,
+    "max_enumerated_strings": 10000,
     "partial_copy_pairs": 20
   }
 }
