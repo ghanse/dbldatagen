@@ -15,8 +15,13 @@ def with_extras(profile: dict[str, Any], version: str) -> dict[str, Any]:
     return profile
 
 
-def test_spec_version_is_0_1_0() -> None:
-    assert SPEC_VERSION == "0.1.0"
+def test_spec_version_is_0_2_0() -> None:
+    assert SPEC_VERSION == "0.2.0"
+
+
+def test_0_1_profile_still_loads(minimal_profile: dict[str, object]) -> None:
+    minimal_profile["spec_version"] = "0.1.0"
+    assert load_profile(minimal_profile).spec_version == "0.1.0"
 
 
 @pytest.mark.parametrize("version", ["0.1", "v0.1.0", "0.1.0-rc1", ""])

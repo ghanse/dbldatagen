@@ -7,7 +7,7 @@ import pytest
 from conftest import EXAMPLES
 
 from dbldatagen_profiler.cli import main
-from dbldatagen_profiler.model import render_json_schema
+from dbldatagen_profiler.model import SPEC_VERSION, render_json_schema
 
 
 def test_console_script_is_registered() -> None:
@@ -18,7 +18,7 @@ def test_console_script_is_registered() -> None:
 @pytest.mark.parametrize("path", EXAMPLES, ids=lambda path: path.name)
 def test_validate_accepts_example(path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["validate", str(path)]) == 0
-    assert "valid profile (spec 0.1.0" in capsys.readouterr().out
+    assert f"valid profile (spec {SPEC_VERSION}" in capsys.readouterr().out
 
 
 def test_validate_rejects_invalid_profile(
