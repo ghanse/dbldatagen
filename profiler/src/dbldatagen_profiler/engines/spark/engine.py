@@ -25,11 +25,13 @@ from dbldatagen_profiler.model import (
     NumericStats,
     PrivacyPolicy,
     Profile,
+    QuasiIdentifierSet,
     StringStats,
     TableProfile,
     TemporalStats,
     ValueTreatment,
 )
+from dbldatagen_profiler.pii.detect import analyze_table
 
 
 _VALUE = "__profile_value"
@@ -45,12 +47,15 @@ _NUMERIC_TYPES = (
 _TEMPORAL_TYPES = (T.DateType, T.TimestampType)
 
 
-def profile_tables(tables: Mapping[str, DataFrame], *, privacy: PrivacyPolicy | None = None) -> Profile:
+def profile_tables(
+    tables: Mapping[str, DataFrame], *, privacy: PrivacyPolicy | None = None, detect_pii: bool = True
+) -> Profile:
     """Profiles named Spark DataFrames.
 
     Args:
         tables: DataFrames keyed by their profile table name.
         privacy: Optional privacy policy applied to emitted literals.
+        detect_pii: Whether to detect sensitive semantics and quasi-identifiers (default true).
 
     Returns:
         A validated profile containing every input table.
@@ -62,31 +67,41 @@ def profile_tables(tables: Mapping[str, DataFrame], *, privacy: PrivacyPolicy | 
         raise ValueError("at least one table is required")
     policy = privacy or PrivacyPolicy()
     with _utc_session_time_zones(tables.values()):
+        analyses = {name: analyze_table(frame) for name, frame in tables.items()} if detect_pii else {}
         result = Profile(
             spec_version=SPEC_VERSION,
             created_at=datetime.now(timezone.utc),
             engine=EngineInfo(name="pyspark", version=pyspark.__version__),
             privacy=policy,
-            tables=[_profile_table(name, frame, policy) for name, frame in tables.items()],
+            tables=[_profile_table(name, frame, policy, analyses.get(name)) for name, frame in tables.items()],
         )
         return Profile.model_validate(result.model_dump(), context={"strict": True})
 
 
-def profile_dataframe(name: str, df: DataFrame, *, privacy: PrivacyPolicy | None = None) -> Profile:
+def profile_dataframe(
+    name: str, df: DataFrame, *, privacy: PrivacyPolicy | None = None, detect_pii: bool = True
+) -> Profile:
     """Profiles one Spark DataFrame.
 
     Args:
         name: Profile table name.
         df: Spark DataFrame to profile.
         privacy: Optional privacy policy applied to emitted literals.
+        detect_pii: Whether to detect sensitive semantics and quasi-identifiers (default true).
 
     Returns:
         A validated single-table profile.
     """
-    return profile_tables({name: df}, privacy=privacy)
+    return profile_tables({name: df}, privacy=privacy, detect_pii=detect_pii)
 
 
-def _profile_table(name: str, df: DataFrame, privacy: PrivacyPolicy) -> TableProfile:
+def _profile_table(
+    name: str,
+    df: DataFrame,
+    privacy: PrivacyPolicy,
+    analysis: tuple[dict[str, Any], list[tuple[list[str], float, int]]] | None,
+) -> TableProfile:
+    semantics, quasi_sets = analysis or ({}, [])
     expressions: list[Column] = [F.count(F.lit(1)).alias("__row_count")]
     for index, field in enumerate(df.schema.fields):
         expressions.extend(_aggregate_expressions(df[field.name], field.dataType, index))
@@ -96,7 +111,27 @@ def _profile_table(name: str, df: DataFrame, privacy: PrivacyPolicy) -> TablePro
         _column_from_aggregate(field, values, index, row_count, privacy, nested=False, df=df)
         for index, field in enumerate(df.schema.fields)
     ]
-    return TableProfile(name=name, row_count=row_count, columns=columns)
+    protected = []
+    for column in columns:
+        semantic = semantics.get(column.name)
+        if semantic is None:
+            protected.append(column)
+            continue
+        updates: dict[str, Any] = {"semantic": semantic}
+        if semantic.sensitivity.value in {"direct_identifier", "secret"}:
+            if column.numeric is not None:
+                updates["numeric"] = column.numeric.model_copy(
+                    update={"min": None, "max": None, "quantiles": None, "histogram": None}
+                )
+            if column.temporal is not None:
+                updates["temporal"] = column.temporal.model_copy(update={"min": None, "max": None, "quantiles": None})
+            if column.string is not None:
+                updates["string"] = column.string.model_copy(update={"top_values": None})
+        protected.append(column.model_copy(update=updates))
+    quasi = [
+        QuasiIdentifierSet(columns=names, unique_fraction=unique, k_anonymity=k) for names, unique, k in quasi_sets
+    ]
+    return TableProfile(name=name, row_count=row_count, columns=protected, quasi_identifier_sets=quasi or None)
 
 
 @contextmanager

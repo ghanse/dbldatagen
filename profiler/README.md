@@ -74,6 +74,8 @@ A profile contains:
 - `relationships`: foreign keys from child columns to parent columns, with coverage, confidence, and fan-out. Fan-out
   counts child rows for every parent key, including keys with none; child keys that match no parent are left out and
   show up in `coverage` instead.
+- `semantic`: optional PII class, sensitivity, confidence, and value-free detection evidence. Tables may also record
+  sampled pairs and triples that behave as quasi-identifiers.
 
 Only the basic schema, row count, and null information are required; engines can add the other blocks over time.
 
@@ -113,6 +115,24 @@ The `privacy` block records the policy the producer applied:
   range bounds (for `extremes`), or `top_values` and enumeration constraints (for `enumerations`), must be absent.
 
 All raw-literal fields are optional, so a strict-privacy producer can leave them out.
+
+PII detection is enabled during Spark profiling by default. Full-column validators require an 80% sampled match
+rate; free-text span detection requires 20%; account IDs require 90% sampled uniqueness. A column-name hint alone
+has confidence 0.30. Quasi-identifier search considers at most 12 moderate-cardinality columns and reports sampled
+pairs or triples with at least 80% unique rows. Detection samples at most 10,000 rows using a seeded content hash.
+Direct identifiers and secrets never retain literal-bearing statistics in the resulting profile.
+
+Detection and keyed substitution can also run independently:
+
+```bash
+dbldatagen-profile pii detect --table customers=customers.parquet -o semantic.json
+dbldatagen-profile pii substitute --table customers=customers.parquet \
+  --profile profile.json --key-file key.bin -o shareable
+```
+
+Substitution uses HMAC-SHA256 domains. Relationship-linked columns share a domain, preserving equality and joins;
+nulls and empty strings are unchanged. Quasi-identifiers remain unchanged unless explicitly generalized through the
+Python API. Email domains are replaced by default because they may identify a group.
 
 ### Versioning
 

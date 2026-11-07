@@ -1,5 +1,5 @@
 {
-  "spec_version": "0.1.0",
+  "spec_version": "0.2.0",
   "created_at": "2026-11-06T12:00:00Z",
   "engine": {
     "name": "hand-written",
@@ -62,8 +62,19 @@
             },
             "patterns": [
               {
-                "regex": "[a-z]+\\.[a-z]+@example\\.(com|org)",
+                "regex": "[a-z]+\\.[a-z]+@[a-z]+\\.[a-z]+",
                 "coverage": 0.97
+              }
+            ]
+          },
+          "semantic": {
+            "pii_class": "email",
+            "sensitivity": "direct_identifier",
+            "confidence": 0.99,
+            "evidence": [
+              {
+                "method": "email",
+                "match_rate": 0.99
               }
             ]
           }

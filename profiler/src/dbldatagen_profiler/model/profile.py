@@ -26,7 +26,7 @@ from typing import Annotated, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 
 
-SPEC_VERSION = "0.1.0"
+SPEC_VERSION = "0.2.0"
 SUPPORTED_MAJOR_VERSION = int(SPEC_VERSION.split(".", maxsplit=1)[0])
 STRICT_CONTEXT_KEY = "strict"
 DEFAULT_MIN_VALUE_COUNT = 10
@@ -376,6 +376,58 @@ class BooleanStats(_SpecModel):
     true_fraction: Fraction
 
 
+class PiiClass(str, Enum):
+    """Semantic class of personally identifying data."""
+
+    EMAIL = "email"
+    PHONE = "phone"
+    PERSON_NAME = "person_name"
+    STREET_ADDRESS = "street_address"
+    CITY = "city"
+    POSTAL_CODE = "postal_code"
+    NATIONAL_ID = "national_id"
+    CREDIT_CARD = "credit_card"
+    IBAN = "iban"
+    IP_ADDRESS = "ip_address"
+    DATE_OF_BIRTH = "date_of_birth"
+    ACCOUNT_ID = "account_id"
+    SECRET_TOKEN = "secret_token"
+    FREE_TEXT_PII = "free_text_pii"
+    OTHER = "other"
+
+
+class Sensitivity(str, Enum):
+    """Privacy sensitivity taxonomy shared with the benchmark catalog."""
+
+    DIRECT_IDENTIFIER = "direct_identifier"
+    QUASI_IDENTIFIER = "quasi_identifier"
+    SECRET = "secret"
+    FREE_TEXT = "free_text"
+
+
+class SemanticEvidence(_SpecModel):
+    """Detection method and its sampled match rate, without source values."""
+
+    method: str = Field(min_length=1)
+    match_rate: Fraction
+
+    @model_validator(mode="before")
+    @classmethod
+    def _forbid_value_fields(cls, data: object) -> object:
+        if isinstance(data, dict) and set(data) != {"method", "match_rate"}:
+            raise ValueError("semantic evidence contains only method and match_rate")
+        return data
+
+
+class Semantic(_SpecModel):
+    """Detected semantic meaning and sensitivity of a column."""
+
+    pii_class: PiiClass
+    sensitivity: Sensitivity
+    confidence: Fraction
+    evidence: list[SemanticEvidence] = Field(default_factory=list)
+
+
 class ColumnProfile(_SpecModel):
     """Profile of a single column, or of a field nested inside a complex column.
 
@@ -420,6 +472,7 @@ class ColumnProfile(_SpecModel):
     boolean: BooleanStats | None = None
     collection_length: LengthStats | None = None
     value_count: Count | None = None
+    semantic: Semantic | None = None
 
     @model_validator(mode="after")
     def _check_type_consistency(self) -> ColumnProfile:
@@ -659,6 +712,20 @@ class Dependency(_SpecModel):
         return self
 
 
+class QuasiIdentifierSet(_SpecModel):
+    """Sampled uniqueness and k-anonymity estimate for a column combination."""
+
+    columns: list[str] = Field(min_length=2, max_length=3)
+    unique_fraction: Fraction
+    k_anonymity: Annotated[int, Field(ge=1)]
+
+    @model_validator(mode="after")
+    def _check_columns(self) -> QuasiIdentifierSet:
+        if len(set(self.columns)) != len(self.columns):
+            raise ValueError("quasi-identifier set repeats a column")
+        return self
+
+
 class TableProfile(_SpecModel):
     """Profile of a single table.
 
@@ -679,6 +746,7 @@ class TableProfile(_SpecModel):
     unique_keys: list[KeyCandidate] | None = None
     check_constraints: list[CheckConstraint] | None = None
     dependencies: list[Dependency] | None = None
+    quasi_identifier_sets: list[QuasiIdentifierSet] | None = None
 
     @model_validator(mode="after")
     def _check_column_refs(self) -> TableProfile:
@@ -690,6 +758,7 @@ class TableProfile(_SpecModel):
             *(name for key in [*keys, *(self.unique_keys or [])] for name in key.columns),
             *(name for constraint in self.check_constraints or [] for name in constraint.column_refs()),
             *(name for dependency in self.dependencies or [] for name in dependency.columns),
+            *(name for item in self.quasi_identifier_sets or [] for name in item.columns),
         ]
         unknown = sorted(set(refs) - set(columns))
         if unknown:
@@ -920,6 +989,15 @@ def _check_column_privacy(column: ColumnProfile, value_count: int | None, policy
             statistics have no known value count, or a suppressed value class is present.
     """
     k = policy.min_value_count
+    if column.semantic is not None and column.semantic.sensitivity in {
+        Sensitivity.DIRECT_IDENTIFIER,
+        Sensitivity.SECRET,
+    }:
+        string = column.string or StringStats()
+        if column.literals() or string.top_values:
+            raise ValueError(f"column {column.name!r}: direct identifiers and secrets cannot carry literal statistics")
+        if string.patterns and any(not _is_generalized_pattern(pattern.regex) for pattern in string.patterns):
+            raise ValueError(f"column {column.name!r}: sensitive patterns must contain character classes only")
     stats = column.numeric or column.temporal
     if policy.extremes == ValueTreatment.SUPPRESSED and stats is not None:
         histogram = column.numeric.histogram if column.numeric else None
@@ -943,3 +1021,9 @@ def _check_column_privacy(column: ColumnProfile, value_count: int | None, policy
     rare += [pattern.regex for pattern in string.patterns or [] if round(pattern.coverage * non_null_rows) < k]
     if rare:
         raise ValueError(f"column {column.name!r}: top_values or patterns cover fewer than {k} rows: {rare}")
+
+
+def _is_generalized_pattern(regex: str) -> bool:
+    """Returns whether a regex consists only of character classes and structural operators."""
+    stripped = re.sub(r"\\[dDsSwW]|\[[^]]+\]|\{\d+(,\d*)?\}|[.*+?^$|()\\-]", "", regex)
+    return re.search(r"[A-Za-z0-9]", stripped) is None
