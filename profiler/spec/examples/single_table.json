@@ -12,9 +12,6 @@
     "allow_expression_constraints": true
   },
   "source": {
-    "name": "crm",
-    "format": "delta",
-    "location": "main.crm.customers",
     "sampling": {
       "fraction": 1.0,
       "seed": 42
@@ -220,12 +217,6 @@
           ],
           "satisfied_fraction": 1.0,
           "min_value_count": 1000
-        },
-        {
-          "kind": "expression",
-          "expression": "is_active OR balance = 0",
-          "satisfied_fraction": 0.99,
-          "dialect": "spark"
         }
       ],
       "dependencies": [

@@ -1,5 +1,7 @@
+import json
 import re
 import time
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -8,9 +10,12 @@ from pyspark.sql import functions as F
 
 from dbldatagen_profiler.engines.spark import profile_tables
 from dbldatagen_profiler.model import Profile
-from profiler_bench.catalog import load, materialize
+from profiler_bench.catalog import DATASETS, load, materialize
 from profiler_bench.fidelity import PrivacyScore, privacy, regex, score_privacy, stats
 from profiler_bench.fidelity.config import load_config
+
+
+_EXAMPLES = Path(__file__).resolve().parents[3] / "profiler" / "spec" / "examples"
 
 
 def _checks(score: PrivacyScore) -> dict[str, bool]:
@@ -314,6 +319,71 @@ def test_sensitive_value_in_non_regex_profile_field_fails_raw_scan(
     assert detail["profile.sensitive_value_leaks"].detail["sensitive_value_in_profile_text"] >= 1.0
     assert detail["profile.k_threshold"].detail["sensitive_value_in_profile_text"] >= 1.0
     assert not score.passed
+
+
+def test_split_sensitive_value_across_source_types_fails_closed_strings(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    data = profile.model_dump(mode="json")
+    email_col = next(
+        c for t in data["tables"] if t["name"] == "customers" for c in t["columns"] if c["name"] == "email"
+    )
+    sku = next(c for t in data["tables"] if t["name"] == "products" for c in t["columns"] if c["name"] == "sku")
+    email_col["source_type"] = "john"
+    sku["source_type"] = "@x.com"
+    leaky = Profile.model_validate(data)
+    score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+    detail = {c.name: c for c in score.checks}
+    assert detail["profile.sensitive_value_leaks"].detail["unexpected_profile_string"] >= 2.0
+    assert detail["profile.k_threshold"].detail["unexpected_profile_string"] >= 2.0
+    assert not score.passed
+
+
+def test_percent_encoded_sensitive_value_fails_raw_scan(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    email = real["customers"].orderBy("customer_id").collect()[0]["email"]
+    encoded = email.replace("@", "%40")
+    data = profile.model_dump(mode="json")
+    sku = next(c for t in data["tables"] if t["name"] == "products" for c in t["columns"] if c["name"] == "sku")
+    sku["string"] = {**(sku.get("string") or {}), "top_values": [{"value": encoded, "frequency": 0.1}]}
+    leaky = Profile.model_validate(data)
+    score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+    detail = {c.name: c for c in score.checks}
+    assert detail["profile.sensitive_value_leaks"].detail["sensitive_value_in_profile_text"] >= 1.0
+    assert detail["profile.k_threshold"].detail["sensitive_value_in_profile_text"] >= 1.0
+    assert not score.passed
+
+
+def test_source_type_not_matching_schema_fails_closed_strings(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile
+) -> None:
+    data = profile.model_dump(mode="json")
+    sku = next(c for t in data["tables"] if t["name"] == "products" for c in t["columns"] if c["name"] == "sku")
+    sku["source_type"] = "varchar(32)"
+    leaky = Profile.model_validate(data)
+    score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+    detail = {c.name: c for c in score.checks}
+    assert detail["profile.sensitive_value_leaks"].detail["unexpected_profile_string"] >= 1.0
+    assert any(
+        key.startswith("unexpected_profile_string:$") and key.endswith(".source_type")
+        for key in detail["profile.sensitive_value_leaks"].detail
+    )
+    assert not score.passed
+
+
+def test_example_profiles_pass_closed_strings() -> None:
+    for path in sorted(_EXAMPLES.glob("*.json")):
+        raw = json.loads(path.read_text())
+        profile = Profile.model_validate(raw)
+        assert privacy._unexpected_profile_strings(profile, {}, data=raw) == {}, path.name
+
+
+def test_baseline_profiles_of_every_xs_dataset_pass_closed_strings(spark: SparkSession) -> None:
+    for name in DATASETS:
+        real = load(name, "xs", 0, spark)
+        profile = profile_tables(real)
+        assert privacy._unexpected_profile_strings(profile, real) == {}, name
 
 
 def test_partial_row_copying_is_detected(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:

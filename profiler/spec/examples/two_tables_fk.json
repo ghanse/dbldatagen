@@ -11,11 +11,7 @@
     "enumerations": "suppressed",
     "allow_expression_constraints": false
   },
-  "source": {
-    "name": "shop",
-    "format": "parquet",
-    "location": "s3://example-bucket/shop/"
-  },
+  "source": null,
   "tables": [
     {
       "name": "customers",

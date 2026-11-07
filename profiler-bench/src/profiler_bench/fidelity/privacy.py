@@ -7,21 +7,54 @@ Every check is pass/fail against a threshold of the metrics configuration; value
 
 from __future__ import annotations
 
+import codecs
 import itertools
-import json
 import math
 import re
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from urllib.parse import unquote
 
 import numpy as np
 import pandas as pd
 from pydantic import ValidationError
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql import types as T
 
-from dbldatagen_profiler.model import ColumnProfile, EnumerationConstraint, LogicalType, Profile
+from dbldatagen_profiler.model import (
+    BooleanStats,
+    Cardinality,
+    ColumnProfile,
+    ComparisonConstraint,
+    DependenceMethod,
+    Dependency,
+    DistinctCount,
+    EngineInfo,
+    EnumerationConstraint,
+    ExpressionConstraint,
+    FanOutStats,
+    Histogram,
+    KeyCandidate,
+    LengthStats,
+    LogicalType,
+    NumericStats,
+    Pattern,
+    PrivacyPolicy,
+    Profile,
+    Quantile,
+    RangeConstraint,
+    Relationship,
+    SamplingInfo,
+    SourceInfo,
+    StringStats,
+    TableProfile,
+    TemporalStats,
+    ValueFrequency,
+    ValueTreatment,
+)
+from dbldatagen_profiler.model.profile import _DATE, _DECIMAL_RE, _TIME
 from profiler_bench.catalog.manifest import Manifest, Table
 from profiler_bench.fidelity import regex, stats
 from profiler_bench.fidelity.config import MetricsConfig, load_config
@@ -100,6 +133,10 @@ def score_privacy(
     if text_hits:
         leaks = {**leaks, "sensitive_value_in_profile_text": text_hits}
         violations = {**violations, "sensitive_value_in_profile_text": text_hits}
+    unexpected = _unexpected_profile_strings(profile, real)
+    if unexpected:
+        leaks = {**leaks, **unexpected}
+        violations = {**violations, **unexpected}
     for reason, flag in (
         ("regex_budget_exceeded", "budget_exceeded"),
         ("sensitive_pattern_not_generalized", "not_generalized"),
@@ -389,6 +426,335 @@ def _profile_columns(columns: Sequence[ColumnProfile]) -> Iterator[ColumnProfile
         yield from _profile_columns(column.children or [])
 
 
+_ENGINE_ID_RE = re.compile(r"^[a-z0-9_.-]{1,64}$")
+_SPEC_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+_ISO_TEMPORAL_RES = (
+    re.compile(rf"^{_DATE}$"),
+    re.compile(rf"^{_TIME}$"),
+    re.compile(rf"^{_DATE}T{_TIME}$"),
+    re.compile(rf"^{_DATE}T{_TIME}(Z|[+-]\d{{2}}:\d{{2}})$"),
+)
+_COMPARISON_OPS = frozenset({"<", "<=", "=", "!=", ">=", ">"})
+_CONSTRAINT_KINDS = frozenset({"range", "enumeration", "comparison", "expression"})
+_MODEL_ENUM_VALUES = frozenset(
+    (
+        *(member.value for member in LogicalType),
+        *(member.value for member in Cardinality),
+        *(member.value for member in DependenceMethod),
+        *(member.value for member in ValueTreatment),
+        *_COMPARISON_OPS,
+        *_CONSTRAINT_KINDS,
+    )
+)
+_MODEL_MAP_KEYS = frozenset({"key", "value", "element"})
+_OBJECT_FIELDS: dict[str, frozenset[str]] = {
+    "Profile": frozenset(Profile.model_fields),
+    "EngineInfo": frozenset(EngineInfo.model_fields),
+    "PrivacyPolicy": frozenset(PrivacyPolicy.model_fields),
+    "SourceInfo": frozenset(SourceInfo.model_fields),
+    "SamplingInfo": frozenset(SamplingInfo.model_fields),
+    "TableProfile": frozenset(TableProfile.model_fields),
+    "ColumnProfile": frozenset(ColumnProfile.model_fields),
+    "DistinctCount": frozenset(DistinctCount.model_fields),
+    "NumericStats": frozenset(NumericStats.model_fields),
+    "StringStats": frozenset(StringStats.model_fields),
+    "TemporalStats": frozenset(TemporalStats.model_fields),
+    "BooleanStats": frozenset(BooleanStats.model_fields),
+    "LengthStats": frozenset(LengthStats.model_fields),
+    "Pattern": frozenset(Pattern.model_fields),
+    "ValueFrequency": frozenset(ValueFrequency.model_fields),
+    "Quantile": frozenset(Quantile.model_fields),
+    "Histogram": frozenset(Histogram.model_fields),
+    "KeyCandidate": frozenset(KeyCandidate.model_fields),
+    "RangeConstraint": frozenset(RangeConstraint.model_fields),
+    "EnumerationConstraint": frozenset(EnumerationConstraint.model_fields),
+    "ComparisonConstraint": frozenset(ComparisonConstraint.model_fields),
+    "ExpressionConstraint": frozenset(ExpressionConstraint.model_fields),
+    "Dependency": frozenset(Dependency.model_fields),
+    "Relationship": frozenset(Relationship.model_fields),
+    "FanOutStats": frozenset(FanOutStats.model_fields),
+}
+
+
+def _schema_names_and_source_types(
+    real: Mapping[str, DataFrame],
+) -> tuple[frozenset[str], dict[tuple[str, str], str]]:
+    """Returns table/column names from `real` and `(table, column_path) -> simpleString()`."""
+    names: set[str] = set(real)
+    source_types: dict[tuple[str, str], str] = {}
+
+    def walk_field(table: str, field: T.StructField, path: str) -> None:
+        names.add(field.name)
+        source_types[(table, path)] = field.dataType.simpleString()
+        data_type = field.dataType
+        if isinstance(data_type, T.StructType):
+            for child in data_type.fields:
+                walk_field(table, child, f"{path}.{child.name}")
+        elif isinstance(data_type, T.ArrayType):
+            walk_field(table, T.StructField("element", data_type.elementType, True), f"{path}.element")
+        elif isinstance(data_type, T.MapType):
+            walk_field(table, T.StructField("key", data_type.keyType, False), f"{path}.key")
+            walk_field(table, T.StructField("value", data_type.valueType, True), f"{path}.value")
+
+    for table, frame in real.items():
+        for field in frame.schema.fields:
+            walk_field(table, field, field.name)
+    return frozenset(names), source_types
+
+
+def _profile_schema_names(profile: Profile) -> frozenset[str]:
+    """Returns table and column names declared by the profile itself (for example profiles)."""
+    names: set[str] = set()
+    for table in profile.tables:
+        names.add(table.name)
+        for path, _ in _profile_paths(table.columns, ""):
+            names.update(path.split("."))
+    return frozenset(names)
+
+
+def _is_non_string_scalar(value: object) -> bool:
+    return value is None or type(value) in (bool, int, float)
+
+
+def _is_lossless_numeric(value: str) -> bool:
+    return _DECIMAL_RE.fullmatch(value) is not None
+
+
+def _is_iso8601(value: str) -> bool:
+    return any(pattern.fullmatch(value) is not None for pattern in _ISO_TEMPORAL_RES)
+
+
+def _is_literal_audit_path(path: str) -> bool:
+    """Returns whether `path` is a top_values or enumeration literal (governed by the k-threshold audit)."""
+    return bool(
+        re.search(r"\.top_values\[\d+\]\.value$", path)
+        or re.search(r"\.check_constraints\[\d+\]\.values\[\d+\]$", path)
+    )
+
+
+def _is_pattern_regex_path(path: str) -> bool:
+    return bool(re.search(r"\.patterns\[\d+\]\.regex$", path))
+
+
+def _is_source_type_path(path: str) -> bool:
+    return path.endswith(".source_type")
+
+
+def _is_engine_meta_path(path: str) -> bool:
+    return path in ("$.engine.name", "$.engine.version") or path.endswith(".dialect")
+
+
+def _decode_profile_text(value: str) -> str:
+    """Percent-decodes then unicode-unescapes `value`, returning `value` unchanged on failure."""
+    try:
+        decoded = unquote(value, errors="strict")
+    except Exception:
+        decoded = value
+    try:
+        return codecs.decode(decoded, "unicode_escape")
+    except Exception:
+        return decoded
+
+
+def _profile_string_list(data: object) -> list[str]:
+    """Returns every string value in `data` in document order (object values before later keys)."""
+    found: list[str] = []
+
+    def walk(node: object) -> None:
+        if isinstance(node, str):
+            found.append(node)
+        elif isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(data)
+    return found
+
+
+def _scan_blobs(data: object) -> list[str]:
+    """Returns the text blobs searched for sensitive values: each string, each decoded string, and concatenations."""
+    strings = _profile_string_list(data)
+    decoded = [_decode_profile_text(s) for s in strings]
+    blobs = [*strings, *decoded, "".join(strings), "".join(decoded)]
+    return [blob.casefold().replace("\\", "") for blob in blobs]
+
+
+_LIST_ITEM_FIELDS: dict[str, frozenset[str] | None] = {
+    ".tables": _OBJECT_FIELDS["TableProfile"],
+    ".columns": _OBJECT_FIELDS["ColumnProfile"],
+    ".children": _OBJECT_FIELDS["ColumnProfile"],
+    ".patterns": _OBJECT_FIELDS["Pattern"],
+    ".top_values": _OBJECT_FIELDS["ValueFrequency"],
+    ".quantiles": _OBJECT_FIELDS["Quantile"],
+    ".check_constraints": None,
+    ".dependencies": _OBJECT_FIELDS["Dependency"],
+    ".relationships": _OBJECT_FIELDS["Relationship"],
+    ".unique_keys": _OBJECT_FIELDS["KeyCandidate"],
+}
+_NESTED_OBJECT_FIELDS = {
+    "engine": _OBJECT_FIELDS["EngineInfo"],
+    "privacy": _OBJECT_FIELDS["PrivacyPolicy"],
+    "source": _OBJECT_FIELDS["SourceInfo"],
+    "sampling": _OBJECT_FIELDS["SamplingInfo"],
+    "distinct_count": _OBJECT_FIELDS["DistinctCount"],
+    "numeric": _OBJECT_FIELDS["NumericStats"],
+    "string": _OBJECT_FIELDS["StringStats"],
+    "temporal": _OBJECT_FIELDS["TemporalStats"],
+    "boolean": _OBJECT_FIELDS["BooleanStats"],
+    "collection_length": _OBJECT_FIELDS["LengthStats"],
+    "length": _OBJECT_FIELDS["LengthStats"],
+    "histogram": _OBJECT_FIELDS["Histogram"],
+    "primary_key": _OBJECT_FIELDS["KeyCandidate"],
+    "fan_out": _OBJECT_FIELDS["FanOutStats"],
+}
+_CONSTRAINT_FIELDS = {
+    "range": _OBJECT_FIELDS["RangeConstraint"],
+    "enumeration": _OBJECT_FIELDS["EnumerationConstraint"],
+    "comparison": _OBJECT_FIELDS["ComparisonConstraint"],
+    "expression": _OBJECT_FIELDS["ExpressionConstraint"],
+}
+
+
+def _allow_closed_string(  # noqa: PLR0911
+    path: str,
+    value: str,
+    source_type_key: tuple[str, str] | None,
+    schema_names: frozenset[str],
+    source_types: Mapping[tuple[str, str], str],
+) -> bool:
+    """Returns whether `value` at `path` is an allowed closed-string form."""
+    if _is_literal_audit_path(path):
+        return True
+    if _is_pattern_regex_path(path):
+        return regex.in_dialect(value)
+    if _is_source_type_path(path):
+        return source_type_key is not None and source_types.get(source_type_key) == value
+    if _is_engine_meta_path(path):
+        return _ENGINE_ID_RE.fullmatch(value) is not None
+    if path == "$.spec_version":
+        return _SPEC_VERSION_RE.fullmatch(value) is not None
+    if value in _MODEL_ENUM_VALUES or value in _MODEL_MAP_KEYS:
+        return True
+    if _is_lossless_numeric(value) or _is_iso8601(value):
+        return True
+    return value in schema_names
+
+
+def _list_item_context(
+    path: str, allowed_keys: frozenset[str] | None, column_depth: int
+) -> tuple[frozenset[str] | None, int]:
+    for suffix, fields in _LIST_ITEM_FIELDS.items():
+        if path.endswith(suffix):
+            depth = column_depth + 1 if suffix in (".columns", ".children") else column_depth
+            return fields, depth
+    return allowed_keys, column_depth
+
+
+def _walk_closed_strings(
+    node: object,
+    path: str,
+    allowed_keys: frozenset[str] | None,
+    table: str | None,
+    column_path: str | None,
+    column_depth: int,
+    *,
+    schema_names: frozenset[str],
+    source_types: Mapping[tuple[str, str], str],
+    paths: list[str],
+) -> None:
+    """Appends JSON paths of closed-string violations under `node` to `paths`."""
+    if isinstance(node, str):
+        source_key = (table, column_path) if table and column_path and path.endswith(".source_type") else None
+        if not _allow_closed_string(path, node, source_key, schema_names, source_types):
+            paths.append(path)
+        return
+    if isinstance(node, list):
+        for index, item in enumerate(node):
+            item_allowed, item_depth = _list_item_context(path, allowed_keys, column_depth)
+            _walk_closed_strings(
+                item,
+                f"{path}[{index}]",
+                item_allowed,
+                table,
+                column_path,
+                item_depth,
+                schema_names=schema_names,
+                source_types=source_types,
+                paths=paths,
+            )
+        return
+    if not isinstance(node, dict):
+        return
+    kind = node.get("kind") if isinstance(node.get("kind"), str) else None
+    if allowed_keys is None and kind in _CONSTRAINT_FIELDS:
+        allowed_keys = _CONSTRAINT_FIELDS[kind]
+    current_table = table
+    current_column = column_path
+    if allowed_keys == _OBJECT_FIELDS["TableProfile"] and isinstance(node.get("name"), str):
+        current_table = node["name"]
+        current_column = None
+    if allowed_keys == _OBJECT_FIELDS["ColumnProfile"] and isinstance(node.get("name"), str):
+        name = node["name"]
+        current_column = name if column_depth <= 1 else f"{column_path}.{name}"
+    for key, value in node.items():
+        child_path = f"{path}.{key}"
+        if allowed_keys is not None and key not in allowed_keys:
+            if not _is_non_string_scalar(value):
+                paths.append(child_path)
+            continue
+        _walk_closed_strings(
+            value,
+            child_path,
+            _NESTED_OBJECT_FIELDS.get(key, allowed_keys),
+            current_table,
+            current_column,
+            column_depth,
+            schema_names=schema_names,
+            source_types=source_types,
+            paths=paths,
+        )
+
+
+def _unexpected_profile_strings(
+    profile: Profile, real: Mapping[str, DataFrame], data: object | None = None
+) -> dict[str, float]:
+    """Returns closed-string violations keyed by `unexpected_profile_string` and per-path detail keys.
+
+    Detail keys name the JSON path and never include the offending value. `data` defaults to the profile dump; pass a
+    raw dict when checking shipped examples that may carry unknown extension fields.
+    """
+    dump: object = profile.model_dump(mode="json") if data is None else data
+    if real:
+        schema_names, source_types = _schema_names_and_source_types(real)
+    else:
+        schema_names = _profile_schema_names(profile)
+        source_types = {
+            (table.name, path): column.source_type
+            for table in profile.tables
+            for path, column in _profile_paths(table.columns, "")
+        }
+    paths: list[str] = []
+    _walk_closed_strings(
+        dump,
+        "$",
+        _OBJECT_FIELDS["Profile"],
+        None,
+        None,
+        0,
+        schema_names=schema_names,
+        source_types=source_types,
+        paths=paths,
+    )
+    if not paths:
+        return {}
+    detail = {f"unexpected_profile_string:{path}": 1.0 for path in paths}
+    detail["unexpected_profile_string"] = float(len(paths))
+    return detail
+
+
 @dataclass(frozen=True)
 class _PatternRisk:
     """What a profile regex could give away.
@@ -483,14 +849,15 @@ def _sensitive_values_in_profile_text(
     seed: int,
     config: MetricsConfig,
 ) -> float:
-    """Returns how many sampled sensitive values appear as substrings of the serialized profile JSON.
+    """Returns how many sampled sensitive values appear in the profile's string blobs.
 
-    The JSON is case-folded and backslashes are stripped so escaped spellings still match. Values shorter than
+    Searches each string alone and the concatenation of all strings in document order, after case-folding and
+    backslash stripping, and again after percent-decoding and unicode-unescaping. Values shorter than
     `privacy.min_literal_len` are ignored.
     """
     if not real:
         return 0.0
-    blob = json.dumps(profile.model_dump(mode="json"), sort_keys=True, ensure_ascii=False).casefold().replace("\\", "")
+    blobs = _scan_blobs(profile.model_dump(mode="json"))
     min_len = config.privacy.min_literal_len
     cap = config.sampling.privacy_rows
     hits = 0
@@ -506,11 +873,11 @@ def _sensitive_values_in_profile_text(
             for value in _sample_values(values, cap, seed):
                 if len(value) < min_len:
                     continue
-                key = value.casefold()
+                key = value.casefold().replace("\\", "")
                 if key in seen:
                     continue
                 seen.add(key)
-                if key.replace("\\", "") in blob:
+                if any(key in blob for blob in blobs):
                     hits += 1
     return float(hits)
 
