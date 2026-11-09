@@ -242,7 +242,7 @@ def _generate_scalar(
     return _apply_pool(column, values, rng, report, path, uniforms)
 
 
-def _ordered_values(  # noqa: PLR0912
+def _ordered_values(  # noqa: PLR0912, PLR0915
     column: ColumnProfile,
     count: int,
     rng: np.random.Generator,
@@ -251,16 +251,19 @@ def _ordered_values(  # noqa: PLR0912
     uniforms: np.ndarray | None,
 ) -> list[Any]:
     stats = column.numeric or column.temporal
-    u = np.clip(rng.random(count) if uniforms is None else uniforms, 0.0, np.nextafter(1.0, 0.0))
+    u = _open_unit(rng.random(count) if uniforms is None else uniforms)
     if column.logical_type in _INTEGER_TYPES | {LogicalType.DECIMAL}:
         return _exact_ordered_values(column, count, rng, report, path, u)
+    endpoints: tuple[float, float] | None = None
     if column.numeric and column.numeric.histogram:
         histogram = column.numeric.histogram
         weights = np.asarray(histogram.counts, dtype=float)
         bins = np.minimum(np.searchsorted(np.cumsum(weights / weights.sum()), u, side="right"), len(weights) - 1)
-        low = np.asarray([_number(histogram.edges[index], column) for index in bins])
-        high = np.asarray([_number(histogram.edges[index + 1], column) for index in bins])
-        raw = low + rng.random(count) * (high - low)
+        low = np.asarray([_number(histogram.edges[index], column) for index in bins], dtype=float)
+        high = np.asarray([_number(histogram.edges[index + 1], column) for index in bins], dtype=float)
+        raw = _open_interval_between(low, high, _open_unit(rng.random(count)))
+        if histogram.edges:
+            endpoints = (_number(histogram.edges[0], column), _number(histogram.edges[-1], column))
         report.add(path, "used", "numeric.histogram")
         for field in ("quantiles", "min", "max", "mean", "stddev"):
             if getattr(column.numeric, field) is not None:
@@ -270,6 +273,7 @@ def _ordered_values(  # noqa: PLR0912
         xp = np.asarray([item.q for item in quantiles], dtype=float)
         fp = np.asarray([_number(item.value, column) for item in quantiles], dtype=float)
         raw = np.interp(u, xp, fp)
+        endpoints = (float(fp[0]), float(fp[-1])) if len(fp) else None
         report.add(path, "used", f"{'numeric' if column.numeric else 'temporal'}.quantiles")
         prefix = "numeric" if column.numeric else "temporal"
         for field in ("min", "max", "mean", "stddev") if column.numeric else ("min", "max"):
@@ -277,12 +281,15 @@ def _ordered_values(  # noqa: PLR0912
                 report.add(path, "ignored", f"{prefix}.{field}")
     elif stats and stats.min is not None and stats.max is not None:
         bound_low, bound_high = _number(stats.min, column), _number(stats.max, column)
+        endpoints = (bound_low, bound_high)
         if column.numeric and column.numeric.mean is not None and column.numeric.stddev is not None:
-            raw = np.clip(_normal_ppf(u) * column.numeric.stddev + column.numeric.mean, bound_low, bound_high)
+            raw = _truncated_normal(
+                u, column.numeric.mean, column.numeric.stddev, bound_low, bound_high, open_bounds=True
+            )
             report.add(path, "used", "numeric.min", "numeric.max", "numeric.mean", "numeric.stddev")
             report.add(path, "approximated", "numeric.clipped_normal")
         else:
-            raw = bound_low + u * (bound_high - bound_low)
+            raw = _open_interval_between(bound_low, bound_high, u)
             prefix = "numeric" if column.numeric else "temporal"
             report.add(path, "used", f"{prefix}.min", f"{prefix}.max")
             report.add(path, "approximated", f"{prefix}.uniform")
@@ -300,6 +307,10 @@ def _ordered_values(  # noqa: PLR0912
             raw[index] = value
         if special:
             report.add(path, "used", "numeric.non_finite")
+        elif endpoints is not None:
+            raw = _away_from_endpoints(raw, endpoints[0], endpoints[1])
+    elif column.logical_type in _TEMPORAL_TYPES and endpoints is not None:
+        raw = _away_from_endpoints(raw, endpoints[0], endpoints[1])
     return [_convert_ordered(value, column) for value in raw]
 
 
@@ -343,7 +354,11 @@ def _exact_ordered_values(
         low = _exact_number(stats.min, column)
         high = _exact_number(stats.max, column)
         if stats.mean is not None and stats.stddev is not None:
-            raw = np.clip(_normal_ppf(uniforms) * stats.stddev + stats.mean, float(low), float(high))
+            # Truncated normal keeps endpoint frequency equal to modeled tail mass after rounding;
+            # clipping would pile outside mass onto the exact observed min/max.
+            raw = _truncated_normal(
+                uniforms, float(stats.mean), float(stats.stddev), float(low), float(high), open_bounds=True
+            )
             values = [_convert_exact(min(high, max(low, Decimal(str(value)))), column) for value in raw]
             report.add(path, "used", "numeric.min", "numeric.max", "numeric.mean", "numeric.stddev")
             report.add(path, "approximated", "numeric.clipped_normal")
@@ -902,23 +917,107 @@ def _nearest_psd(matrix: np.ndarray) -> tuple[np.ndarray, bool]:
 
 
 def _normal_cdf(values: np.ndarray) -> np.ndarray:
-    probabilities = np.asarray([0.5 * (1 + math.erf(value / math.sqrt(2))) for value in values])
-    return np.clip(probabilities, 0.0, np.nextafter(1.0, 0.0))
+    probabilities = np.asarray([_standard_normal_cdf(float(value)) for value in values])
+    return _open_unit(probabilities)
 
 
 def _normal_ppf(values: np.ndarray) -> np.ndarray:
     return np.asarray([_inverse_normal(float(value)) for value in values])
 
 
+def _standard_normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
 def _inverse_normal(probability: float) -> float:
     low, high = -8.0, 8.0
     for _ in range(48):
         middle = (low + high) / 2
-        if 0.5 * (1 + math.erf(middle / math.sqrt(2))) < probability:
+        if _standard_normal_cdf(middle) < probability:
             low = middle
         else:
             high = middle
     return (low + high) / 2
+
+
+def _open_unit(values: np.ndarray | float) -> np.ndarray:
+    """Maps uniforms into (0, 1) so inverse-CDF transforms do not land on exact endpoints."""
+    return np.clip(np.asarray(values, dtype=float), np.nextafter(0.0, 1.0), np.nextafter(1.0, 0.0))
+
+
+def _open_interval_between(low: np.ndarray | float, high: np.ndarray | float, uniforms: np.ndarray) -> np.ndarray:
+    """Samples the open interval (low, high) via inverse CDF, avoiding exact endpoint atoms."""
+    u = _open_unit(uniforms)
+    lower = np.asarray(low, dtype=float)
+    upper = np.asarray(high, dtype=float)
+    open_low = np.nextafter(lower, upper)
+    open_high = np.nextafter(upper, lower)
+    width = open_high - open_low
+    usable = width > 0
+    midpoint = np.where(np.isfinite(lower + upper), (lower + upper) / 2.0, lower)
+    return np.where(usable, open_low + u * width, midpoint)
+
+
+def _truncated_normal(  # noqa: PLR0912
+    uniforms: np.ndarray,
+    mean: float,
+    stddev: float,
+    low: float,
+    high: float,
+    *,
+    open_bounds: bool,
+) -> np.ndarray:
+    """Inverse-CDF samples from Normal(mean, stddev) truncated to the observed bounds.
+
+    Copula uniforms remain usable: each draw is F^{-1}(u) of the truncated CDF. Opening the
+    bounds keeps continuous types from emitting the exact profiled extrema as point masses.
+    """
+    u = _open_unit(uniforms)
+    count = len(u)
+    result: np.ndarray | None = None
+    if count == 0:
+        result = np.asarray([], dtype=float)
+    elif not math.isfinite(low) or not math.isfinite(high):
+        if not math.isfinite(stddev) or stddev <= 0:
+            center = mean if math.isfinite(mean) else 0.0
+            result = np.full(count, center)
+        else:
+            result = mean + stddev * _normal_ppf(u)
+    else:
+        lower, upper = (high, low) if high < low else (low, high)
+        if upper == lower:
+            result = np.full(count, lower)
+        else:
+            if open_bounds:
+                open_low = np.nextafter(lower, upper)
+                open_high = np.nextafter(upper, lower)
+                if not open_low < open_high:
+                    result = np.full(count, (lower + upper) / 2.0)
+                else:
+                    lower, upper = float(open_low), float(open_high)
+            if result is None and (not math.isfinite(stddev) or stddev <= 0):
+                center = mean if math.isfinite(mean) else (lower + upper) / 2.0
+                result = np.full(count, float(np.clip(center, lower, upper)))
+            elif result is None:
+                fa = _standard_normal_cdf((lower - mean) / stddev)
+                fb = _standard_normal_cdf((upper - mean) / stddev)
+                span = fb - fa
+                if not math.isfinite(span) or span <= 0:
+                    result = lower + u * (upper - lower)
+                else:
+                    result = mean + stddev * _normal_ppf(_open_unit(fa + u * span))
+    return result
+
+
+def _away_from_endpoints(values: np.ndarray, low: float, high: float) -> np.ndarray:
+    """Nudges continuous draws off exact finite endpoints (quantile plateaus, degenerate bins)."""
+    if not math.isfinite(low) or not math.isfinite(high) or low == high:
+        return values
+    lower, upper = (high, low) if high < low else (low, high)
+    result = np.asarray(values, dtype=float).copy()
+    result[result == lower] = np.nextafter(lower, upper)
+    result[result == upper] = np.nextafter(upper, lower)
+    return result
 
 
 def _number(value: Any, column: ColumnProfile) -> float:  # noqa: ANN401
