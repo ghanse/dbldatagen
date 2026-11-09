@@ -62,7 +62,8 @@ def _recorded_path(path: str | Path, repo_root: Path) -> str:
     """Returns a portable path for persisted experiment metadata."""
     resolved = Path(path).resolve()
     try:
-        return resolved.relative_to(repo_root).as_posix() or "."
+        relative = resolved.relative_to(repo_root).as_posix()
+        return "<repo>" if relative == "." else f"<repo>/{relative}"
     except ValueError:
         return f"<external>/{resolved.name}"
 
@@ -97,6 +98,7 @@ def run_experiment(config: ExperimentConfig) -> Path:
     candidate_path = config.baseline_worktree if config.control else config.candidate_worktree
     candidate = identify_build("candidate", candidate_path)
     harness = identify_harness(policy=policy)
+    recording_root = Path(harness.harness_root)
 
     datasets = list(config.datasets) if config.datasets is not None else sorted(DATASETS)
     speed_tiers = (
@@ -115,12 +117,12 @@ def run_experiment(config: ExperimentConfig) -> Path:
         "datasets": datasets,
         "speed_tiers": speed_tiers,
         "fidelity_tier": fidelity_tier,
-        "baseline": _recorded_identity(baseline.to_dict(), repo_root),
-        "candidate": _recorded_identity(candidate.to_dict(), repo_root),
-        "harness": _recorded_identity(harness.to_dict(), repo_root),
+        "baseline": _recorded_identity(baseline.to_dict(), recording_root),
+        "candidate": _recorded_identity(candidate.to_dict(), recording_root),
+        "harness": _recorded_identity(harness.to_dict(), recording_root),
         "policy": policy,
-        "policy_path": _recorded_path(config.policy_path, repo_root),
-        "command_line": _recorded_command(config.command_line or sys.argv, repo_root),
+        "policy_path": _recorded_path(config.policy_path, recording_root),
+        "command_line": _recorded_command(config.command_line or sys.argv, recording_root),
         "machine": machine_info(),
         "not_measured": policy.get("not_measured", []),
     }
