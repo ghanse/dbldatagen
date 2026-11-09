@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import math
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import numpy as np
@@ -12,14 +14,27 @@ from pyspark.sql import SparkSession
 from scipy import stats
 
 from dbldatagen_profiler.engines.spark import profile_tables
-from dbldatagen_profiler.model import Histogram, LogicalType, NumericStats, Quantile, TableProfile, TemporalStats
+from dbldatagen_profiler.model import (
+    ColumnProfile,
+    Histogram,
+    LogicalType,
+    NumericStats,
+    Quantile,
+    TableProfile,
+    TemporalStats,
+)
 from profiler_bench.catalog import load
 from profiler_bench.runner.scorer import try_real_scorer
+from profiler_bench.sampler import core as sampler_core
 from profiler_bench.sampler import sample
 from profiler_bench.sampler.core import (
     _calibrate_truncated_parameters,
+    _calibrate_truncated_parameters_exact,
+    _exact_number,
+    _exact_truncated_normal,
     _standard_normal_cdf,
     _truncated_moments,
+    _truncated_moments_exact,
     _truncated_normal,
 )
 
@@ -99,76 +114,164 @@ def test_truncated_normal_zero_and_missing_stddev_fallbacks(spark: SparkSession)
     assert float(np.mean((values == 2.0) | (values == 8.0))) < 0.001
 
 
-def test_exact_int64_and_decimal_truncated_normal_preserve_domain(spark: SparkSession) -> None:
-    """Exact int64/decimal draws keep the profiled mean/sd; float(mu) near 2^63 must not shift them."""
-    row_count = 8_000
-    int_mean = 2**63 - 10_000
-    int_sd = 100
-    int_low = int_mean - 1_000
-    int_high = int_mean + 1_000
-    int_stats = NumericStats(min=str(int_low), max=str(int_high), mean=str(int_mean), stddev=str(int_sd))
-    int_values = np.asarray(
-        [
-            row.x
-            for row in sample(
-                profile(
-                    TableProfile(
-                        name="t",
-                        row_count=row_count,
-                        columns=[column("x", LogicalType.INT64, numeric=int_stats)],
-                    )
-                ),
-                spark,
-                seed=19,
-            )
-            .tables["t"]
-            .collect()
-        ],
-        dtype=object,
+def _exact_stats_column(
+    kind: LogicalType,
+    low: Decimal,
+    high: Decimal,
+    mean: Decimal,
+    stddev: Decimal,
+    *,
+    precision: int | None = None,
+    scale: int | None = None,
+) -> ColumnProfile:
+    """NumericStats with lossless Decimal mean/stddev (model_construct bypasses float coercion)."""
+    stats = NumericStats.model_construct(
+        min=format(low, "f"),
+        max=format(high, "f"),
+        mean=mean,
+        stddev=stddev,
     )
-    int_as_float = np.asarray([float(value - int_mean) for value in int_values], dtype=float)
-    int_se = int_sd / math.sqrt(row_count)
-    assert all(isinstance(value, int) and int_low <= value <= int_high for value in int_values)
-    assert float(np.mean([value in (int_low, int_high) for value in int_values])) < 0.05
-    assert abs(float(np.mean(int_as_float))) <= 3 * int_se
-    assert float(np.std(int_as_float, ddof=1)) == pytest.approx(int_sd, rel=0.10)
+    name = "amount" if kind == LogicalType.DECIMAL else "x"
+    source = f"decimal({precision},{scale})" if kind == LogicalType.DECIMAL else kind.value
+    return ColumnProfile.model_construct(
+        name=name,
+        logical_type=kind,
+        source_type=source,
+        nullable=False,
+        null_fraction=0.0,
+        precision=precision,
+        scale=scale,
+        numeric=stats,
+    )
 
-    # Near decimal(38,10)'s ~1e28 magnitude, float(low)==float(high)==float(mean).
-    # mean+1000 == 1e28 needs 29 integer digits, so the upper bound is the type max (~mean+1000).
-    dec_mean = Decimal("9999999999999999999999999000.0000000000")
-    dec_sd = Decimal("100.0000000000")
-    dec_low = dec_mean - Decimal("1000.0000000000")
-    dec_high = Decimal("9999999999999999999999999999.9999999999")
-    assert float(dec_low) == float(dec_high) == float(dec_mean)
-    dec_stats = NumericStats(
-        min=format(dec_low, "f"),
-        max=format(dec_high, "f"),
-        mean=format(dec_mean, "f"),
-        stddev=format(dec_sd, "f"),
+
+@pytest.mark.parametrize(
+    ("label", "center", "kind", "precision", "scale"),
+    [
+        ("0", Decimal(0), LogicalType.INT64, None, None),
+        ("1e10", Decimal("10000000000"), LogicalType.INT64, None, None),
+        ("2^62", Decimal(2**62), LogicalType.INT64, None, None),
+        ("1e28", Decimal("9999999999999999999999998500.0000000000"), LogicalType.DECIMAL, 38, 10),
+    ],
+)
+@pytest.mark.parametrize(
+    ("asymmetry", "fraction"),
+    [("mid", Decimal("0.5")), ("low10", Decimal("0.1")), ("low90", Decimal("0.9"))],
+)
+def test_exact_truncated_normal_property_across_magnitudes_and_asymmetry(
+    label: str,
+    center: Decimal,
+    kind: LogicalType,
+    precision: int | None,
+    scale: int | None,
+    asymmetry: str,
+    fraction: Decimal,
+) -> None:
+    """Exact-type truncated normal keeps location across magnitudes and asymmetric means."""
+    del label, asymmetry
+    range_width = Decimal(1000)
+    stddev = range_width / Decimal(10)
+    low = center - range_width / Decimal(2)
+    high = center + range_width / Decimal(2)
+    mean = low + fraction * range_width
+    with localcontext() as ctx:
+        ctx.prec = 50
+        if kind != LogicalType.DECIMAL:
+            low, high, mean, stddev = (value.to_integral_value() for value in (low, high, mean, stddev))
+        else:
+            quantum = Decimal("0.0000000001")
+            low, high, mean, stddev = (value.quantize(quantum) for value in (low, high, mean, stddev))
+            assert float(low) == float(high) == float(mean)
+    column_profile = _exact_stats_column(kind, low, high, mean, stddev, precision=precision, scale=scale)
+    stats = column_profile.numeric
+    assert stats is not None
+    assert isinstance(stats.mean, Decimal)
+    assert isinstance(stats.stddev, Decimal)
+
+    count = 8_000
+    uniforms = np.linspace(np.nextafter(0.0, 1.0), np.nextafter(1.0, 0.0), count)
+    values = _exact_truncated_normal(
+        uniforms,
+        stats.mean,
+        stats.stddev,
+        _exact_number(stats.min, column_profile),
+        _exact_number(stats.max, column_profile),
+        column_profile,
     )
-    dec_values = [
-        row.amount
-        for row in sample(
-            profile(
-                TableProfile(
-                    name="t",
-                    row_count=row_count,
-                    columns=[column("amount", LogicalType.DECIMAL, precision=38, scale=10, numeric=dec_stats)],
-                )
-            ),
-            spark,
-            seed=21,
-        )
-        .tables["t"]
-        .collect()
-    ]
-    dec_offsets = np.asarray([float(value - dec_mean) for value in dec_values], dtype=float)
-    dec_se = float(dec_sd) / math.sqrt(row_count)
-    assert all(isinstance(value, Decimal) and dec_low <= value <= dec_high for value in dec_values)
-    assert all(value.as_tuple().exponent == -10 for value in dec_values)
-    assert float(np.mean([value in (dec_low, dec_high) for value in dec_values])) < 0.05
-    assert abs(float(np.mean(dec_offsets))) <= 3 * dec_se
-    assert float(np.std(dec_offsets, ddof=1)) == pytest.approx(float(dec_sd), rel=0.10)
+    with localcontext() as ctx:
+        ctx.prec = 50
+        mu, sigma = _calibrate_truncated_parameters_exact(mean, stddev, low, high)
+        expected_mean, expected_std = _truncated_moments_exact(mu, sigma, low, high)
+        offsets = [value - expected_mean for value in values]
+        se = expected_std / Decimal(str(math.sqrt(count)))
+        mean_error = abs(sum(offsets, Decimal(0)) / Decimal(count))
+
+    assert all(low <= value <= high for value in values)
+    if kind == LogicalType.DECIMAL:
+        assert all(isinstance(value, Decimal) and value.as_tuple().exponent == -10 for value in values)
+    else:
+        assert all(isinstance(value, int) for value in values)
+    assert sum(value in (low, high) for value in values) / count < 0.005
+    assert mean_error <= Decimal(3) * se
+    sampled_std = float(np.std([float(offset) for offset in offsets], ddof=1))
+    assert sampled_std == pytest.approx(float(expected_std), rel=0.15)
+
+
+def test_exact_path_rejects_float_collapse_for_asymmetric_decimal_means() -> None:
+    """At ~1e28, asymmetric Decimal means stay distinct even though float(mean) collides."""
+    range_width = Decimal(1000)
+    stddev = range_width / Decimal(10)
+    center = Decimal("9999999999999999999999998500.0000000000")
+    with localcontext() as ctx:
+        ctx.prec = 50
+        quantum = Decimal("0.0000000001")
+        low = (center - range_width / Decimal(2)).quantize(quantum)
+        high = (center + range_width / Decimal(2)).quantize(quantum)
+        left = (low + Decimal("0.1") * range_width).quantize(quantum)
+        right = (low + Decimal("0.9") * range_width).quantize(quantum)
+    assert float(left) == float(right) == float(low) == float(high)
+
+    column_profile = _exact_stats_column(LogicalType.DECIMAL, low, high, left, stddev, precision=38, scale=10)
+    uniforms = np.linspace(np.nextafter(0.0, 1.0), np.nextafter(1.0, 0.0), 4_000)
+    left_vals = _exact_truncated_normal(uniforms, left, stddev, low, high, column_profile)
+    right_vals = _exact_truncated_normal(uniforms, right, stddev, low, high, column_profile)
+    with localcontext() as ctx:
+        ctx.prec = 50
+        left_mean = sum(left_vals, Decimal(0)) / Decimal(len(left_vals))
+        right_mean = sum(right_vals, Decimal(0)) / Decimal(len(right_vals))
+        assert abs(left_mean - left) < abs(left_mean - right)
+        assert abs(right_mean - right) < abs(right_mean - left)
+        assert abs(left_mean - right_mean) > Decimal(100)
+
+
+def test_exact_truncated_path_source_has_no_float_exact_quantities() -> None:
+    """Static guard: exact-path helpers must not float()-cast min/max/mean/mid/offsets."""
+    allowed_float_args = {"uniform", "uniforms", "value"}  # open-unit ranks / loop vars only
+
+    for name in (
+        "_exact_location",
+        "_exact_scale",
+        "_exact_truncated_normal",
+        "_calibrate_truncated_parameters_exact",
+        "_standardized_bounds",
+        "_truncated_moments_exact",
+    ):
+        source = inspect.getsource(getattr(sampler_core, name))
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Name) or node.func.id != "float":
+                continue
+            assert len(node.args) == 1
+            arg = node.args[0]
+            if isinstance(arg, ast.Name):
+                assert arg.id in allowed_float_args or arg.id == "uniform", f"{name} float-casts exact name {arg.id!r}"
+                continue
+            # Only Decimal divisions for standardized a/b are allowed as float(...).
+            assert isinstance(arg, ast.BinOp) and isinstance(
+                arg.op, ast.Div
+            ), f"{name} has a non-division float() argument: {ast.dump(arg)}"
 
 
 def test_truncated_normal_mean_stddev_calibration_or_documented_shift(spark: SparkSession) -> None:

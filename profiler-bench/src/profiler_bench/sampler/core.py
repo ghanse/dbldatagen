@@ -1196,56 +1196,57 @@ def _truncated_moment_factors(alpha: float, beta: float) -> tuple[float, float] 
 
 
 def _exact_location(mean: float | str | Decimal, low: Decimal, high: Decimal) -> Decimal:
-    """Builds an exact-domain mean without converting bounds through float.
+    """Parses mean into Decimal without casting bounds, mid, or offsets through float().
 
-    `NumericStats.mean` is an approximate JSON number. Absolute float(mean) is useless near
-    1e28 where float(low)==float(high). Anchor at the exact Decimal midpoint of the lossless
-    bounds and apply only the float offset of mean from that midpoint (0 when they collapse).
+    Decimal/str means stay exact. A float mean (NumericStats JSON number) becomes
+    `Decimal(mean)` (the float's exact dyadic value) and is clamped to [low, high].
+    Callers that need a lossless large-magnitude mean must supply Decimal or str
+    (tests use model_construct).
     """
-    if isinstance(mean, Decimal):
-        return mean
-    if isinstance(mean, str):
-        return Decimal(mean)
     with localcontext() as ctx:
         ctx.prec = 50
-        mid = (low + high) / Decimal(2)
-        if not math.isfinite(mean):
-            return mid
-        offset = float(mean) - float(mid)
-        if not math.isfinite(offset):
-            return mid
-        return mid + Decimal(str(offset))
+        if isinstance(mean, Decimal):
+            value = mean
+        elif isinstance(mean, str):
+            value = Decimal(mean)
+        elif not math.isfinite(mean):
+            value = (low + high) / Decimal(2)
+        else:
+            value = Decimal(mean)
+        return min(high, max(low, value))
 
 
 def _exact_scale(stddev: float | str | Decimal) -> Decimal:
-    """Parses stddev without deriving it from float bounds."""
-    if isinstance(stddev, Decimal):
-        return stddev
-    if isinstance(stddev, str):
+    """Parses stddev into Decimal without float arithmetic on bounds or other exact quantities."""
+    with localcontext() as ctx:
+        ctx.prec = 50
+        if isinstance(stddev, Decimal):
+            return stddev
+        if isinstance(stddev, str):
+            return Decimal(stddev)
+        if not math.isfinite(stddev) or stddev < 0:
+            return Decimal(0)
         return Decimal(stddev)
-    if not math.isfinite(stddev) or stddev < 0:
-        return Decimal(0)
-    return Decimal(str(stddev))
 
 
 def _standardized_bounds(low: Decimal, high: Decimal, mu: Decimal, sigma: Decimal) -> tuple[float, float]:
-    """Returns (a, b) = ((low-mu)/sigma, (high-mu)/sigma); Decimal first, float only for a/b."""
-    alpha = (low - mu) / sigma
-    beta = (high - mu) / sigma
-    return float(alpha), float(beta)
+    """Returns (a, b) from Decimal (low-mu)/sigma and (high-mu)/sigma; float only after division."""
+    with localcontext() as ctx:
+        ctx.prec = 50
+        return float((low - mu) / sigma), float((high - mu) / sigma)
 
 
 def _calibrate_truncated_parameters_exact(
     mean: Decimal, stddev: Decimal, low: Decimal, high: Decimal
 ) -> tuple[Decimal, Decimal]:
-    """Calibrates (mu, sigma) in Decimal; truncated factors use only standardized float (a, b)."""
+    """Calibrates (mu, sigma) in Decimal; only standardized (a, b) and sd-unit factors use float."""
     if stddev <= 0 or not (low < high) or not (low < mean < high):
         return mean, stddev
     with localcontext() as ctx:
         ctx.prec = 50
         mu, sigma = mean, stddev
         best = (mu, sigma)
-        best_error = math.inf
+        best_error = Decimal("Infinity")
         for _ in range(25):
             alpha, beta = _standardized_bounds(low, high, mu, sigma)
             factors = _truncated_moment_factors(alpha, beta)
@@ -1256,13 +1257,11 @@ def _calibrate_truncated_parameters_exact(
             current_std = sigma * Decimal(str(scale))
             if current_std <= 0:
                 break
-            error = float(abs(current_mean - mean) / max(abs(mean), Decimal(1))) + float(
-                abs(current_std - stddev) / stddev
-            )
+            error = abs(current_mean - mean) / max(abs(mean), Decimal(1)) + abs(current_std - stddev) / stddev
             if error < best_error:
                 best_error = error
                 best = (mu, sigma)
-            if error < 0.01:
+            if error < Decimal("0.01"):
                 return mu, sigma
             mu += mean - current_mean
             sigma = max(sigma * (stddev / current_std), stddev * Decimal("1e-6"))
@@ -1279,6 +1278,20 @@ def _calibrate_truncated_parameters_exact(
         return mean, stddev
 
 
+def _truncated_moments_exact(mean: Decimal, stddev: Decimal, low: Decimal, high: Decimal) -> tuple[Decimal, Decimal]:
+    """Exact-domain truncated mean/stddev using Decimal location/scale and standardized factors."""
+    with localcontext() as ctx:
+        ctx.prec = 50
+        if stddev <= 0 or not (low < high):
+            center = min(high, max(low, mean))
+            return center, Decimal(0)
+        factors = _truncated_moment_factors(*_standardized_bounds(low, high, mean, stddev))
+        if factors is None:
+            return (low + high) / Decimal(2), Decimal(0)
+        delta, scale = factors
+        return mean + stddev * Decimal(str(delta)), stddev * Decimal(str(scale))
+
+
 def _exact_truncated_normal(
     uniforms: np.ndarray,
     mean: float | str | Decimal,
@@ -1289,17 +1302,18 @@ def _exact_truncated_normal(
 ) -> list[Any]:
     """Draws truncated-normal z in float, then maps mu+sigma*z with Decimal/int exact arithmetic.
 
-    Location/scale stay Decimal; only standardized bounds (a, b) and z cross through float.
+    Exact quantities (min/max/mean/stddev/mid/offsets) stay Decimal; only standardized (a, b)
+    and z are floats, each from a Decimal division (or inverse-CDF) first.
     """
     if high < low:
         low, high = high, low
-    mean_d = _exact_location(mean, low, high)
-    std_d = _exact_scale(stddev)
-    if high == low or std_d <= 0:
-        center = min(high, max(low, mean_d))
-        return [_convert_exact(center, column) for _ in uniforms]
     with localcontext() as ctx:
         ctx.prec = 50
+        mean_d = _exact_location(mean, low, high)
+        std_d = _exact_scale(stddev)
+        if high == low or std_d <= 0:
+            center = min(high, max(low, mean_d))
+            return [_convert_exact(center, column) for _ in uniforms]
         mu_d, sigma_d = _calibrate_truncated_parameters_exact(mean_d, std_d, low, high)
         if sigma_d <= 0:
             return [_convert_exact(min(high, max(low, mu_d)), column) for _ in uniforms]
