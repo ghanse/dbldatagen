@@ -269,6 +269,7 @@ frames = result.tables
 coverage = result.report
 ```
 
+When only min/max/mean/stddev are available, numeric draws use a truncated normal (inverse-CDF within the observed bounds) rather than clipping, so exact profiled extrema are not piled as point masses.
 Pearson and Spearman dependencies use a Gaussian copula with a nearest-positive-semidefinite correlation matrix.
 Cramér's V is approximated by replacing the requested share of sampled right-hand categories through a deterministic
 left-to-right category mapping; the requested coefficient controls the mixture strength but is not guaranteed to equal
