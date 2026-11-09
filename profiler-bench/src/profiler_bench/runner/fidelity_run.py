@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
@@ -11,7 +12,7 @@ import tempfile
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from profiler_bench.runner.measure import rotate_order
 from profiler_bench.runner.scorer import FakeScorer, FidelityScores, Scorer, real_scorer_spec
@@ -236,7 +237,12 @@ def _run_cell(
         ]
         if cache_dir is not None:
             command.extend(["--cache-dir", str(cache_dir)])
-        completed = _run_worker_command(command, timeout_s=cell_timeout_s, kill_grace_s=kill_grace_s)
+        completed = _run_worker_command(
+            command,
+            timeout_s=cell_timeout_s,
+            kill_grace_s=kill_grace_s,
+            log_dir=tmp_path,
+        )
         return _records_from_worker(
             role=role,
             dataset=dataset,
@@ -253,42 +259,56 @@ def _run_worker_command(
     *,
     timeout_s: float,
     kill_grace_s: float,
+    log_dir: Path,
 ) -> subprocess.CompletedProcess[str]:
-    """Runs a worker in its own process group and enforces `timeout_s`."""
-    proc = subprocess.Popen(
-        list(command),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
+    """Runs a worker in its own process group and enforces `timeout_s`.
+
+    Worker stdout/stderr go to log files (not pipes) so a surviving descendant cannot
+    hang the parent in ``communicate()``.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path = log_dir / "worker.stdout"
+    stderr_path = log_dir / "worker.stderr"
     timed_out = False
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _terminate_process_group(proc.pid, grace_s=kill_grace_s)
-        stdout, stderr = proc.communicate()
+    with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open("w", encoding="utf-8") as stderr_file:
+        proc = subprocess.Popen(
+            list(command),
+            stdout=stdout_file,
+            stderr=stderr_file,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_process_group(proc.pid, grace_s=kill_grace_s)
+            try:
+                proc.wait(timeout=max(kill_grace_s, 0.1) + 2.0)
+            except subprocess.TimeoutExpired:
+                _signal_process_group(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=2.0)
     result = subprocess.CompletedProcess(
         args=list(command),
         returncode=proc.returncode if proc.returncode is not None else -1,
-        stdout=stdout or "",
-        stderr=stderr or "",
+        stdout=stdout_path.read_text() if stdout_path.is_file() else "",
+        stderr=stderr_path.read_text() if stderr_path.is_file() else "",
     )
     result.timed_out = timed_out  # type: ignore[attr-defined]
     return result
 
 
 def _terminate_process_group(pid: int, *, grace_s: float) -> None:
-    """SIGTERM the worker process group, then SIGKILL after `grace_s`."""
-    if not _signal_process_group(pid, signal.SIGTERM):
-        return
+    """SIGTERM the worker process group, then SIGKILL if the group still exists."""
+    _signal_process_group(pid, signal.SIGTERM)
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline:
-        if not _process_alive(pid):
+        if not _process_group_alive(pid):
             return
         time.sleep(0.05)
-    _signal_process_group(pid, signal.SIGKILL)
+    if _process_group_alive(pid):
+        _signal_process_group(pid, signal.SIGKILL)
 
 
 def _signal_process_group(pid: int, sig: signal.Signals | int) -> bool:
@@ -306,14 +326,15 @@ def _signal_process_group(pid: int, sig: signal.Signals | int) -> bool:
             return False
 
 
-def _process_alive(pid: int) -> bool:
-    """Returns whether `pid` (the session/process-group leader) is still alive."""
+def _process_group_alive(pgid: int) -> bool:
+    """Returns whether any member of process group `pgid` still exists."""
     try:
-        os.kill(pid, 0)
+        os.killpg(pgid, 0)
         return True
     except ProcessLookupError:
         return False
     except PermissionError:
+        # macOS can raise PermissionError for signal 0 even when the group remains.
         return True
 
 
@@ -344,61 +365,73 @@ def _records_from_worker(
     samples_dir: Path,
     completed: subprocess.CompletedProcess[str],
 ) -> list[dict[str, Any]]:
-    timed_out = bool(getattr(completed, "timed_out", False))
-    if timed_out:
-        return _failed_cell(
-            role,
-            dataset,
-            tier,
-            seeds,
-            "WorkerTimeout",
-            f"fidelity worker exceeded cell timeout (returncode={completed.returncode})",
-            samples_dir,
-        )
+    failure = _worker_failure(
+        out_path=out_path, completed=completed, role=role, dataset=dataset, tier=tier, seeds=seeds
+    )
+    if failure is not None:
+        error_class, error = failure
+        return _failed_cell(role, dataset, tier, seeds, error_class, error, samples_dir)
 
-    payload, parse_error = _load_worker_payload(out_path)
-    if completed.returncode != 0:
-        detail = parse_error or (payload or {}).get("error") or completed.stderr[-2000:]
-        return _failed_cell(
-            role,
-            dataset,
-            tier,
-            seeds,
-            "WorkerCrashed",
-            f"fidelity worker exited {completed.returncode}: {detail}",
-            samples_dir,
-        )
-    if payload is None:
-        return _failed_cell(
-            role,
-            dataset,
-            tier,
-            seeds,
-            "WorkerOutputInvalid",
-            parse_error or "fidelity worker produced missing or invalid JSON",
-            samples_dir,
-        )
-
-    raw_records = payload.get("records")
-    if not payload.get("ok") or not isinstance(raw_records, list):
-        return _failed_cell(
-            role,
-            dataset,
-            tier,
-            seeds,
-            "WorkerOutputInvalid",
-            str(payload.get("error") or "fidelity worker payload missing ok records"),
-            samples_dir,
-        )
-
-    records = [dict(record) for record in raw_records]
-    mismatch = _payload_mismatch(records, role=role, dataset=dataset, tier=tier, seeds=seeds)
-    if mismatch is not None:
-        return _failed_cell(role, dataset, tier, seeds, "WorkerOutputMismatch", mismatch, samples_dir)
-
+    payload, _ = _load_worker_payload(out_path)
+    assert payload is not None  # narrowed by _worker_failure
+    records = [dict(record) for record in cast(list[dict[str, Any]], payload["records"])]
     for record in records:
         _write_sample(samples_dir, record)
     return records
+
+
+def _worker_failure(
+    *,
+    out_path: Path,
+    completed: subprocess.CompletedProcess[str],
+    role: str,
+    dataset: str,
+    tier: str,
+    seeds: Sequence[int],
+) -> tuple[str, str] | None:
+    """Returns `(error_class, error)` when the worker result cannot be accepted."""
+    error_class: str | None = None
+    error: str | None = None
+    if bool(getattr(completed, "timed_out", False)):
+        error_class = "WorkerTimeout"
+        error = f"fidelity worker exceeded cell timeout (returncode={completed.returncode})"
+    else:
+        payload, parse_error = _load_worker_payload(out_path)
+        if completed.returncode != 0:
+            detail = parse_error or (payload or {}).get("error") or completed.stderr[-2000:]
+            error_class = "WorkerCrashed"
+            error = f"fidelity worker exited {completed.returncode}: {detail}"
+        elif payload is None:
+            error_class = "WorkerOutputInvalid"
+            error = parse_error or "fidelity worker produced missing or invalid JSON"
+        elif not payload.get("ok"):
+            error_class = "WorkerOutputInvalid"
+            error = str(payload.get("error") or "fidelity worker payload missing ok records")
+        else:
+            raw_records = payload.get("records")
+            shape_error = _records_shape_error(raw_records)
+            if shape_error is not None:
+                error_class = "WorkerOutputInvalid"
+                error = shape_error
+            else:
+                records = [dict(record) for record in cast(list[dict[str, Any]], raw_records)]
+                mismatch = _payload_mismatch(records, role=role, dataset=dataset, tier=tier, seeds=seeds)
+                if mismatch is not None:
+                    error_class = "WorkerOutputMismatch"
+                    error = mismatch
+    if error_class is None or error is None:
+        return None
+    return error_class, error
+
+
+def _records_shape_error(raw_records: object) -> str | None:
+    """Returns an error when `records` is not a list of dicts."""
+    if not isinstance(raw_records, list):
+        return f"records must be a list, got {type(raw_records).__name__}"
+    for index, record in enumerate(raw_records):
+        if not isinstance(record, dict):
+            return f"records[{index}] must be an object, got {type(record).__name__}"
+    return None
 
 
 def _load_worker_payload(out_path: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -474,6 +507,7 @@ def _failed_seed(
 
 def _write_sample(samples_dir: Path, record: dict[str, Any]) -> None:
     seed = record["seed"]
+    samples_dir.mkdir(parents=True, exist_ok=True)
     path = samples_dir / f"fidelity-{record['role']}-{record['dataset']}-{record['tier']}-seed-{seed}.json"
     path.write_text(json.dumps(record, sort_keys=True, default=str))
 

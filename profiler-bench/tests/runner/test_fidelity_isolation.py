@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import textwrap
 import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from profiler_bench.runner import fidelity_worker
 from profiler_bench.runner.experiment import ExperimentConfig, run_experiment
-from profiler_bench.runner.fidelity_run import run_fidelity_samples, score_one_seed
+from profiler_bench.runner.fidelity_run import _records_from_worker, run_fidelity_samples, score_one_seed
 from profiler_bench.runner.policy import DEFAULT_POLICY
 from profiler_bench.runner.scorer import FakeScorer
 from profiler_bench.runner.spark_conf import fidelity_spark_config
@@ -217,6 +220,83 @@ def test_worker_timeout_marks_cell_and_kills_children(tmp_path: Path) -> None:
         time.sleep(0.05)
     else:
         raise AssertionError(f"child process {child_pid} survived worker timeout")
+
+
+def test_timeout_kills_sigterm_resistant_descendant(tmp_path: Path) -> None:
+    worker = tmp_path / "sigterm_resistant_worker.py"
+    child_pid_file = tmp_path / "child.pid"
+    # Leader stays alive until timeout; the child ignores SIGTERM so only SIGKILL ends it.
+    _write_fake_worker(
+        worker,
+        f"""
+        args = _parse()
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(1000)",
+            ],
+            start_new_session=False,
+        )
+        Path({str(child_pid_file)!r}).write_text(str(child.pid))
+        time.sleep(1000)
+        """,
+    )
+    timeout_s = 0.4
+    grace_s = 0.2
+    slack_s = 2.0
+    started = time.monotonic()
+    records = run_fidelity_samples(
+        speed_records=[_speed_profile("baseline", "numeric"), _speed_profile("candidate", "numeric")],
+        scorer_baseline=FakeScorer(),
+        scorer_candidate=FakeScorer(),
+        datasets=["numeric"],
+        policy={"fidelity_tier": "xs", "fidelity_seeds": 1},
+        samples_dir=tmp_path / "samples",
+        fidelity_spark=fidelity_spark_config(driver_memory="8g"),
+        cell_timeout_s=timeout_s,
+        kill_grace_s=grace_s,
+        worker_prefix=[sys.executable, str(worker)],
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < timeout_s + grace_s + slack_s
+    assert all(record["error_class"] == "WorkerTimeout" for record in records)
+    child_pid = int(child_pid_file.read_text())
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError(f"SIGTERM-resistant child {child_pid} survived timeout cleanup")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"ok": True, "records": [None]},
+        {"ok": True, "records": [1]},
+        {"ok": True, "records": "x"},
+        [],
+    ],
+)
+def test_malformed_worker_records_are_worker_output_invalid(tmp_path: Path, payload: object) -> None:
+    out_path = tmp_path / "cell.json"
+    out_path.write_text(json.dumps(payload))
+    completed = subprocess.CompletedProcess(args=["fake"], returncode=0, stdout="", stderr="")
+    records = _records_from_worker(
+        role="baseline",
+        dataset="numeric",
+        tier="xs",
+        seeds=[0, 1],
+        out_path=out_path,
+        samples_dir=tmp_path / "samples",
+        completed=completed,
+    )
+    assert len(records) == 2
+    assert all(not record["ok"] and record["error_class"] == "WorkerOutputInvalid" for record in records)
 
 
 def test_truncated_worker_json_is_worker_output_invalid(tmp_path: Path) -> None:
