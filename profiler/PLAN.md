@@ -94,7 +94,7 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P1.3c | Investigate retail real-vs-real ceiling 0.94 (order_items 0.86): suspected catalog Zipf parent ranking varying by sample seed | P1.3, P1.5 | todo |
 | P1.3b | Register real public datasets in the catalog (download + checksum hook exists; none registered) — needs a decision on which datasets are reachable through the proxy | P1.3 | todo |
 | P1.8a | Fix: profiler fails on nested at tier s (`TypeError: unhashable type: 'list'`) | P1.2, P2.1 | merged (PR #16) |
-| P1.8b | Fix: runner scores all fidelity cells in one SparkSession; driver OOM cascades into every later sample. Isolate per (build, dataset) worker, 8g driver | P1.6a | in-progress |
+| P1.8b | Fix: runner scores all fidelity cells in one SparkSession; driver OOM cascades into every later sample. Isolate per (build, dataset) worker, 8g driver | P1.6a | merged (PR #17) |
 | P1.9 | Rust engine scaffold (Polars vs DataFusion decision, CLI binary, spec-valid output for the baseline features) | P1.1, Rust toolchain | deferred (human decision 2026-11-06: PySpark-only Phase 1; Rust engine later) |
 
 ### Phase 1b — PII (human request 2026-11-07)
