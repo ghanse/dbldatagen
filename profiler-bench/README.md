@@ -214,9 +214,12 @@ Profile regex and text privacy is layered (synth-data leakage is the last):
    (default 10_000) strings — the full enumeration of that language under the shared regex work budget (exhaustion
    fails conservatively). Every sensitive column is then scanned in Spark over **all** rows (case-folded): exact
    semi-join against enumerated strings; sensitive values of length at least `min_literal_len` that are substrings of
-   any candidate text; and candidate factors that are substrings of sensitive values. A hit fails with reason
-   `sensitive_value_in_profile`, naming the sensitive column and JSON path, never the value. The sampled per-value
-   regex language check is kept as well.
+   any candidate text; and candidate factors that are substrings of sensitive values. Independently, every
+   dialect-accepted non-structural pattern branch is fullmatched against all sensitive values in Spark; matched
+   values are aggregated to distinct `(branch, length)` pairs (length capped at `max_regex_length`), and each pair's
+   language size is counted once on the driver under the shared budget. A count below max(k, `min_regex_language`)
+   fails with reason `sensitive_value_in_profile`, naming the sensitive column, JSON path, and branch index — never
+   the value. Budget exhaustion fails conservatively. The sampled per-value regex language check is kept as well.
 5. **Structural generalization (sensitive columns).** Columns the manifest marks `direct_identifier`, `secret`, or
    `free_text` may only carry literal-free patterns (spec 0.2.0). After dropping group syntax and anchors, and folding
    single-character and case-only classes such as `[jJ]` into literals, the pattern must not contain a literal

@@ -394,6 +394,52 @@ def test_unsampled_sensitive_value_in_non_sensitive_pattern_fails(
         assert not score.passed
 
 
+def _plant_email(real: dict[str, DataFrame], value: str) -> dict[str, DataFrame]:
+    order = Window.orderBy("customer_id")
+    customers = real["customers"].withColumn(
+        "email", F.when(F.row_number().over(order) == 1, F.lit(value)).otherwise(F.col("email"))
+    )
+    return {**real, "customers": customers}
+
+
+def test_unsampled_medium_two_choice_language_fails(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 2^14 = 16384 lies between max_enumerated_strings (10k) and min_regex_language (1e6).
+    planted = "a" * 14
+    pattern = "[ab]" * 14
+    assert 10_000 < 2**14 < 1_000_000
+    monkeypatch.setattr(privacy, "_sample_values", lambda *args, **kwargs: [])
+    leaky = _with_patterns(profile, "products", "sku", [pattern])
+    score = score_privacy(
+        _plant_email(real, planted), _independent(spark), leaky, materialize("retail", "xs", 0).manifest
+    )
+    detail = {c.name: c for c in score.checks}
+    assert detail["profile.sensitive_value_leaks"].detail["sensitive_value_in_profile"] >= 1.0
+    assert any(
+        key.startswith("sensitive_value_in_profile:customers.email:") and key.endswith(":0")
+        for key in detail["profile.sensitive_value_leaks"].detail
+    )
+    assert not score.passed
+
+
+def test_unsampled_huge_two_choice_language_passes_threshold(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 2^22 > min_regex_language (1e6): documents the language-size threshold.
+    planted = "a" * 22
+    pattern = "[ab]" * 22
+    assert 2**22 > 1_000_000
+    monkeypatch.setattr(privacy, "_sample_values", lambda *args, **kwargs: [])
+    leaky = _with_patterns(profile, "products", "sku", [pattern])
+    score = score_privacy(
+        _plant_email(real, planted), _independent(spark), leaky, materialize("retail", "xs", 0).manifest
+    )
+    detail = {c.name: c for c in score.checks}
+    assert detail["profile.sensitive_value_leaks"].detail.get("sensitive_value_in_profile", 0.0) == 0.0
+    assert detail["profile.sensitive_value_leaks"].passed
+
+
 def test_example_profiles_pass_closed_strings() -> None:
     for path in sorted(_EXAMPLES.glob("*.json")):
         raw = json.loads(path.read_text())

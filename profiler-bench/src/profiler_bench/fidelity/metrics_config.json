@@ -1,5 +1,5 @@
 {
-  "version": "1.7.0",
+  "version": "1.8.0",
   "sampling": {
     "max_rows": 20000,
     "discriminator_rows": 2000,

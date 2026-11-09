@@ -19,7 +19,7 @@ from urllib.parse import unquote
 import numpy as np
 import pandas as pd
 from pydantic import ValidationError
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
@@ -1007,18 +1007,119 @@ def _build_candidate_set(
     return _CandidateSet(texts=texts, exacts=exacts, factors=factors, budget_exceeded=budget_exceeded)
 
 
-def _sensitive_values_in_profile(  # noqa: PLR0912
+def _record_profile_hit(detail: dict[str, float], key: str) -> None:
+    detail[key] = 1.0
+    detail["sensitive_value_in_profile"] = detail.get("sensitive_value_in_profile", 0.0) + 1.0
+
+
+def _candidate_substring_hits(
+    values: DataFrame,
+    session: SparkSession,
+    exacts: list[tuple[str, str]],
+    texts: list[tuple[str, str]],
+    factors: list[tuple[str, str]],
+    min_len: int,
+) -> set[str]:
+    """Returns JSON paths of candidate-set exact/substring hits against lowercased sensitive `values` (columns v, n)."""
+    hit_paths: set[str] = set()
+    if exacts:
+        exact_df = F.broadcast(session.createDataFrame(exacts, "text string, path string"))
+        for row in values.join(exact_df, values.v == exact_df.text, "inner").select("path").distinct().collect():
+            hit_paths.add(row["path"])
+    if texts:
+        blob = "\x1e".join(text for text, _ in texts)
+        text_paths = dict(texts)
+        matched = [
+            r["v"]
+            for r in values.where(F.col("n") >= min_len)
+            .where(F.instr(F.lit(blob), F.col("v")) > 0)
+            .select("v")
+            .distinct()
+            .limit(100)
+            .collect()
+        ]
+        for value in matched:
+            for text, json_path in text_paths.items():
+                if value in text:
+                    hit_paths.add(json_path)
+    if factors:
+        factor_df = F.broadcast(session.createDataFrame(factors, "text string, path string"))
+        for row in (
+            values.join(factor_df, F.instr(values.v, factor_df.text) > 0, "inner").select("path").distinct().collect()
+        ):
+            hit_paths.add(row["path"])
+    return hit_paths
+
+
+def _branch_length_pairs(
+    values: DataFrame,
+    risks: Mapping[tuple[str, str, int], _PatternRisk],
+    max_regex_length: int,
+) -> list[tuple[str, int, str, int]]:
+    """Returns distinct `(json_path, branch_index, branch, length)` for sensitive values each branch fullmatches.
+
+    Lengths are capped at `max_regex_length`. Matching uses Spark `rlike` with a full-anchor so every row is checked
+    without collecting values to the driver.
+    """
+    pairs: set[tuple[str, int, str, int]] = set()
+    for risk in risks.values():
+        if risk.not_in_dialect or risk.not_generalized or not risk.json_path:
+            continue
+        for branch_index, branch in enumerate(risk.branches):
+            anchored = f"^(?:{branch})$"
+            lengths = (
+                values.where(F.col("raw").rlike(anchored))
+                .select(F.least(F.col("n"), F.lit(max_regex_length)).alias("n"))
+                .distinct()
+                .collect()
+            )
+            for row in lengths:
+                pairs.add((risk.json_path, branch_index, branch, int(row["n"])))
+    return sorted(pairs)
+
+
+def _language_size_hits(
+    pairs: Sequence[tuple[str, int, str, int]],
+    *,
+    column: str,
+    limit: float,
+    max_dfa_states: int,
+    detail: dict[str, float],
+) -> None:
+    """Counts each distinct `(branch, length)` once under a shared budget; records small-language profile hits."""
+    if not pairs:
+        return
+    work = regex._WorkBudget(max_dfa_states)
+    cache: dict[tuple[str, int], int | regex._BudgetExceeded] = {}
+    for json_path, branch_index, branch, length in pairs:
+        key = (branch, length)
+        if key not in cache:
+            try:
+                cache[key] = regex.count_matches(branch, 0, length, max_dfa_states=max_dfa_states, budget=work)
+            except regex.UnsupportedForCount:
+                cache[key] = 0
+        counted = cache[key]
+        if counted is regex.BUDGET_EXCEEDED:
+            detail["regex_budget_exceeded"] = detail.get("regex_budget_exceeded", 0.0) + 1.0
+            _record_profile_hit(detail, f"sensitive_value_in_profile:{column}:{json_path}:{branch_index}")
+            return
+        if isinstance(counted, int) and counted < limit:
+            _record_profile_hit(detail, f"sensitive_value_in_profile:{column}:{json_path}:{branch_index}")
+
+
+def _sensitive_values_in_profile(
     profile: Profile,
     manifest: Manifest,
     real: Mapping[str, DataFrame],
     risks: Mapping[tuple[str, str, int], _PatternRisk],
     config: MetricsConfig,
 ) -> dict[str, float]:
-    """Checks every sensitive value (all rows) against the profile candidate set.
+    """Checks every sensitive value (all rows) against the profile candidate set and small-language branches.
 
-    Exact matches use the enumerated branch languages; substring checks cover candidate texts and required-literal
-    factors. Hits are reported as `sensitive_value_in_profile` with the sensitive column and JSON path, never the
-    value. Budget exhaustion while building candidates fails conservatively.
+    Candidate-set exact and substring hits, plus pattern branches whose language at a matched value's length is
+    smaller than max(k, `privacy.min_regex_language`), fail with `sensitive_value_in_profile` naming the sensitive
+    column, JSON path, and (for language hits) branch index — never the value. Language counts are computed once per
+    distinct `(branch, length)` under the shared regex work budget; exhaustion fails conservatively.
     """
     if not real:
         return {}
@@ -1027,7 +1128,9 @@ def _sensitive_values_in_profile(  # noqa: PLR0912
     if candidates.budget_exceeded:
         detail["regex_budget_exceeded"] = detail.get("regex_budget_exceeded", 0.0) + 1.0
         detail["sensitive_value_in_profile"] = detail.get("sensitive_value_in_profile", 0.0) + 1.0
-    min_len = config.privacy.min_literal_len
+    limits = config.privacy
+    min_len = limits.min_literal_len
+    limit = max(float(profile.privacy.min_value_count), limits.min_regex_language)
     session = next(iter(real.values())).sparkSession
     exacts = list({(c.text, c.path) for c in candidates.exacts if c.text})
     factors = list({(c.text, c.path) for c in candidates.factors if c.text})
@@ -1042,46 +1145,24 @@ def _sensitive_values_in_profile(  # noqa: PLR0912
             expr = ".".join(identifier(p) for p in path.split("."))
             values = (
                 real[table.name]
-                .selectExpr(f"CAST({expr} AS STRING) AS v")
+                .selectExpr(f"CAST({expr} AS STRING) AS raw")
                 .dropna()
-                .select(F.lower(F.col("v")).alias("v"), F.length("v").alias("n"))
+                .select(
+                    F.col("raw"),
+                    F.lower(F.col("raw")).alias("v"),
+                    F.length("raw").alias("n"),
+                )
             )
-            hit_paths: set[str] = set()
-            if exacts:
-                exact_df = F.broadcast(session.createDataFrame(exacts, "text string, path string"))
-                for row in (
-                    values.join(exact_df, values.v == exact_df.text, "inner").select("path").distinct().collect()
-                ):
-                    hit_paths.add(row["path"])
-            if texts:
-                blob = "\x1e".join(text for text, _ in texts)
-                text_paths = dict(texts)
-                matched = [
-                    r["v"]
-                    for r in values.where(F.col("n") >= min_len)
-                    .where(F.instr(F.lit(blob), F.col("v")) > 0)
-                    .select("v")
-                    .distinct()
-                    .limit(100)
-                    .collect()
-                ]
-                for value in matched:
-                    for text, json_path in text_paths.items():
-                        if value in text:
-                            hit_paths.add(json_path)
-            if factors:
-                factor_df = F.broadcast(session.createDataFrame(factors, "text string, path string"))
-                for row in (
-                    values.join(factor_df, F.instr(values.v, factor_df.text) > 0, "inner")
-                    .select("path")
-                    .distinct()
-                    .collect()
-                ):
-                    hit_paths.add(row["path"])
-            for json_path in sorted(hit_paths):
-                key = f"sensitive_value_in_profile:{column}:{json_path}"
-                detail[key] = 1.0
-                detail["sensitive_value_in_profile"] = detail.get("sensitive_value_in_profile", 0.0) + 1.0
+            for json_path in sorted(_candidate_substring_hits(values, session, exacts, texts, factors, min_len)):
+                _record_profile_hit(detail, f"sensitive_value_in_profile:{column}:{json_path}")
+            pairs = _branch_length_pairs(values, risks, limits.max_regex_length)
+            _language_size_hits(
+                pairs,
+                column=column,
+                limit=limit,
+                max_dfa_states=limits.max_dfa_states,
+                detail=detail,
+            )
     return detail
 
 
