@@ -58,6 +58,32 @@ def experiment_dir(experiment_id: str, repo_root: Path | None = None) -> Path:
     return root / "profiler" / "rsi" / "experiments" / experiment_id
 
 
+def _recorded_path(path: str | Path, repo_root: Path) -> str:
+    """Returns a portable path for persisted experiment metadata."""
+    resolved = Path(path).resolve()
+    try:
+        relative = resolved.relative_to(repo_root).as_posix()
+        return "<repo>" if relative == "." else f"<repo>/{relative}"
+    except ValueError:
+        return f"<external>/{resolved.name}"
+
+
+def _recorded_identity(identity: dict[str, Any], repo_root: Path) -> dict[str, Any]:
+    """Returns an identity with portable filesystem paths."""
+    recorded = dict(identity)
+    for field in ("worktree", "harness_root"):
+        if field in recorded:
+            recorded[field] = _recorded_path(recorded[field], repo_root)
+    if "hashed_roots" in recorded:
+        recorded["hashed_roots"] = [_recorded_path(path, repo_root) for path in recorded["hashed_roots"]]
+    return recorded
+
+
+def _recorded_command(command: Sequence[str], repo_root: Path) -> list[str]:
+    """Returns command arguments with absolute paths made portable."""
+    return [_recorded_path(arg, repo_root) if Path(arg).is_absolute() else arg for arg in command]
+
+
 def run_experiment(config: ExperimentConfig) -> Path:
     """Runs the experiment and returns the experiment directory path."""
     policy = load_policy(config.policy_path)
@@ -72,6 +98,7 @@ def run_experiment(config: ExperimentConfig) -> Path:
     candidate_path = config.baseline_worktree if config.control else config.candidate_worktree
     candidate = identify_build("candidate", candidate_path)
     harness = identify_harness(policy=policy)
+    recording_root = Path(harness.harness_root)
 
     datasets = list(config.datasets) if config.datasets is not None else sorted(DATASETS)
     speed_tiers = (
@@ -90,12 +117,12 @@ def run_experiment(config: ExperimentConfig) -> Path:
         "datasets": datasets,
         "speed_tiers": speed_tiers,
         "fidelity_tier": fidelity_tier,
-        "baseline": baseline.to_dict(),
-        "candidate": candidate.to_dict(),
-        "harness": harness.to_dict(),
+        "baseline": _recorded_identity(baseline.to_dict(), recording_root),
+        "candidate": _recorded_identity(candidate.to_dict(), recording_root),
+        "harness": _recorded_identity(harness.to_dict(), recording_root),
         "policy": policy,
-        "policy_path": str(config.policy_path.resolve()),
-        "command_line": list(config.command_line or sys.argv),
+        "policy_path": _recorded_path(config.policy_path, recording_root),
+        "command_line": _recorded_command(config.command_line or sys.argv, recording_root),
         "machine": machine_info(),
         "not_measured": policy.get("not_measured", []),
     }
@@ -114,7 +141,11 @@ def run_experiment(config: ExperimentConfig) -> Path:
     determinism = check_profile_determinism(speed_records)
     (samples_dir / "profile_determinism.json").write_text(json.dumps(determinism, indent=2, sort_keys=True) + "\n")
 
-    scorer = config.scorer or try_real_scorer()
+    scorer = config.scorer or try_real_scorer(
+        cache_dir=out / "cache",
+        harness_hash=harness.harness_hash,
+        metrics_config_hash=harness.metrics_config_hash,
+    )
     if scorer is None:
         raise RuntimeError("no Scorer available: inject ExperimentConfig.scorer or merge sampler/fidelity modules")
     scorer_baseline: Scorer
