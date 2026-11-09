@@ -133,11 +133,19 @@ def test_exact_int64_and_decimal_truncated_normal_preserve_domain(spark: SparkSe
     assert abs(float(np.mean(int_as_float))) <= 3 * int_se
     assert float(np.std(int_as_float, ddof=1)) == pytest.approx(int_sd, rel=0.10)
 
-    dec_mean = Decimal("9999999500.0000000000")
+    # Near decimal(38,10)'s ~1e28 magnitude, float(low)==float(high)==float(mean).
+    # mean+1000 == 1e28 needs 29 integer digits, so the upper bound is the type max (~mean+1000).
+    dec_mean = Decimal("9999999999999999999999999000.0000000000")
     dec_sd = Decimal("100.0000000000")
     dec_low = dec_mean - Decimal("1000.0000000000")
-    dec_high = dec_mean + Decimal("1000.0000000000")
-    dec_stats = NumericStats(min=str(dec_low), max=str(dec_high), mean=str(dec_mean), stddev=str(dec_sd))
+    dec_high = Decimal("9999999999999999999999999999.9999999999")
+    assert float(dec_low) == float(dec_high) == float(dec_mean)
+    dec_stats = NumericStats(
+        min=format(dec_low, "f"),
+        max=format(dec_high, "f"),
+        mean=format(dec_mean, "f"),
+        stddev=format(dec_sd, "f"),
+    )
     dec_values = [
         row.amount
         for row in sample(

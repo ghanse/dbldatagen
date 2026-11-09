@@ -1196,11 +1196,11 @@ def _truncated_moment_factors(alpha: float, beta: float) -> tuple[float, float] 
 
 
 def _exact_location(mean: float | str | Decimal, low: Decimal, high: Decimal) -> Decimal:
-    """Recovers an exact-domain mean from NumericStats' float mean via lossless min/max.
+    """Builds an exact-domain mean without converting bounds through float.
 
-    `NumericStats.mean` is an approximate JSON number, so large int64/decimal means lose low
-    bits. Mapping the float mean as a fraction of float(min)/float(max) onto the exact bounds
-    restores the profiled location when min/max carry the lossless encoding.
+    `NumericStats.mean` is an approximate JSON number. Absolute float(mean) is useless near
+    1e28 where float(low)==float(high). Anchor at the exact Decimal midpoint of the lossless
+    bounds and apply only the float offset of mean from that midpoint (0 when they collapse).
     """
     if isinstance(mean, Decimal):
         return mean
@@ -1208,26 +1208,37 @@ def _exact_location(mean: float | str | Decimal, low: Decimal, high: Decimal) ->
         return Decimal(mean)
     with localcontext() as ctx:
         ctx.prec = 50
-        flo, fhi = float(low), float(high)
-        if math.isfinite(mean) and math.isfinite(flo) and math.isfinite(fhi) and flo != fhi:
-            fraction = min(max((mean - flo) / (fhi - flo), 0.0), 1.0)
-            return low + Decimal(str(fraction)) * (high - low)
-        return min(high, max(low, Decimal(str(mean))))
+        mid = (low + high) / Decimal(2)
+        if not math.isfinite(mean):
+            return mid
+        offset = float(mean) - float(mid)
+        if not math.isfinite(offset):
+            return mid
+        return mid + Decimal(str(offset))
 
 
 def _exact_scale(stddev: float | str | Decimal) -> Decimal:
-    """Parses stddev without re-entering float when it is already exact text/Decimal."""
+    """Parses stddev without deriving it from float bounds."""
     if isinstance(stddev, Decimal):
         return stddev
     if isinstance(stddev, str):
         return Decimal(stddev)
+    if not math.isfinite(stddev) or stddev < 0:
+        return Decimal(0)
     return Decimal(str(stddev))
+
+
+def _standardized_bounds(low: Decimal, high: Decimal, mu: Decimal, sigma: Decimal) -> tuple[float, float]:
+    """Returns (a, b) = ((low-mu)/sigma, (high-mu)/sigma); Decimal first, float only for a/b."""
+    alpha = (low - mu) / sigma
+    beta = (high - mu) / sigma
+    return float(alpha), float(beta)
 
 
 def _calibrate_truncated_parameters_exact(
     mean: Decimal, stddev: Decimal, low: Decimal, high: Decimal
 ) -> tuple[Decimal, Decimal]:
-    """Calibrates (mu, sigma) in Decimal; only standardized truncated factors use float."""
+    """Calibrates (mu, sigma) in Decimal; truncated factors use only standardized float (a, b)."""
     if stddev <= 0 or not (low < high) or not (low < mean < high):
         return mean, stddev
     with localcontext() as ctx:
@@ -1236,8 +1247,7 @@ def _calibrate_truncated_parameters_exact(
         best = (mu, sigma)
         best_error = math.inf
         for _ in range(25):
-            alpha = float((low - mu) / sigma)
-            beta = float((high - mu) / sigma)
+            alpha, beta = _standardized_bounds(low, high, mu, sigma)
             factors = _truncated_moment_factors(alpha, beta)
             if factors is None:
                 break
@@ -1258,7 +1268,7 @@ def _calibrate_truncated_parameters_exact(
             sigma = max(sigma * (stddev / current_std), stddev * Decimal("1e-6"))
             sigma = min(sigma, max(high - low, stddev) * Decimal(20))
             mu = min(max(mu, low - Decimal(50) * sigma), high + Decimal(50) * sigma)
-        matched = _truncated_moment_factors(float((low - best[0]) / best[1]), float((high - best[0]) / best[1]))
+        matched = _truncated_moment_factors(*_standardized_bounds(low, high, best[0], best[1]))
         if matched is not None:
             matched_mean = best[0] + best[1] * Decimal(str(matched[0]))
             matched_std = best[1] * Decimal(str(matched[1]))
@@ -1279,7 +1289,7 @@ def _exact_truncated_normal(
 ) -> list[Any]:
     """Draws truncated-normal z in float, then maps mu+sigma*z with Decimal/int exact arithmetic.
 
-    Bounds and recovered mean/stddev stay Decimal end-to-end; only the standardized draw z is float.
+    Location/scale stay Decimal; only standardized bounds (a, b) and z cross through float.
     """
     if high < low:
         low, high = high, low
@@ -1293,8 +1303,7 @@ def _exact_truncated_normal(
         mu_d, sigma_d = _calibrate_truncated_parameters_exact(mean_d, std_d, low, high)
         if sigma_d <= 0:
             return [_convert_exact(min(high, max(low, mu_d)), column) for _ in uniforms]
-        alpha = float((low - mu_d) / sigma_d)
-        beta = float((high - mu_d) / sigma_d)
+        alpha, beta = _standardized_bounds(low, high, mu_d, sigma_d)
         values: list[Any] = []
         for uniform in _open_unit(uniforms):
             z = _truncated_standard_ppf(float(uniform), alpha, beta)
