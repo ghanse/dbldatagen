@@ -21,6 +21,7 @@ class FidelityScores:
         privacy_passed: Whether every privacy guard check passed.
         ceiling: Real-vs-real ceiling for the dataset, when known.
         relative_reconstruction: `reconstruction` as a fraction of `ceiling`, capped at 1.
+        privacy_unmeasured: Privacy checks that could not be measured.
         detail: Full per-metric detail from the underlying scorers.
         metrics_config_hash: Hash of the metrics configuration that produced the scores.
     """
@@ -30,6 +31,7 @@ class FidelityScores:
     privacy_passed: bool
     ceiling: float | None
     relative_reconstruction: float | None
+    privacy_unmeasured: list[str]
     detail: dict[str, Any]
     metrics_config_hash: str
 
@@ -101,6 +103,7 @@ class FakeScorer:
             privacy_passed=bool(values["privacy_passed"]),
             ceiling=ceiling,
             relative_reconstruction=relative,
+            privacy_unmeasured=[],
             detail={"dataset": dataset, "seed": seed, "values": values},
             metrics_config_hash=self.metrics_config_hash,
         )
@@ -124,7 +127,7 @@ class FakeScorer:
         )
 
 
-def try_real_scorer(*, cache_dir: Path, harness_hash: str) -> Scorer | None:
+def try_real_scorer(*, cache_dir: Path, harness_hash: str, metrics_config_hash: str) -> Scorer | None:
     """Returns a real sampler+fidelity scorer when those modules are importable, else None."""
     try:
         from profiler_bench import fidelity, sampler  # noqa: PLC0415
@@ -138,6 +141,7 @@ def try_real_scorer(*, cache_dir: Path, harness_hash: str) -> Scorer | None:
         fidelity_ceiling=fidelity.ceiling,
         cache_dir=cache_dir,
         harness_hash=harness_hash,
+        metrics_config_hash=metrics_config_hash,
     )
 
 
@@ -150,7 +154,8 @@ class _RealScorer:
     fidelity_ceiling: Any
     cache_dir: Path
     harness_hash: str
-    _ceiling_cache: dict[tuple[str, str, int], ReconstructionScore] = field(default_factory=dict)
+    metrics_config_hash: str
+    _ceiling_cache: dict[tuple[str, str, int, str, str], ReconstructionScore] = field(default_factory=dict)
 
     def score(
         self,
@@ -184,15 +189,27 @@ class _RealScorer:
 
         from profiler_bench.fidelity import ReconstructionScore  # noqa: PLC0415
 
-        key = (dataset, tier, structure_seed)
+        key = (dataset, tier, structure_seed, self.harness_hash, self.metrics_config_hash)
         if key not in self._ceiling_cache:
-            path = self.cache_dir / "ceilings" / self.harness_hash / f"{dataset}-{tier}-seed-{structure_seed}.json"
+            path = (
+                self.cache_dir
+                / "ceilings"
+                / self.harness_hash
+                / self.metrics_config_hash
+                / f"{dataset}-{tier}-seed-{structure_seed}.json"
+            )
             if path.is_file():
                 result = ReconstructionScore.model_validate_json(path.read_text())
             else:
                 spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
                 spark.conf.set("spark.sql.session.timeZone", "UTC")
-                result = self.fidelity_ceiling(dataset, tier, spark=spark, structure_seed=structure_seed)
+                result = self.fidelity_ceiling(
+                    dataset,
+                    tier,
+                    spark=spark,
+                    structure_seed=structure_seed,
+                    sample_seed=structure_seed,
+                )
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(result.model_dump_json(indent=2) + "\n")
             self._ceiling_cache[key] = result
@@ -231,23 +248,26 @@ def _score_with_real_modules(
     reconstruction = scorer.score_reconstruction(real, synth, manifest, seed=seed)
     structure = scorer.score_structure(loaded, manifest, real=real, sample_seed=sample_seed, seed=seed)
     privacy = scorer.score_privacy(
-        holdout,
+        real,
         synth,
         loaded,
         manifest,
-        sample_seed=holdout_seed,
+        holdout=holdout,
+        sample_seed=sample_seed,
         seed=seed,
     )
     if not isinstance(privacy.passed, bool):
         raise RuntimeError("privacy scorer did not produce a pass/fail result")
     ceiling = scorer._ceiling(dataset, tier, structure_seed=structure_seed)
     relative = float(reconstruction.relative_to(ceiling))
+    privacy_unmeasured = [check.name for check in privacy.checks if check.detail.get("unmeasured", 0.0) > 0.0]
     return FidelityScores(
         reconstruction=float(reconstruction.score),
         structure=float(structure.score),
         privacy_passed=bool(privacy.passed),
         ceiling=float(ceiling.score),
         relative_reconstruction=relative,
+        privacy_unmeasured=privacy_unmeasured,
         detail={
             "reconstruction": reconstruction.model_dump(mode="json"),
             "structure": structure.model_dump(mode="json"),

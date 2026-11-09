@@ -288,7 +288,9 @@ after an untimed warmup, rotate baseline/candidate order across cases, and recor
 take one profile per build/dataset at the fidelity tier and score it with the reference sampler and fidelity metrics
 for K **paired** sampler seeds. Each result includes the full reconstruction, structure, privacy, and real-vs-real
 ceiling detail. Ceilings are cached by dataset, tier, and harness hash in the experiment cache. `--control` runs the
-baseline against itself. Tests can explicitly inject a `FakeScorer`; command-line runs never use it.
+baseline against itself. Unmeasured privacy checks keep the sample successful with `privacy_passed=false` and are
+listed in `privacy_unmeasured`, so the evaluator's hard guard rejects them. Tests can explicitly inject a `FakeScorer`;
+command-line runs never use it.
 
 `profiler_bench.evaluate` applies `profiler-bench/policies/default.json`. The accuracy mean estimand is the equally
 weighted mean across datasets of each dataset's mean paired-seed difference; its CI uses a **stratified bootstrap**

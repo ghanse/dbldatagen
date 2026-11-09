@@ -41,6 +41,7 @@ def run_fidelity_samples(
                     "dataset": dataset,
                     "tier": tier,
                     "ok": False,
+                    "error_class": "MissingProfileError",
                     "error": "missing speed profile for fidelity scoring",
                     "seeds": seeds,
                 }
@@ -119,6 +120,7 @@ def _one_seed(
             "reconstruction": scores.reconstruction,
             "structure": scores.structure,
             "privacy_passed": scores.privacy_passed,
+            "privacy_unmeasured": scores.privacy_unmeasured,
             "ceiling": scores.ceiling,
             "relative_reconstruction": scores.relative_reconstruction,
             "detail": scores.detail,

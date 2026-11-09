@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 from pathlib import Path
 
@@ -60,6 +62,14 @@ def test_control_smoke_never_accepted(tmp_path: Path, smoke_policy: Path, catalo
         run = json.loads((out / "run.json").read_text())
         assert run["baseline"]["commit"] == run["candidate"]["commit"]
         assert "not_measured" in run
+        artifacts = [
+            out / name for name in ("run.json", "summary.json", "verdict.json", "REPORT.md", "benchmark_entry.json")
+        ]
+        absolute_path = re.compile(r"/(?:Users|home|private|tmp|opt|var)/")
+        for artifact in artifacts:
+            text = artifact.read_text()
+            assert os.path.expanduser("~") not in text
+            assert absolute_path.search(text) is None
         orders = {tuple(json.loads(path.read_text())["order"]) for path in samples}
         assert ("baseline", "candidate") in orders
         assert ("candidate", "baseline") in orders
