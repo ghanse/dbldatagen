@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from decimal import Decimal
 from pathlib import Path
 
@@ -99,35 +100,51 @@ def test_truncated_normal_zero_and_missing_stddev_fallbacks(spark: SparkSession)
 
 
 def test_exact_int64_and_decimal_truncated_normal_preserve_domain(spark: SparkSession) -> None:
-    """Large int64/decimal ranges must stay exact and avoid float-collapsed endpoint atoms."""
-    int_low = 2**63 - 10_000
-    int_high = 2**63 - 1
-    int_stats = NumericStats(min=str(int_low), max=str(int_high), mean=str(int_low + 5_000), stddev="100")
-    int_values = [
-        row.x
-        for row in sample(
-            profile(
-                TableProfile(name="t", row_count=5_000, columns=[column("x", LogicalType.INT64, numeric=int_stats)])
-            ),
-            spark,
-            seed=19,
-        )
-        .tables["t"]
-        .collect()
-    ]
+    """Exact int64/decimal draws keep the profiled mean/sd; float(mu) near 2^63 must not shift them."""
+    row_count = 8_000
+    int_mean = 2**63 - 10_000
+    int_sd = 100
+    int_low = int_mean - 1_000
+    int_high = int_mean + 1_000
+    int_stats = NumericStats(min=str(int_low), max=str(int_high), mean=str(int_mean), stddev=str(int_sd))
+    int_values = np.asarray(
+        [
+            row.x
+            for row in sample(
+                profile(
+                    TableProfile(
+                        name="t",
+                        row_count=row_count,
+                        columns=[column("x", LogicalType.INT64, numeric=int_stats)],
+                    )
+                ),
+                spark,
+                seed=19,
+            )
+            .tables["t"]
+            .collect()
+        ],
+        dtype=object,
+    )
+    int_as_float = np.asarray([float(value - int_mean) for value in int_values], dtype=float)
+    int_se = int_sd / math.sqrt(row_count)
     assert all(isinstance(value, int) and int_low <= value <= int_high for value in int_values)
     assert float(np.mean([value in (int_low, int_high) for value in int_values])) < 0.05
+    assert abs(float(np.mean(int_as_float))) <= 3 * int_se
+    assert float(np.std(int_as_float, ddof=1)) == pytest.approx(int_sd, rel=0.10)
 
-    dec_low = Decimal("9999999000.0000000000")
-    dec_high = Decimal("9999999999.9999999999")
-    dec_stats = NumericStats(min=str(dec_low), max=str(dec_high), mean="9999999500.0000000000", stddev="20")
+    dec_mean = Decimal("9999999500.0000000000")
+    dec_sd = Decimal("100.0000000000")
+    dec_low = dec_mean - Decimal("1000.0000000000")
+    dec_high = dec_mean + Decimal("1000.0000000000")
+    dec_stats = NumericStats(min=str(dec_low), max=str(dec_high), mean=str(dec_mean), stddev=str(dec_sd))
     dec_values = [
         row.amount
         for row in sample(
             profile(
                 TableProfile(
                     name="t",
-                    row_count=5_000,
+                    row_count=row_count,
                     columns=[column("amount", LogicalType.DECIMAL, precision=38, scale=10, numeric=dec_stats)],
                 )
             ),
@@ -137,9 +154,13 @@ def test_exact_int64_and_decimal_truncated_normal_preserve_domain(spark: SparkSe
         .tables["t"]
         .collect()
     ]
+    dec_offsets = np.asarray([float(value - dec_mean) for value in dec_values], dtype=float)
+    dec_se = float(dec_sd) / math.sqrt(row_count)
     assert all(isinstance(value, Decimal) and dec_low <= value <= dec_high for value in dec_values)
     assert all(value.as_tuple().exponent == -10 for value in dec_values)
     assert float(np.mean([value in (dec_low, dec_high) for value in dec_values])) < 0.05
+    assert abs(float(np.mean(dec_offsets))) <= 3 * dec_se
+    assert float(np.std(dec_offsets, ddof=1)) == pytest.approx(float(dec_sd), rel=0.10)
 
 
 def test_truncated_normal_mean_stddev_calibration_or_documented_shift(spark: SparkSession) -> None:

@@ -9,7 +9,7 @@ import string
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from itertools import pairwise
 from typing import Any
 
@@ -1079,18 +1079,11 @@ def _truncated_moments(mean: float, stddev: float, low: float, high: float) -> t
     if not math.isfinite(stddev) or stddev <= 0 or not (low < high):
         center = float(np.clip(mean, low, high)) if math.isfinite(mean) else 0.5 * (low + high)
         return center, 0.0
-    alpha = (low - mean) / stddev
-    beta = (high - mean) / stddev
-    span = _cdf_diff(alpha, beta)
-    if span <= 0.0 or not math.isfinite(span):
+    factors = _truncated_moment_factors((low - mean) / stddev, (high - mean) / stddev)
+    if factors is None:
         return 0.5 * (low + high), 0.0
-    density_a = _standard_normal_pdf(alpha)
-    density_b = _standard_normal_pdf(beta)
-    delta = (density_a - density_b) / span
-    truncated_mean = mean + stddev * delta
-    variance_factor = 1.0 + (alpha * density_a - beta * density_b) / span - delta * delta
-    truncated_std = stddev * math.sqrt(max(variance_factor, 0.0))
-    return truncated_mean, truncated_std
+    delta, scale = factors
+    return mean + stddev * delta, stddev * scale
 
 
 def _calibrate_truncated_parameters(mean: float, stddev: float, low: float, high: float) -> tuple[float, float]:
@@ -1188,6 +1181,94 @@ def _truncated_normal(  # noqa: PLR0911
     return np.clip(draws, lower, upper)
 
 
+def _truncated_moment_factors(alpha: float, beta: float) -> tuple[float, float] | None:
+    """Returns (location factor, scale factor) for a standard truncated normal on [alpha, beta]."""
+    span = _cdf_diff(alpha, beta)
+    if span <= 0.0 or not math.isfinite(span):
+        return None
+    density_a = _standard_normal_pdf(alpha)
+    density_b = _standard_normal_pdf(beta)
+    delta = (density_a - density_b) / span
+    variance_factor = 1.0 + (alpha * density_a - beta * density_b) / span - delta * delta
+    if variance_factor < 0.0 or not math.isfinite(variance_factor):
+        return None
+    return delta, math.sqrt(variance_factor)
+
+
+def _exact_location(mean: float | str | Decimal, low: Decimal, high: Decimal) -> Decimal:
+    """Recovers an exact-domain mean from NumericStats' float mean via lossless min/max.
+
+    `NumericStats.mean` is an approximate JSON number, so large int64/decimal means lose low
+    bits. Mapping the float mean as a fraction of float(min)/float(max) onto the exact bounds
+    restores the profiled location when min/max carry the lossless encoding.
+    """
+    if isinstance(mean, Decimal):
+        return mean
+    if isinstance(mean, str):
+        return Decimal(mean)
+    with localcontext() as ctx:
+        ctx.prec = 50
+        flo, fhi = float(low), float(high)
+        if math.isfinite(mean) and math.isfinite(flo) and math.isfinite(fhi) and flo != fhi:
+            fraction = min(max((mean - flo) / (fhi - flo), 0.0), 1.0)
+            return low + Decimal(str(fraction)) * (high - low)
+        return min(high, max(low, Decimal(str(mean))))
+
+
+def _exact_scale(stddev: float | str | Decimal) -> Decimal:
+    """Parses stddev without re-entering float when it is already exact text/Decimal."""
+    if isinstance(stddev, Decimal):
+        return stddev
+    if isinstance(stddev, str):
+        return Decimal(stddev)
+    return Decimal(str(stddev))
+
+
+def _calibrate_truncated_parameters_exact(
+    mean: Decimal, stddev: Decimal, low: Decimal, high: Decimal
+) -> tuple[Decimal, Decimal]:
+    """Calibrates (mu, sigma) in Decimal; only standardized truncated factors use float."""
+    if stddev <= 0 or not (low < high) or not (low < mean < high):
+        return mean, stddev
+    with localcontext() as ctx:
+        ctx.prec = 50
+        mu, sigma = mean, stddev
+        best = (mu, sigma)
+        best_error = math.inf
+        for _ in range(25):
+            alpha = float((low - mu) / sigma)
+            beta = float((high - mu) / sigma)
+            factors = _truncated_moment_factors(alpha, beta)
+            if factors is None:
+                break
+            delta, scale = factors
+            current_mean = mu + sigma * Decimal(str(delta))
+            current_std = sigma * Decimal(str(scale))
+            if current_std <= 0:
+                break
+            error = float(abs(current_mean - mean) / max(abs(mean), Decimal(1))) + float(
+                abs(current_std - stddev) / stddev
+            )
+            if error < best_error:
+                best_error = error
+                best = (mu, sigma)
+            if error < 0.01:
+                return mu, sigma
+            mu += mean - current_mean
+            sigma = max(sigma * (stddev / current_std), stddev * Decimal("1e-6"))
+            sigma = min(sigma, max(high - low, stddev) * Decimal(20))
+            mu = min(max(mu, low - Decimal(50) * sigma), high + Decimal(50) * sigma)
+        matched = _truncated_moment_factors(float((low - best[0]) / best[1]), float((high - best[0]) / best[1]))
+        if matched is not None:
+            matched_mean = best[0] + best[1] * Decimal(str(matched[0]))
+            matched_std = best[1] * Decimal(str(matched[1]))
+            if abs(matched_mean - mean) <= Decimal("0.05") * max(abs(mean), Decimal(1)) + Decimal("0.05") and abs(
+                matched_std - stddev
+            ) <= Decimal("0.05") * stddev + Decimal("0.05"):
+                return best
+        return mean, stddev
+
+
 def _exact_truncated_normal(
     uniforms: np.ndarray,
     mean: float | str | Decimal,
@@ -1196,31 +1277,30 @@ def _exact_truncated_normal(
     high: Decimal,
     column: ColumnProfile,
 ) -> list[Any]:
-    """Draws truncated-normal z in float, then maps mu+sigma*z with Decimal/int exact arithmetic."""
-    mean_d = mean if isinstance(mean, Decimal) else Decimal(str(mean))
-    std_d = stddev if isinstance(stddev, Decimal) else Decimal(str(stddev))
+    """Draws truncated-normal z in float, then maps mu+sigma*z with Decimal/int exact arithmetic.
+
+    Bounds and recovered mean/stddev stay Decimal end-to-end; only the standardized draw z is float.
+    """
     if high < low:
         low, high = high, low
+    mean_d = _exact_location(mean, low, high)
+    std_d = _exact_scale(stddev)
     if high == low or std_d <= 0:
         center = min(high, max(low, mean_d))
         return [_convert_exact(center, column) for _ in uniforms]
-    # Calibrate using float approximations of the bounds only for the (mu, sigma) solve;
-    # standardized bounds use Decimal arithmetic.
-    calibrate_low = float(low) if low.copy_abs() < Decimal(2**53) else float(mean_d - std_d)
-    calibrate_high = float(high) if high.copy_abs() < Decimal(2**53) else float(mean_d + std_d)
-    if calibrate_low >= calibrate_high:
-        calibrate_low, calibrate_high = float(mean_d - std_d), float(mean_d + std_d)
-    mu, sigma = _calibrate_truncated_parameters(float(mean_d), float(std_d), calibrate_low, calibrate_high)
-    mu_d = Decimal(str(mu))
-    sigma_d = Decimal(str(max(sigma, float(std_d) * 1e-6)))
-    alpha = float((low - mu_d) / sigma_d)
-    beta = float((high - mu_d) / sigma_d)
-    values: list[Any] = []
-    for uniform in _open_unit(uniforms):
-        z = _truncated_standard_ppf(float(uniform), alpha, beta)
-        value = mu_d + sigma_d * Decimal(str(z))
-        values.append(_convert_exact(min(high, max(low, value)), column))
-    return values
+    with localcontext() as ctx:
+        ctx.prec = 50
+        mu_d, sigma_d = _calibrate_truncated_parameters_exact(mean_d, std_d, low, high)
+        if sigma_d <= 0:
+            return [_convert_exact(min(high, max(low, mu_d)), column) for _ in uniforms]
+        alpha = float((low - mu_d) / sigma_d)
+        beta = float((high - mu_d) / sigma_d)
+        values: list[Any] = []
+        for uniform in _open_unit(uniforms):
+            z = _truncated_standard_ppf(float(uniform), alpha, beta)
+            value = mu_d + sigma_d * Decimal(str(z))
+            values.append(_convert_exact(min(high, max(low, value)), column))
+        return values
 
 
 def _away_from_endpoints(values: np.ndarray, low: float, high: float) -> np.ndarray:
