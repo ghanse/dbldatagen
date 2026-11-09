@@ -86,10 +86,10 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P1.5 | Fidelity metrics: marginals (KS / Wasserstein / TVD), cardinality error, pattern match rate, pairwise dependence error, constraint satisfaction, referential integrity, discriminator AUC, privacy guard (exact-row copy rate, distance to closest record) | P1.1 | merged (PR #10) |
 | P1.6 | Runner + evaluator: fresh-process samples, wall/CPU/RSS, paired bootstrap gate, policy JSON, results layout, noise control (same build vs itself) | P1.3–P1.5 | merged (PR #12); real Scorer wiring after P1.5 (P1.6a) |
 | P1.6a | Wire the runner to the real sampler + fidelity Scorer; end-to-end control run on tier xs | P1.5, P1.6 | merged (PR #14) |
-| P1.4b | Fix sampler privacy leak: clipped-normal draws land on exact observed min/max, recreating real-unique pairs (numeric fails partial_copy_rate_excess) | P1.4, P1.6a | in-progress |
+| P1.4b | Fix sampler privacy leak: clipped-normal draws land on exact observed min/max, recreating real-unique pairs (numeric fails partial_copy_rate_excess) | P1.4, P1.6a | merged (PR #15) |
 | P1.7 | RSI log tooling: append-only `log.jsonl` writer/validator + `LOG.md` renderer; `rsi/RSI.md` | P1.1 | merged (PR #4) |
 | P1.7a | Fix: `rsi_log.py append --kind` flag is dropped; add CLI-flag tests | P1.7 | merged (PR #5) |
-| P1.8 | Baseline run: freeze the harness, record the baseline + ceiling for every dataset | P1.2–P1.7 | todo |
+| P1.8 | Baseline run: freeze the harness, record the baseline + ceiling for every dataset | P1.2–P1.7 | in-progress |
 | P1.2a | Fix: baseline engine overflows on `avg`/`stddev` of decimal(38,x) under ANSI mode (found by P1.5 at tier s) | P1.2 | merged (PR #11) |
 | P1.3c | Investigate retail real-vs-real ceiling 0.94 (order_items 0.86): suspected catalog Zipf parent ranking varying by sample seed | P1.3, P1.5 | todo |
 | P1.3b | Register real public datasets in the catalog (download + checksum hook exists; none registered) — needs a decision on which datasets are reachable through the proxy | P1.3 | todo |
@@ -109,6 +109,7 @@ Candidate proposal areas (they enter the log as proposals when triaged):
 - Quantile / histogram marginals; heavy-tail and multimodal fits
 - Cardinality: exact vs HLL, bucketed frequency profiles, top-k with a privacy threshold
 - String structure: regex inference (character-class tokenization, multiple patterns with coverage weights), length distributions
+- Spec 0.3 candidate: lossless (string-encoded) mean/stddev for decimal and int64 columns; float mean collapses location at ~1e28 (found in P1.4b review)
 - Spec 0.3 candidate: make the profile regex dialect (allowlisted, portable to Rust; enforced by the bench in P1.5) part of the spec and validate it in the model
 - Spec 0.2 candidates: functional dependencies (no field in 0.1.0, so the metrics score them 'not recovered'); correlation_ratio consumption in the sampler
 - Keys: PK / unique / composite key discovery; FK inclusion-dependency discovery across tables; FK fan-out distributions
