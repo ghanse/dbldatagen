@@ -15,7 +15,7 @@ from profiler_bench.fidelity.scores import StructureCategory
 
 
 def _baseline(name: str, spark: SparkSession) -> tuple[Profile, Manifest]:
-    return profile_tables(load(name, "xs", 0, spark)), materialize(name, "xs", 0).manifest
+    return profile_tables(load(name, "xs", 0, spark), detect_pii=False), materialize(name, "xs", 0).manifest
 
 
 def _bound(value: object, column: dict[str, Any]) -> object:

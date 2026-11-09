@@ -29,7 +29,7 @@ def real(spark: SparkSession) -> dict[str, DataFrame]:
 
 @pytest.fixture(scope="module")
 def profile(real: dict[str, DataFrame]) -> Profile:
-    return profile_tables(real)
+    return profile_tables(real, detect_pii=False)
 
 
 def test_independent_synth_passes(spark: SparkSession, real: dict[str, DataFrame], profile: Profile) -> None:
@@ -81,7 +81,7 @@ def test_regex_literals_leak_without_the_raw_value(real: dict[str, DataFrame]) -
 def test_declared_quasi_identifier_sets_are_checked(spark: SparkSession) -> None:
     real = load("strings", "xs", 0, spark)
     truth = materialize("strings", "xs", 0).manifest
-    profile = profile_tables(real)
+    profile = profile_tables(real, detect_pii=False)
     name = "contacts.quasi_identifiers[home_zip,birth_date,gender].match_rate_excess"
     assert not _checks(score_privacy(real, real, profile, truth))[name]
     independent = score_privacy(real, load("strings", "xs", 0, spark, sample_seed=3), profile, truth)
@@ -91,7 +91,10 @@ def test_declared_quasi_identifier_sets_are_checked(spark: SparkSession) -> None
 def test_every_value_leak_class_is_checked(spark: SparkSession) -> None:
     real = load("strings", "xs", 0, spark)
     names = {
-        c.name for c in score_privacy(real, real, profile_tables(real), materialize("strings", "xs", 0).manifest).checks
+        c.name
+        for c in score_privacy(
+            real, real, profile_tables(real, detect_pii=False), materialize("strings", "xs", 0).manifest
+        ).checks
     }
     assert "contacts.session_token.value_leak_rate_excess" in names
     assert "contacts.comment.value_leak_rate_excess" in names
@@ -423,6 +426,27 @@ def test_unsampled_medium_two_choice_language_fails(
     assert not score.passed
 
 
+def test_uppercase_only_branch_matches_raw_sensitive_value(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Dialect branches are case-sensitive; matching only folded values would miss this uppercase-only class.
+    planted = "A" * 14
+    pattern = "[AB]{14}"
+    assert 10_000 < 2**14 < 1_000_000
+    monkeypatch.setattr(privacy, "_sample_values", lambda *args, **kwargs: [])
+    leaky = _with_patterns(profile, "products", "sku", [pattern])
+    score = score_privacy(
+        _plant_email(real, planted), _independent(spark), leaky, materialize("retail", "xs", 0).manifest
+    )
+    detail = {c.name: c for c in score.checks}
+    assert detail["profile.sensitive_value_leaks"].detail["sensitive_value_in_profile"] >= 1.0
+    assert any(
+        key.startswith("sensitive_value_in_profile:customers.email:") and key.endswith(":0")
+        for key in detail["profile.sensitive_value_leaks"].detail
+    )
+    assert not score.passed
+
+
 def test_unsampled_huge_two_choice_language_passes_threshold(
     spark: SparkSession, real: dict[str, DataFrame], profile: Profile, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -450,7 +474,7 @@ def test_example_profiles_pass_closed_strings() -> None:
 def test_baseline_profiles_of_every_xs_dataset_pass_closed_strings(spark: SparkSession) -> None:
     for name in DATASETS:
         real = load(name, "xs", 0, spark)
-        profile = profile_tables(real)
+        profile = profile_tables(real, detect_pii=False)
         assert privacy._unexpected_profile_strings(profile, real) == {}, name
 
 

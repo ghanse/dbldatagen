@@ -41,12 +41,16 @@ from dbldatagen_profiler.model import (
     LogicalType,
     NumericStats,
     Pattern,
+    PiiClass,
     PrivacyPolicy,
     Profile,
     Quantile,
     RangeConstraint,
     Relationship,
     SamplingInfo,
+    Semantic,
+    SemanticEvidence,
+    Sensitivity,
     SourceInfo,
     StringStats,
     TableProfile,
@@ -431,6 +435,7 @@ def _profile_columns(columns: Sequence[ColumnProfile]) -> Iterator[ColumnProfile
 
 
 _ENGINE_ID_RE = re.compile(r"^[a-z0-9_.-]{1,64}$")
+_SOURCE_META_RE = re.compile(r"^[a-zA-Z0-9_./:+-]{1,512}$")
 _SPEC_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _ISO_TEMPORAL_RES = (
     re.compile(rf"^{_DATE}$"),
@@ -446,6 +451,8 @@ _MODEL_ENUM_VALUES = frozenset(
         *(member.value for member in Cardinality),
         *(member.value for member in DependenceMethod),
         *(member.value for member in ValueTreatment),
+        *(member.value for member in PiiClass),
+        *(member.value for member in Sensitivity),
         *_COMPARISON_OPS,
         *_CONSTRAINT_KINDS,
     )
@@ -477,6 +484,8 @@ _OBJECT_FIELDS: dict[str, frozenset[str]] = {
     "Dependency": frozenset(Dependency.model_fields),
     "Relationship": frozenset(Relationship.model_fields),
     "FanOutStats": frozenset(FanOutStats.model_fields),
+    "Semantic": frozenset(Semantic.model_fields),
+    "SemanticEvidence": frozenset(SemanticEvidence.model_fields),
 }
 
 
@@ -548,6 +557,14 @@ def _is_engine_meta_path(path: str) -> bool:
     return path in ("$.engine.name", "$.engine.version") or path.endswith(".dialect")
 
 
+def _is_source_meta_path(path: str) -> bool:
+    return path in ("$.source.name", "$.source.format", "$.source.location")
+
+
+def _is_expression_path(path: str) -> bool:
+    return bool(re.search(r"\.check_constraints\[\d+\]\.expression$", path))
+
+
 def _decode_profile_text(value: str) -> str:
     """Percent-decodes then unicode-unescapes `value`, returning `value` unchanged on failure."""
     try:
@@ -597,6 +614,7 @@ _LIST_ITEM_FIELDS: dict[str, frozenset[str] | None] = {
     ".dependencies": _OBJECT_FIELDS["Dependency"],
     ".relationships": _OBJECT_FIELDS["Relationship"],
     ".unique_keys": _OBJECT_FIELDS["KeyCandidate"],
+    ".evidence": _OBJECT_FIELDS["SemanticEvidence"],
 }
 _NESTED_OBJECT_FIELDS = {
     "engine": _OBJECT_FIELDS["EngineInfo"],
@@ -613,6 +631,7 @@ _NESTED_OBJECT_FIELDS = {
     "histogram": _OBJECT_FIELDS["Histogram"],
     "primary_key": _OBJECT_FIELDS["KeyCandidate"],
     "fan_out": _OBJECT_FIELDS["FanOutStats"],
+    "semantic": _OBJECT_FIELDS["Semantic"],
 }
 _CONSTRAINT_FIELDS = {
     "range": _OBJECT_FIELDS["RangeConstraint"],
@@ -628,6 +647,8 @@ def _allow_closed_string(  # noqa: PLR0911
     source_type_key: tuple[str, str] | None,
     schema_names: frozenset[str],
     source_types: Mapping[tuple[str, str], str],
+    *,
+    allow_expressions: bool,
 ) -> bool:
     """Returns whether `value` at `path` is an allowed closed-string form."""
     if _is_literal_audit_path(path):
@@ -636,7 +657,13 @@ def _allow_closed_string(  # noqa: PLR0911
         return regex.in_dialect(value)
     if _is_source_type_path(path):
         return source_type_key is not None and source_types.get(source_type_key) == value
+    if _is_expression_path(path):
+        return allow_expressions
     if _is_engine_meta_path(path):
+        return _ENGINE_ID_RE.fullmatch(value) is not None
+    if _is_source_meta_path(path):
+        return _SOURCE_META_RE.fullmatch(value) is not None
+    if re.search(r"\.evidence\[\d+\]\.method$", path):
         return _ENGINE_ID_RE.fullmatch(value) is not None
     if path == "$.spec_version":
         return _SPEC_VERSION_RE.fullmatch(value) is not None
@@ -667,12 +694,15 @@ def _walk_closed_strings(
     *,
     schema_names: frozenset[str],
     source_types: Mapping[tuple[str, str], str],
+    allow_expressions: bool,
     paths: list[str],
 ) -> None:
     """Appends JSON paths of closed-string violations under `node` to `paths`."""
     if isinstance(node, str):
         source_key = (table, column_path) if table and column_path and path.endswith(".source_type") else None
-        if not _allow_closed_string(path, node, source_key, schema_names, source_types):
+        if not _allow_closed_string(
+            path, node, source_key, schema_names, source_types, allow_expressions=allow_expressions
+        ):
             paths.append(path)
         return
     if isinstance(node, list):
@@ -687,6 +717,7 @@ def _walk_closed_strings(
                 item_depth,
                 schema_names=schema_names,
                 source_types=source_types,
+                allow_expressions=allow_expressions,
                 paths=paths,
             )
         return
@@ -718,6 +749,7 @@ def _walk_closed_strings(
             column_depth,
             schema_names=schema_names,
             source_types=source_types,
+            allow_expressions=allow_expressions,
             paths=paths,
         )
 
@@ -728,7 +760,9 @@ def _unexpected_profile_strings(
     """Returns closed-string violations keyed by `unexpected_profile_string` and per-path detail keys.
 
     Detail keys name the JSON path and never include the offending value. `data` defaults to the profile dump; pass a
-    raw dict when checking shipped examples that may carry unknown extension fields.
+    raw dict when checking shipped examples that may carry unknown extension fields. Expression-constraint strings are
+    allowed only when `privacy.allow_expression_constraints` is true; they remain subject to the raw-text and
+    all-sensitive-value scans.
     """
     dump: object = profile.model_dump(mode="json") if data is None else data
     if real:
@@ -750,6 +784,7 @@ def _unexpected_profile_strings(
         0,
         schema_names=schema_names,
         source_types=source_types,
+        allow_expressions=profile.privacy.allow_expression_constraints,
         paths=paths,
     )
     if not paths:

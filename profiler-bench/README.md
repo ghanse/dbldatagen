@@ -193,10 +193,12 @@ Profile regex and text privacy is layered (synth-data leakage is the last):
 1. **Closed strings.** Every string in the serialized profile JSON must be exactly one of: a model enum value; a
    lossless numeric/decimal encoding; an ISO-8601 temporal value; a table or column name that exists in the real
    schema; a Spark `source_type` equal to that column's `simpleString()`; a regex in the allowlisted dialect (pattern
-   fields only); an engine name/version (or expression `dialect`) matching `^[a-z0-9_.-]{1,64}$`; or a key in a
-   model-defined map (`key` / `value` / `element`). Any other string fails with reason `unexpected_profile_string`,
-   naming the JSON path and never the value. Unknown extension fields are allowed only when they hold non-string
-   scalars. `top_values` and enumeration literals stay under the k-threshold audit instead.
+   fields only); an engine name/version (or expression `dialect`) matching `^[a-z0-9_.-]{1,64}$`; a source
+   name/format/location matching `^[a-zA-Z0-9_./:+-]{1,512}$`; a check-constraint `expression` when
+   `privacy.allow_expression_constraints` is true (still covered by the raw-text and all-sensitive-value scans); or a
+   key in a model-defined map (`key` / `value` / `element`). Any other string fails with reason
+   `unexpected_profile_string`, naming the JSON path and never the value. Unknown extension fields are allowed only
+   when they hold non-string scalars. `top_values` and enumeration literals stay under the k-threshold audit instead.
 2. **Allowlisted dialect.** Every profile regex is accepted only if a strict tokenizer over the *raw source string*
    (not Python's `sre_parse`) recognizes the portable dialect: literals and escaped literals, classes `[...]`
    (including negation and ranges), `.`, `\d`/`\D`/`\w`/`\W`/`\s`/`\S`, quantifiers `?`/`*`/`+`/`{m}`/`{m,}`/`{m,n}`
