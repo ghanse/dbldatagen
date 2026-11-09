@@ -90,8 +90,16 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P1.7a | Fix: `rsi_log.py append --kind` flag is dropped; add CLI-flag tests | P1.7 | merged (PR #5) |
 | P1.8 | Baseline run: freeze the harness, record the baseline + ceiling for every dataset | P1.2–P1.7 | todo |
 | P1.2a | Fix: baseline engine overflows on `avg`/`stddev` of decimal(38,x) under ANSI mode (found by P1.5 at tier s) | P1.2 | merged (PR #11) |
+| P1.3c | Investigate retail real-vs-real ceiling 0.94 (order_items 0.86): suspected catalog Zipf parent ranking varying by sample seed | P1.3, P1.5 | todo |
 | P1.3b | Register real public datasets in the catalog (download + checksum hook exists; none registered) — needs a decision on which datasets are reachable through the proxy | P1.3 | todo |
 | P1.9 | Rust engine scaffold (Polars vs DataFusion decision, CLI binary, spec-valid output for the baseline features) | P1.1, Rust toolchain | deferred (human decision 2026-11-06: PySpark-only Phase 1; Rust engine later) |
+
+### Phase 1b — PII (human request 2026-11-07)
+
+| ID | Item | Depends on | Status |
+|----|------|------------|--------|
+| P2.1 | PII detection (spec 0.2.0 `semantic` + quasi-identifier sets) and keyed, format-preserving, join-consistent substitution of real data (contract: `.polly/contracts/p2-1-pii.md`) | P1.2 | merged (PR #13) |
+| P2.2 | Benchmark side: catalog PII ground truth for every PII class, detection precision/recall metric, substitution fidelity (stats + relational integrity preserved) and leakage metrics, sampler consumes `semantic.pii_class` | P1.5, P2.1 | todo |
 
 ### Phase 2 — RSI iterations (Step 2)
 
@@ -100,6 +108,7 @@ Candidate proposal areas (they enter the log as proposals when triaged):
 - Quantile / histogram marginals; heavy-tail and multimodal fits
 - Cardinality: exact vs HLL, bucketed frequency profiles, top-k with a privacy threshold
 - String structure: regex inference (character-class tokenization, multiple patterns with coverage weights), length distributions
+- Spec 0.3 candidate: make the profile regex dialect (allowlisted, portable to Rust; enforced by the bench in P1.5) part of the spec and validate it in the model
 - Spec 0.2 candidates: functional dependencies (no field in 0.1.0, so the metrics score them 'not recovered'); correlation_ratio consumption in the sampler
 - Keys: PK / unique / composite key discovery; FK inclusion-dependency discovery across tables; FK fan-out distributions
 - Check constraints: ranges, enumerations, cross-column inequalities (`a <= b`), functional dependencies

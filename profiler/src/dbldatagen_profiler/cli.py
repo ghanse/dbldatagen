@@ -7,6 +7,7 @@ the profile JSON Schema.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
 from importlib import import_module
@@ -53,7 +54,31 @@ def _build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--format", choices=("parquet", "csv", "delta"), default="parquet", help="Input format.")
     profile.add_argument("-o", "--output", type=Path, required=True, help="Output profile JSON file.")
     profile.set_defaults(handler=_profile)
+
+    pii = commands.add_parser("pii", help="Detect or substitute personally identifying data.")
+    pii_commands = pii.add_subparsers(dest="pii_command", required=True)
+    detect = pii_commands.add_parser("detect", help="Detect PII semantics.")
+    _add_input_arguments(detect)
+    detect.add_argument("-o", "--output", type=Path, required=True, help="Output semantic JSON file.")
+    detect.set_defaults(handler=_pii_detect)
+    substitute = pii_commands.add_parser("substitute", help="Substitute PII using a profile and key.")
+    _add_input_arguments(substitute)
+    substitute.add_argument("--profile", type=Path, required=True, help="Profile JSON file.")
+    substitute.add_argument("--key-file", type=Path, required=True, help="File containing the substitution key.")
+    substitute.add_argument(
+        "--allow-insecure-key-file",
+        action="store_true",
+        help="Allow a key file readable by group or other users.",
+    )
+    substitute.add_argument("-o", "--output", type=Path, required=True, help="Output directory.")
+    substitute.set_defaults(handler=_pii_substitute)
     return parser
+
+
+def _add_input_arguments(parser: argparse.ArgumentParser) -> None:
+    """Adds common named-table and input-format arguments."""
+    parser.add_argument("--table", action="append", required=True, metavar="NAME=PATH", help="Named input table.")
+    parser.add_argument("--format", choices=("parquet", "csv", "delta"), default="parquet", help="Input format.")
 
 
 def _validate(args: argparse.Namespace) -> int:
@@ -106,6 +131,67 @@ def _profile(args: argparse.Namespace) -> int:
         print(f"dbldatagen-profile profile: {error}", file=sys.stderr)
         return 1
     return 0
+
+
+def _spark_inputs(args: argparse.Namespace) -> tuple[object, dict[str, object]]:
+    """Creates a local UTC Spark session and reads CLI table arguments."""
+    parsed = [_parse_table(value) for value in args.table]
+    inputs = dict(parsed)
+    if len(inputs) != len(parsed):
+        raise ValueError("duplicate table name")
+    SparkSession = import_module("pyspark.sql").SparkSession
+    spark = (
+        SparkSession.builder.master("local[*]")
+        .appName("dbldatagen-profiler")
+        .config("spark.sql.session.timeZone", "UTC")
+        .getOrCreate()
+    )
+    return spark, {name: spark.read.format(args.format).load(path) for name, path in inputs.items()}
+
+
+def _pii_detect(args: argparse.Namespace) -> int:
+    """Detects PII in input tables and writes semantic JSON."""
+    try:
+        _, tables = _spark_inputs(args)
+        detect = import_module("dbldatagen_profiler.pii").detect
+        result = detect(tables)
+        payload = {
+            table: {column: semantic.model_dump(mode="json") for column, semantic in columns.items()}
+            for table, columns in result.items()
+        }
+        args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"dbldatagen-profile pii detect: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _pii_substitute(args: argparse.Namespace) -> int:
+    """Substitutes PII in input tables and writes Parquet outputs and a report."""
+    try:
+        key = _read_key(args.key_file, allow_insecure=args.allow_insecure_key_file)
+        _, tables = _spark_inputs(args)
+        profile = load_profile(args.profile.read_text(encoding="utf-8"), strict=True)
+        substitute = import_module("dbldatagen_profiler.pii").substitute
+        result = substitute(tables, profile, key=key)
+        args.output.mkdir(parents=True, exist_ok=True)
+        for name, frame in result.tables.items():
+            frame.write.mode("error").parquet(str(args.output / name))
+        (args.output / "report.json").write_text(json.dumps(result.report, indent=2) + "\n", encoding="utf-8")
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"dbldatagen-profile pii substitute: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _read_key(path: Path, *, allow_insecure: bool) -> bytes:
+    """Reads a substitution key after validating its length and file permissions."""
+    if path.stat().st_mode & 0o077 and not allow_insecure:
+        raise ValueError("key file is readable by group or other users; use --allow-insecure-key-file to override")
+    key = path.read_bytes()
+    if len(key) < 32:
+        raise ValueError("key file must contain at least 32 bytes")
+    return key
 
 
 def _parse_table(value: str) -> tuple[str, str]:
