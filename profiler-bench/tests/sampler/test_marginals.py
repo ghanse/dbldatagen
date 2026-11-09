@@ -46,7 +46,7 @@ from .profiles import column, profile
             None,
         ),
         (
-            "clipped_normal",
+            "truncated_normal",
             NumericStats(min=-4.0, max=4.0, mean=0.5, stddev=0.8),
             0.5,
             0.05,

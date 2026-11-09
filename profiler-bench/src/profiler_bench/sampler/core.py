@@ -283,12 +283,14 @@ def _ordered_values(  # noqa: PLR0912, PLR0915
         bound_low, bound_high = _number(stats.min, column), _number(stats.max, column)
         endpoints = (bound_low, bound_high)
         if column.numeric and column.numeric.mean is not None and column.numeric.stddev is not None:
-            raw = _truncated_normal(
-                u, column.numeric.mean, column.numeric.stddev, bound_low, bound_high, open_bounds=True
+            mu, sigma = _calibrate_truncated_parameters(
+                float(column.numeric.mean), float(column.numeric.stddev), bound_low, bound_high
             )
+            raw = _truncated_normal(u, mu, sigma, bound_low, bound_high, open_bounds=True)
             report.add(path, "used", "numeric.min", "numeric.max", "numeric.mean", "numeric.stddev")
-            report.add(path, "approximated", "numeric.clipped_normal")
+            report.add(path, "approximated", "numeric.truncated_normal")
         else:
+            # Missing stddev (or mean): fall back to open uniform on [min, max].
             raw = _open_interval_between(bound_low, bound_high, u)
             prefix = "numeric" if column.numeric else "temporal"
             report.add(path, "used", f"{prefix}.min", f"{prefix}.max")
@@ -354,15 +356,13 @@ def _exact_ordered_values(
         low = _exact_number(stats.min, column)
         high = _exact_number(stats.max, column)
         if stats.mean is not None and stats.stddev is not None:
-            # Truncated normal keeps endpoint frequency equal to modeled tail mass after rounding;
-            # clipping would pile outside mass onto the exact observed min/max.
-            raw = _truncated_normal(
-                uniforms, float(stats.mean), float(stats.stddev), float(low), float(high), open_bounds=True
-            )
-            values = [_convert_exact(min(high, max(low, Decimal(str(value)))), column) for value in raw]
+            # Truncated shape in float/z-space; map onto the exact int/Decimal domain so ranges
+            # above 2^53 and high-precision decimals do not collapse into endpoint atoms.
+            values = _exact_truncated_normal(uniforms, stats.mean, stats.stddev, low, high, column)
             report.add(path, "used", "numeric.min", "numeric.max", "numeric.mean", "numeric.stddev")
-            report.add(path, "approximated", "numeric.clipped_normal")
+            report.add(path, "approximated", "numeric.truncated_normal")
             return values
+        # Missing stddev: fall back to exact discrete/quantum-uniform on [min, max].
         report.add(path, "used", "numeric.min", "numeric.max")
         report.add(path, "approximated", "numeric.uniform")
         return [_exact_between(low, high, float(value), column, closed=True) for value in uniforms]
@@ -925,19 +925,207 @@ def _normal_ppf(values: np.ndarray) -> np.ndarray:
     return np.asarray([_inverse_normal(float(value)) for value in values])
 
 
+def _standard_normal_pdf(value: float) -> float:
+    return math.exp(-0.5 * value * value) / math.sqrt(2.0 * math.pi)
+
+
 def _standard_normal_cdf(value: float) -> float:
-    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+    """Stable Φ(z) via erfc; does not saturate the same way as ½(1+erf) in the far tails."""
+    return 0.5 * math.erfc(-value / math.sqrt(2.0))
+
+
+def _standard_normal_sf(value: float) -> float:
+    """Stable survival 1-Φ(z) via erfc."""
+    return 0.5 * math.erfc(value / math.sqrt(2.0))
+
+
+def _standard_normal_logsf(value: float) -> float:
+    """log(1-Φ(z)), with a mills-ratio expansion when erfc underflows."""
+    survival = _standard_normal_sf(value)
+    if survival > 0.0:
+        return math.log(survival)
+    if value <= 0.0:
+        return math.log(max(1.0 - _standard_normal_cdf(value), np.nextafter(0.0, 1.0)))
+    # sf(z) ~ φ(z)/z (1 - 1/z^2 + 3/z^4 - 15/z^6) for large z > 0.
+    inverse = 1.0 / (value * value)
+    series = 1.0 - inverse + 3.0 * inverse * inverse - 15.0 * inverse * inverse * inverse
+    return (
+        -0.5 * value * value
+        - 0.5 * math.log(2.0 * math.pi)
+        - math.log(value)
+        + math.log(max(series, np.nextafter(0.0, 1.0)))
+    )
+
+
+def _cdf_diff(alpha: float, beta: float) -> float:
+    """Φ(beta) - Φ(alpha) without catastrophic cancellation in either tail."""
+    if alpha >= 0.0:
+        return _standard_normal_sf(alpha) - _standard_normal_sf(beta)
+    if beta <= 0.0:
+        return _standard_normal_sf(-beta) - _standard_normal_sf(-alpha)
+    return _standard_normal_cdf(beta) - _standard_normal_cdf(alpha)
+
+
+# Acklam rational-approximation coefficients (public domain).
+_ACKLAM_A = (
+    -3.969683028665376e01,
+    2.209460984245205e02,
+    -2.759285104469687e02,
+    1.383577459334152e02,
+    -3.066479806614716e01,
+    2.506628277459239e00,
+)
+_ACKLAM_B = (
+    -5.447609879822406e01,
+    1.615858368580409e02,
+    -1.556989798598866e02,
+    6.680131188771972e01,
+    -1.328068155288572e01,
+)
+_ACKLAM_C = (
+    -7.784894002430293e-03,
+    -3.223964580411365e-01,
+    -2.400758277161838e00,
+    -2.549732539343734e00,
+    4.374664141464968e00,
+    2.938163982698783e00,
+)
+_ACKLAM_D = (
+    7.784695709041462e-03,
+    3.224671290700398e-01,
+    2.445134137142996e00,
+    3.754408661907416e00,
+)
+
+
+def _inverse_normal_from_log(log_probability: float) -> float:
+    """Φ^{-1}(exp(log_p)) for probabilities too small to represent in float64."""
+    if not math.isfinite(log_probability):
+        return -math.inf if log_probability < 0 else math.inf
+    if log_probability >= 0.0:
+        return _inverse_normal(min(math.exp(log_probability), 1.0))
+    q = math.sqrt(-2.0 * log_probability)
+    return (
+        ((((_ACKLAM_C[0] * q + _ACKLAM_C[1]) * q + _ACKLAM_C[2]) * q + _ACKLAM_C[3]) * q + _ACKLAM_C[4]) * q
+        + _ACKLAM_C[5]
+    ) / ((((_ACKLAM_D[0] * q + _ACKLAM_D[1]) * q + _ACKLAM_D[2]) * q + _ACKLAM_D[3]) * q + 1.0)
 
 
 def _inverse_normal(probability: float) -> float:
-    low, high = -8.0, 8.0
-    for _ in range(48):
-        middle = (low + high) / 2
-        if _standard_normal_cdf(middle) < probability:
-            low = middle
-        else:
-            high = middle
-    return (low + high) / 2
+    """Acklam's rational approximation to Φ^{-1} with a Halley refinement (no ±8 cap)."""
+    if probability <= 0.0:
+        return -math.inf
+    if probability >= 1.0:
+        return math.inf
+    if probability == 0.5:
+        return 0.0
+    plow = 0.02425
+    phigh = 1.0 - plow
+    if probability < plow:
+        x = _inverse_normal_from_log(math.log(probability))
+    elif probability > phigh:
+        x = -_inverse_normal_from_log(math.log1p(-probability))
+    else:
+        q = probability - 0.5
+        r = q * q
+        x = (
+            (
+                ((((_ACKLAM_A[0] * r + _ACKLAM_A[1]) * r + _ACKLAM_A[2]) * r + _ACKLAM_A[3]) * r + _ACKLAM_A[4]) * r
+                + _ACKLAM_A[5]
+            )
+            * q
+            / (
+                ((((_ACKLAM_B[0] * r + _ACKLAM_B[1]) * r + _ACKLAM_B[2]) * r + _ACKLAM_B[3]) * r + _ACKLAM_B[4]) * r
+                + 1.0
+            )
+        )
+    error = _standard_normal_cdf(x) - probability
+    density = _standard_normal_pdf(x)
+    if density > 0.0 and math.isfinite(error):
+        x -= error / (density + x * error / 2.0)
+    return x
+
+
+def _truncated_standard_ppf(uniform: float, alpha: float, beta: float) -> float:  # noqa: PLR0911
+    """Inverse CDF of a standard normal truncated to [alpha, beta], stable in far tails."""
+    u = float(np.clip(uniform, np.nextafter(0.0, 1.0), np.nextafter(1.0, 0.0)))
+    if not math.isfinite(alpha) or not math.isfinite(beta) or alpha >= beta:
+        return 0.0
+    if beta <= 0.0:
+        # Reflect left-tail windows onto the right tail so survival arithmetic applies.
+        return -_truncated_standard_ppf(1.0 - u, -beta, -alpha)
+    if alpha >= 0.0:
+        log_sa = _standard_normal_logsf(alpha)
+        log_sb = _standard_normal_logsf(beta)
+        ratio = math.exp(log_sb - log_sa)
+        weight = 1.0 - u * (1.0 - ratio)
+        weight = min(max(weight, np.nextafter(0.0, 1.0)), 1.0)
+        log_s = log_sa + math.log(weight)
+        if log_s >= math.log(0.5):
+            return _inverse_normal(1.0 - math.exp(log_s))
+        survival = math.exp(log_s)
+        if survival > 0.0:
+            return -_inverse_normal(survival)
+        return -_inverse_normal_from_log(log_s)
+    lower = _standard_normal_cdf(alpha)
+    span = _cdf_diff(alpha, beta)
+    if span <= 0.0 or not math.isfinite(span):
+        return 0.5 * (alpha + beta)
+    return _inverse_normal(lower + u * span)
+
+
+def _truncated_moments(mean: float, stddev: float, low: float, high: float) -> tuple[float, float]:
+    """Mean and stddev of Normal(mean, stddev) truncated to [low, high]."""
+    if not math.isfinite(stddev) or stddev <= 0 or not (low < high):
+        center = float(np.clip(mean, low, high)) if math.isfinite(mean) else 0.5 * (low + high)
+        return center, 0.0
+    alpha = (low - mean) / stddev
+    beta = (high - mean) / stddev
+    span = _cdf_diff(alpha, beta)
+    if span <= 0.0 or not math.isfinite(span):
+        return 0.5 * (low + high), 0.0
+    density_a = _standard_normal_pdf(alpha)
+    density_b = _standard_normal_pdf(beta)
+    delta = (density_a - density_b) / span
+    truncated_mean = mean + stddev * delta
+    variance_factor = 1.0 + (alpha * density_a - beta * density_b) / span - delta * delta
+    truncated_std = stddev * math.sqrt(max(variance_factor, 0.0))
+    return truncated_mean, truncated_std
+
+
+def _calibrate_truncated_parameters(mean: float, stddev: float, low: float, high: float) -> tuple[float, float]:
+    """Finds (mu, sigma) whose truncation to [low, high] matches the profiled mean/stddev.
+
+    Uses a bounded fixed-point solve. When no truncated-normal moments match the targets
+    (common for heavy left skew with a wide right bound), returns the profiled parameters
+    unchanged so callers can document the resulting mean/stddev shift.
+    """
+    if not math.isfinite(stddev) or stddev <= 0 or not (low < high) or not (low < mean < high):
+        return mean, stddev
+    mu, sigma = mean, stddev
+    best = (mu, sigma)
+    best_error = math.inf
+    for _ in range(25):
+        current_mean, current_std = _truncated_moments(mu, sigma, low, high)
+        if not math.isfinite(current_mean) or not math.isfinite(current_std) or current_std <= 0:
+            break
+        error = abs(current_mean - mean) / max(abs(mean), 1.0) + abs(current_std - stddev) / stddev
+        if error < best_error:
+            best_error = error
+            best = (mu, sigma)
+        if error < 0.01:
+            return mu, sigma
+        mu += mean - current_mean
+        sigma = max(sigma * (stddev / current_std), stddev * 1e-6)
+        sigma = min(sigma, max(high - low, stddev) * 20.0)
+        mu = min(max(mu, low - 50.0 * sigma), high + 50.0 * sigma)
+    matched_mean, matched_std = _truncated_moments(*best, low, high)
+    if (
+        abs(matched_mean - mean) <= 0.05 * max(abs(mean), 1.0) + 0.05
+        and abs(matched_std - stddev) <= 0.05 * stddev + 0.05
+    ):
+        return best
+    return mean, stddev
 
 
 def _open_unit(values: np.ndarray | float) -> np.ndarray:
@@ -958,7 +1146,7 @@ def _open_interval_between(low: np.ndarray | float, high: np.ndarray | float, un
     return np.where(usable, open_low + u * width, midpoint)
 
 
-def _truncated_normal(  # noqa: PLR0912
+def _truncated_normal(  # noqa: PLR0911
     uniforms: np.ndarray,
     mean: float,
     stddev: float,
@@ -969,44 +1157,70 @@ def _truncated_normal(  # noqa: PLR0912
 ) -> np.ndarray:
     """Inverse-CDF samples from Normal(mean, stddev) truncated to the observed bounds.
 
-    Copula uniforms remain usable: each draw is F^{-1}(u) of the truncated CDF. Opening the
-    bounds keeps continuous types from emitting the exact profiled extrema as point masses.
+    Copula uniforms remain usable: each draw is F^{-1}(u) of the truncated CDF. Far-tail
+    windows use survival/log-survival arithmetic so Φ saturation cannot collapse the span.
+    stddev <= 0 falls back to a point mass at the clipped mean.
     """
     u = _open_unit(uniforms)
     count = len(u)
-    result: np.ndarray | None = None
     if count == 0:
-        result = np.asarray([], dtype=float)
-    elif not math.isfinite(low) or not math.isfinite(high):
+        return np.asarray([], dtype=float)
+    if not math.isfinite(low) or not math.isfinite(high):
         if not math.isfinite(stddev) or stddev <= 0:
             center = mean if math.isfinite(mean) else 0.0
-            result = np.full(count, center)
-        else:
-            result = mean + stddev * _normal_ppf(u)
-    else:
-        lower, upper = (high, low) if high < low else (low, high)
-        if upper == lower:
-            result = np.full(count, lower)
-        else:
-            if open_bounds:
-                open_low = np.nextafter(lower, upper)
-                open_high = np.nextafter(upper, lower)
-                if not open_low < open_high:
-                    result = np.full(count, (lower + upper) / 2.0)
-                else:
-                    lower, upper = float(open_low), float(open_high)
-            if result is None and (not math.isfinite(stddev) or stddev <= 0):
-                center = mean if math.isfinite(mean) else (lower + upper) / 2.0
-                result = np.full(count, float(np.clip(center, lower, upper)))
-            elif result is None:
-                fa = _standard_normal_cdf((lower - mean) / stddev)
-                fb = _standard_normal_cdf((upper - mean) / stddev)
-                span = fb - fa
-                if not math.isfinite(span) or span <= 0:
-                    result = lower + u * (upper - lower)
-                else:
-                    result = mean + stddev * _normal_ppf(_open_unit(fa + u * span))
-    return result
+            return np.full(count, center)
+        return mean + stddev * _normal_ppf(u)
+    lower, upper = (high, low) if high < low else (low, high)
+    if upper == lower:
+        return np.full(count, lower)
+    if open_bounds:
+        open_low = np.nextafter(lower, upper)
+        open_high = np.nextafter(upper, lower)
+        if not open_low < open_high:
+            return np.full(count, (lower + upper) / 2.0)
+        lower, upper = float(open_low), float(open_high)
+    if not math.isfinite(stddev) or stddev <= 0:
+        center = mean if math.isfinite(mean) else (lower + upper) / 2.0
+        return np.full(count, float(np.clip(center, lower, upper)))
+    alpha = (lower - mean) / stddev
+    beta = (upper - mean) / stddev
+    draws = np.asarray([mean + stddev * _truncated_standard_ppf(float(value), alpha, beta) for value in u])
+    return np.clip(draws, lower, upper)
+
+
+def _exact_truncated_normal(
+    uniforms: np.ndarray,
+    mean: float | str | Decimal,
+    stddev: float | str | Decimal,
+    low: Decimal,
+    high: Decimal,
+    column: ColumnProfile,
+) -> list[Any]:
+    """Draws truncated-normal z in float, then maps mu+sigma*z with Decimal/int exact arithmetic."""
+    mean_d = mean if isinstance(mean, Decimal) else Decimal(str(mean))
+    std_d = stddev if isinstance(stddev, Decimal) else Decimal(str(stddev))
+    if high < low:
+        low, high = high, low
+    if high == low or std_d <= 0:
+        center = min(high, max(low, mean_d))
+        return [_convert_exact(center, column) for _ in uniforms]
+    # Calibrate using float approximations of the bounds only for the (mu, sigma) solve;
+    # standardized bounds use Decimal arithmetic.
+    calibrate_low = float(low) if low.copy_abs() < Decimal(2**53) else float(mean_d - std_d)
+    calibrate_high = float(high) if high.copy_abs() < Decimal(2**53) else float(mean_d + std_d)
+    if calibrate_low >= calibrate_high:
+        calibrate_low, calibrate_high = float(mean_d - std_d), float(mean_d + std_d)
+    mu, sigma = _calibrate_truncated_parameters(float(mean_d), float(std_d), calibrate_low, calibrate_high)
+    mu_d = Decimal(str(mu))
+    sigma_d = Decimal(str(max(sigma, float(std_d) * 1e-6)))
+    alpha = float((low - mu_d) / sigma_d)
+    beta = float((high - mu_d) / sigma_d)
+    values: list[Any] = []
+    for uniform in _open_unit(uniforms):
+        z = _truncated_standard_ppf(float(uniform), alpha, beta)
+        value = mu_d + sigma_d * Decimal(str(z))
+        values.append(_convert_exact(min(high, max(low, value)), column))
+    return values
 
 
 def _away_from_endpoints(values: np.ndarray, low: float, high: float) -> np.ndarray:
