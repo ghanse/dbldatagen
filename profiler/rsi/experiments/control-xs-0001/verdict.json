@@ -11,11 +11,16 @@
       "status": "pass"
     },
     {
-      "detail": {},
+      "detail": {
+        "failed": [
+          "fidelity/candidate/numeric/xs/seed-0",
+          "fidelity/candidate/numeric/xs/seed-1"
+        ]
+      },
       "name": "privacy",
-      "passed": true,
-      "reason": "privacy_passed",
-      "status": "pass"
+      "passed": false,
+      "reason": "privacy_guard_failed",
+      "status": "fail"
     },
     {
       "detail": {
@@ -131,8 +136,9 @@
   "interval_note": "Each gate uses a two-sided percentile CI at the policy confidence level; there is no family-wise coverage guarantee across gates.",
   "proposal_type": "accuracy",
   "reasons": [
+    "privacy_guard_failed",
     "control",
     "accuracy_crossing_interval"
   ],
-  "verdict": "inconclusive"
+  "verdict": "rejected"
 }

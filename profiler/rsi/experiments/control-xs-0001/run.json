@@ -1,25 +1,25 @@
 {
   "baseline": {
-    "commit": "9876575c368de30fe1a12cc5d5763c9729441471",
-    "dirty": true,
+    "commit": "da246ad78ad4f92d3dfe6aaae530c62ae9e41a58",
+    "dirty": false,
     "profiler_src_hash": "166e9e8e369602d2a269444761183518e78d8a107c6566e70e6dc92b391ff7f2",
     "role": "baseline",
-    "worktree": "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring"
+    "worktree": "<repo>"
   },
   "candidate": {
-    "commit": "9876575c368de30fe1a12cc5d5763c9729441471",
-    "dirty": true,
+    "commit": "da246ad78ad4f92d3dfe6aaae530c62ae9e41a58",
+    "dirty": false,
     "profiler_src_hash": "166e9e8e369602d2a269444761183518e78d8a107c6566e70e6dc92b391ff7f2",
     "role": "candidate",
-    "worktree": "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring"
+    "worktree": "<repo>"
   },
   "command_line": [
-    "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring/profiler-bench/src/profiler_bench/rsi/__main__.py",
+    "<repo>/profiler-bench/src/profiler_bench/rsi/__main__.py",
     "run",
     "--baseline",
-    "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring",
+    "<repo>",
     "--candidate",
-    "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring",
+    "<repo>",
     "--policy",
     "profiler-bench/tests/runner/control-xs-policy.json",
     "--experiment-id",
@@ -29,7 +29,7 @@
     "numeric",
     "--control",
     "--repo-root",
-    "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring",
+    "<external>/p1-6a-control-root.wIO7ch",
     "--cache-dir",
     "profiler-bench/.cache/catalog",
     "--speed-tiers",
@@ -43,13 +43,13 @@
   "experiment_id": "control-xs-0001",
   "fidelity_tier": "xs",
   "harness": {
-    "commit": "9876575c368de30fe1a12cc5d5763c9729441471",
-    "dirty": true,
-    "harness_hash": "4f16a4ccc214502b8fa21645bd23a9d08319ef254959f88cfa3415ff52fbd8e1",
-    "harness_root": "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring",
+    "commit": "da246ad78ad4f92d3dfe6aaae530c62ae9e41a58",
+    "dirty": false,
+    "harness_hash": "e6b7807ad44c54003569f6acbf98af9e2953b7888db61ce64d360b3155116378",
+    "harness_root": "<repo>",
     "hashed_roots": [
-      "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring/profiler-bench/src/profiler_bench",
-      "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring/profiler-bench/policies"
+      "<repo>/profiler-bench/src/profiler_bench",
+      "<repo>/profiler-bench/policies"
     ],
     "metrics_config_hash": "5fbc62012d271b69c3f575bc7b55ae8824fe7ae7dab601aecc14919168de6a3d",
     "policy_hash": "0f26f1b433045e5456f3ecb54a1a0d4334a9997c16d7c5b4f5fd70093a29725d"
@@ -117,7 +117,7 @@
     ],
     "version": "1.0.0"
   },
-  "policy_path": "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring/profiler-bench/tests/runner/control-xs-policy.json",
+  "policy_path": "<repo>/profiler-bench/tests/runner/control-xs-policy.json",
   "speed_tiers": [
     "xs"
   ]
