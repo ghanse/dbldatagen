@@ -285,12 +285,18 @@ The reference sampler is designed for benchmark tiers up to `s` (about 100,000 r
 `profiler_bench.runner` compares a frozen **baseline** profiler build with a **candidate** build under a frozen
 harness. Each build is a git worktree plus commit; the worker imports `profiler/src` from that worktree via
 `PYTHONPATH` in a **fresh subprocess**. Speed samples time `profile_tables` (driver wall, process CPU, peak RSS)
-after an untimed warmup, rotate baseline/candidate order across cases, and record profile hashes. Fidelity samples
-take one profile per build/dataset at the fidelity tier and score it with the reference sampler and fidelity metrics
-for K **paired** sampler seeds. Each result includes the full reconstruction, structure, privacy, and real-vs-real
-ceiling detail. Ceilings are cached by dataset, tier, and harness hash in the experiment cache. `--control` runs the
-baseline against itself. Unmeasured privacy checks keep the sample successful with `privacy_passed=false` and are
-listed in `privacy_unmeasured`, so the evaluator's hard guard rejects them. Tests can explicitly inject a `FakeScorer`;
+after an untimed warmup, rotate baseline/candidate order across cases, and record profile hashes under the policy's
+timed Spark config (unchanged by fidelity settings). Fidelity samples take one profile per build/dataset at the
+fidelity tier and score it with the reference sampler and fidelity metrics for K **paired** sampler seeds. Each
+`(build, dataset)` cell runs in its own fidelity worker subprocess with a fresh SparkSession (profile in via file,
+score JSON out via file; all K seeds share that process). Builds rotate per dataset the same way speed samples do.
+A crash in one cell cannot affect any other cell; that cell's seed records are `ok=false` with `error_class`.
+Fidelity workers use a fixed Spark config recorded in `run.json` as `fidelity_spark` (default
+`spark.driver.memory=8g`, override with `ExperimentConfig.fidelity_driver_memory`; shuffle partitions sized for
+`local[N]`). Each result includes the full reconstruction, structure, privacy, and real-vs-real ceiling detail.
+Ceilings are cached by dataset, tier, and harness hash in the experiment cache. `--control` runs the baseline against
+itself. Unmeasured privacy checks keep the sample successful with `privacy_passed=false` and are listed in
+`privacy_unmeasured`, so the evaluator's hard guard rejects them. Tests can explicitly inject a `FakeScorer`;
 command-line runs never use it.
 
 `profiler_bench.evaluate` applies `profiler-bench/policies/default.json`. The accuracy mean estimand is the equally

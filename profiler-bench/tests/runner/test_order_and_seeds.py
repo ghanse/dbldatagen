@@ -78,6 +78,7 @@ def test_missing_profile_has_error_class(tmp_path: Path) -> None:
     )
     assert len(records) == 2
     assert all(record["error_class"] == "MissingProfileError" for record in records)
+    assert [record["role"] for record in records] == ["baseline", "candidate"]
 
 
 class _UnmeasuredScorer(_BrokenScorer):

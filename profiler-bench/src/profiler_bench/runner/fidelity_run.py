@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from profiler_bench.runner.scorer import FidelityScores, Scorer
+from profiler_bench.runner.measure import rotate_order
+from profiler_bench.runner.scorer import FakeScorer, FidelityScores, Scorer, real_scorer_spec
+from profiler_bench.runner.spark_conf import DEFAULT_FIDELITY_DRIVER_MEMORY, fidelity_spark_config
 
 
 def paired_seeds(k: int, *, start: int = 0) -> list[int]:
@@ -24,17 +29,31 @@ def run_fidelity_samples(
     policy: dict[str, Any],
     samples_dir: Path,
     dataset_seed: int = 0,
+    fidelity_spark: dict[str, Any] | None = None,
+    cache_dir: Path | None = None,
+    harness_hash: str = "",
+    metrics_config_hash: str = "",
+    python_exe: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Scores one representative profile per build/dataset at the fidelity tier with paired seeds."""
+    """Scores one representative profile per build/dataset in an isolated worker.
+
+    Each (role, dataset) cell runs in a fresh subprocess with its own SparkSession.
+    All K paired seeds for that cell share the process. A crash in one cell cannot
+    affect any other cell.
+    """
     tier = str(policy.get("fidelity_tier", "s"))
     k = int(policy.get("fidelity_seeds", 5))
     seeds = paired_seeds(k)
     samples_dir.mkdir(parents=True, exist_ok=True)
+    spark_config = fidelity_spark or fidelity_spark_config(driver_memory=DEFAULT_FIDELITY_DRIVER_MEMORY)
     profiles = _representative_profiles(speed_records, datasets, tier)
+    scorers = {"baseline": scorer_baseline, "candidate": scorer_candidate}
     records: list[dict[str, Any]] = []
-    for dataset in datasets:
+    exe = python_exe or sys.executable
+    for case_index, dataset in enumerate(datasets):
+        order = rotate_order(0, case_index)
         if dataset not in profiles.get("baseline", {}) or dataset not in profiles.get("candidate", {}):
-            for role in ("baseline", "candidate"):
+            for role in order:
                 record = {
                     "kind": "fidelity",
                     "role": role,
@@ -49,20 +68,241 @@ def run_fidelity_samples(
                 path.write_text(json.dumps(record, sort_keys=True))
                 records.append(record)
             continue
-        for seed in seeds:
-            for role, scorer in (("baseline", scorer_baseline), ("candidate", scorer_candidate)):
-                record = _one_seed(
-                    role=role,
-                    dataset=dataset,
-                    tier=tier,
-                    seed=seed,
-                    profile=profiles[role][dataset],
-                    scorer=scorer,
-                    samples_dir=samples_dir,
-                    dataset_seed=dataset_seed,
-                )
-                records.append(record)
+        for role in order:
+            cell_records = _run_cell(
+                role=role,
+                dataset=dataset,
+                tier=tier,
+                seeds=seeds,
+                profile=profiles[role][dataset],
+                scorer=scorers[role],
+                samples_dir=samples_dir,
+                dataset_seed=dataset_seed,
+                fidelity_spark=spark_config,
+                cache_dir=cache_dir,
+                harness_hash=harness_hash,
+                metrics_config_hash=metrics_config_hash,
+                python_exe=exe,
+            )
+            records.extend(cell_records)
     return records
+
+
+def score_one_seed(
+    *,
+    role: str,
+    dataset: str,
+    tier: str,
+    seed: int,
+    profile: dict[str, Any],
+    scorer: Scorer,
+    dataset_seed: int,
+) -> dict[str, Any]:
+    """Scores one seed and returns the fidelity sample record (does not write files)."""
+    try:
+        scores: FidelityScores = scorer.score(
+            profile,
+            dataset=dataset,
+            tier=tier,
+            seed=seed,
+            structure_seed=dataset_seed,
+            sample_seed=dataset_seed,
+        )
+        if scores.ceiling is None or scores.relative_reconstruction is None:
+            raise RuntimeError("scorer did not produce ceiling-relative reconstruction")
+        return {
+            "kind": "fidelity",
+            "role": role,
+            "dataset": dataset,
+            "tier": tier,
+            "seed": seed,
+            "ok": True,
+            "reconstruction": scores.reconstruction,
+            "structure": scores.structure,
+            "privacy_passed": scores.privacy_passed,
+            "privacy_unmeasured": scores.privacy_unmeasured,
+            "ceiling": scores.ceiling,
+            "relative_reconstruction": scores.relative_reconstruction,
+            "detail": scores.detail,
+            "metrics_config_hash": scores.metrics_config_hash,
+        }
+    except Exception as error:
+        return {
+            "kind": "fidelity",
+            "role": role,
+            "dataset": dataset,
+            "tier": tier,
+            "seed": seed,
+            "ok": False,
+            "error_class": type(error).__name__,
+            "error": str(error),
+        }
+
+
+def _one_seed(
+    *,
+    role: str,
+    dataset: str,
+    tier: str,
+    seed: int,
+    profile: dict[str, Any],
+    scorer: Scorer,
+    samples_dir: Path,
+    dataset_seed: int,
+) -> dict[str, Any]:
+    """Scores one seed and writes the sample JSON (kept for unit tests)."""
+    record = score_one_seed(
+        role=role,
+        dataset=dataset,
+        tier=tier,
+        seed=seed,
+        profile=profile,
+        scorer=scorer,
+        dataset_seed=dataset_seed,
+    )
+    path = samples_dir / f"fidelity-{role}-{dataset}-{tier}-seed-{seed}.json"
+    path.write_text(json.dumps(record, sort_keys=True, default=str))
+    return record
+
+
+def _run_cell(
+    *,
+    role: str,
+    dataset: str,
+    tier: str,
+    seeds: Sequence[int],
+    profile: dict[str, Any],
+    scorer: Scorer,
+    samples_dir: Path,
+    dataset_seed: int,
+    fidelity_spark: dict[str, Any],
+    cache_dir: Path | None,
+    harness_hash: str,
+    metrics_config_hash: str,
+    python_exe: str,
+) -> list[dict[str, Any]]:
+    """Runs one (role, dataset) cell in a fresh worker subprocess."""
+    with tempfile.TemporaryDirectory(prefix="rsi-fidelity-") as tmp:
+        tmp_path = Path(tmp)
+        profile_path = tmp_path / "profile.json"
+        scorer_path = tmp_path / "scorer.json"
+        spark_path = tmp_path / "fidelity-spark.json"
+        seeds_path = tmp_path / "seeds.json"
+        out_path = tmp_path / "cell.json"
+        profile_path.write_text(json.dumps(profile, sort_keys=True, default=str))
+        scorer_path.write_text(json.dumps(_scorer_spec(scorer, cache_dir, harness_hash, metrics_config_hash)))
+        spark_path.write_text(json.dumps(fidelity_spark, sort_keys=True))
+        seeds_path.write_text(json.dumps(list(seeds)))
+        command = [
+            python_exe,
+            "-m",
+            "profiler_bench.runner.fidelity_worker",
+            "--profile-json",
+            str(profile_path),
+            "--scorer-json",
+            str(scorer_path),
+            "--fidelity-spark-json",
+            str(spark_path),
+            "--seeds-json",
+            str(seeds_path),
+            "--out",
+            str(out_path),
+            "--role",
+            role,
+            "--dataset",
+            dataset,
+            "--tier",
+            tier,
+            "--dataset-seed",
+            str(dataset_seed),
+        ]
+        if cache_dir is not None:
+            command.extend(["--cache-dir", str(cache_dir)])
+        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+        return _records_from_worker(
+            role=role,
+            dataset=dataset,
+            tier=tier,
+            seeds=seeds,
+            out_path=out_path,
+            samples_dir=samples_dir,
+            completed=completed,
+        )
+
+
+def _scorer_spec(
+    scorer: Scorer,
+    cache_dir: Path | None,
+    harness_hash: str,
+    metrics_config_hash: str,
+) -> dict[str, Any]:
+    if isinstance(scorer, FakeScorer):
+        return scorer.to_spec()
+    if cache_dir is None:
+        raise ValueError("real fidelity scoring requires cache_dir")
+    return real_scorer_spec(
+        cache_dir=cache_dir,
+        harness_hash=harness_hash,
+        metrics_config_hash=metrics_config_hash,
+    )
+
+
+def _records_from_worker(
+    *,
+    role: str,
+    dataset: str,
+    tier: str,
+    seeds: Sequence[int],
+    out_path: Path,
+    samples_dir: Path,
+    completed: subprocess.CompletedProcess[str],
+) -> list[dict[str, Any]]:
+    if out_path.is_file():
+        payload = json.loads(out_path.read_text())
+        raw_records = payload.get("records")
+        if payload.get("ok") and isinstance(raw_records, list) and len(raw_records) == len(seeds):
+            records = [dict(record) for record in raw_records]
+            for record in records:
+                _write_sample(samples_dir, record)
+            return records
+        error_class = str(payload.get("error_class") or "FidelityWorkerError")
+        error = str(payload.get("error") or "fidelity worker failed")
+    else:
+        error_class = "FidelityWorkerCrash"
+        error = (
+            f"fidelity worker produced no output (returncode={completed.returncode}); "
+            f"stderr={completed.stderr[-2000:]}"
+        )
+    return [_failed_seed(role, dataset, tier, seed, error_class, error, samples_dir) for seed in seeds]
+
+
+def _failed_seed(
+    role: str,
+    dataset: str,
+    tier: str,
+    seed: int,
+    error_class: str,
+    error: str,
+    samples_dir: Path,
+) -> dict[str, Any]:
+    record = {
+        "kind": "fidelity",
+        "role": role,
+        "dataset": dataset,
+        "tier": tier,
+        "seed": seed,
+        "ok": False,
+        "error_class": error_class,
+        "error": error,
+    }
+    _write_sample(samples_dir, record)
+    return record
+
+
+def _write_sample(samples_dir: Path, record: dict[str, Any]) -> None:
+    seed = record["seed"]
+    path = samples_dir / f"fidelity-{record['role']}-{record['dataset']}-{record['tier']}-seed-{seed}.json"
+    path.write_text(json.dumps(record, sort_keys=True, default=str))
 
 
 def _representative_profiles(
@@ -85,57 +325,3 @@ def _representative_profiles(
         if isinstance(profile, dict):
             out[role][dataset] = profile
     return out
-
-
-def _one_seed(
-    *,
-    role: str,
-    dataset: str,
-    tier: str,
-    seed: int,
-    profile: dict[str, Any],
-    scorer: Scorer,
-    samples_dir: Path,
-    dataset_seed: int,
-) -> dict[str, Any]:
-    path = samples_dir / f"fidelity-{role}-{dataset}-{tier}-seed-{seed}.json"
-    try:
-        scores: FidelityScores = scorer.score(
-            profile,
-            dataset=dataset,
-            tier=tier,
-            seed=seed,
-            structure_seed=dataset_seed,
-            sample_seed=dataset_seed,
-        )
-        if scores.ceiling is None or scores.relative_reconstruction is None:
-            raise RuntimeError("scorer did not produce ceiling-relative reconstruction")
-        record: dict[str, Any] = {
-            "kind": "fidelity",
-            "role": role,
-            "dataset": dataset,
-            "tier": tier,
-            "seed": seed,
-            "ok": True,
-            "reconstruction": scores.reconstruction,
-            "structure": scores.structure,
-            "privacy_passed": scores.privacy_passed,
-            "privacy_unmeasured": scores.privacy_unmeasured,
-            "ceiling": scores.ceiling,
-            "relative_reconstruction": scores.relative_reconstruction,
-            "detail": scores.detail,
-            "metrics_config_hash": scores.metrics_config_hash,
-        }
-    except Exception as error:
-        record = {
-            "kind": "fidelity",
-            "role": role,
-            "dataset": dataset,
-            "tier": tier,
-            "seed": seed,
-            "ok": False,
-            "error_class": type(error).__name__,
-            "error": str(error),
-        }
-    path.write_text(json.dumps(record, sort_keys=True, default=str))
-    return record

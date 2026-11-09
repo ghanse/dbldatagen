@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -72,6 +73,9 @@ class FakeScorer:
     by_seed: dict[int, dict[str, Any]] = field(default_factory=dict)
     by_role_seed: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
     role: str = "baseline"
+    raise_message: str | None = None
+    crash_exit_code: int | None = None
+    fail_datasets: tuple[str, ...] = ()
 
     def score(
         self,
@@ -85,6 +89,11 @@ class FakeScorer:
     ) -> FidelityScores:
         """Returns configured scores, optionally overridden per seed or (role, seed)."""
         del profile, tier, structure_seed, sample_seed
+        if not self.fail_datasets or dataset in self.fail_datasets:
+            if self.crash_exit_code is not None:
+                os._exit(int(self.crash_exit_code))
+            if self.raise_message is not None:
+                raise RuntimeError(self.raise_message)
         values: dict[str, Any] = {
             "reconstruction": self.reconstruction,
             "structure": self.structure,
@@ -124,7 +133,70 @@ class FakeScorer:
             by_seed=dict(self.by_seed),
             by_role_seed=dict(self.by_role_seed),
             role=role,
+            raise_message=self.raise_message,
+            crash_exit_code=self.crash_exit_code,
+            fail_datasets=tuple(self.fail_datasets),
         )
+
+    def to_spec(self) -> dict[str, Any]:
+        """Returns a JSON-serializable worker scorer specification."""
+        return {
+            "kind": "fake",
+            "reconstruction": self.reconstruction,
+            "structure": self.structure,
+            "privacy_passed": self.privacy_passed,
+            "ceiling_value": self.ceiling_value,
+            "metrics_config_hash": self.metrics_config_hash,
+            "by_seed": {str(seed): dict(values) for seed, values in self.by_seed.items()},
+            "by_role_seed": {f"{role}:{seed}": dict(values) for (role, seed), values in self.by_role_seed.items()},
+            "role": self.role,
+            "raise_message": self.raise_message,
+            "crash_exit_code": self.crash_exit_code,
+            "fail_datasets": list(self.fail_datasets),
+        }
+
+
+def scorer_from_spec(spec: dict[str, Any]) -> Scorer:
+    """Rebuilds a scorer from a worker specification (`fake` or `real`)."""
+    kind = str(spec.get("kind", "real"))
+    if kind == "fake":
+        by_role_seed: dict[tuple[str, int], dict[str, Any]] = {}
+        for key, values in dict(spec.get("by_role_seed", {})).items():
+            role, seed_text = str(key).split(":", 1)
+            by_role_seed[(role, int(seed_text))] = dict(values)
+        return FakeScorer(
+            reconstruction=float(spec.get("reconstruction", 0.8)),
+            structure=float(spec.get("structure", 0.7)),
+            privacy_passed=bool(spec.get("privacy_passed", True)),
+            ceiling_value=float(spec.get("ceiling_value", 0.9)),
+            metrics_config_hash=str(spec.get("metrics_config_hash", "fake-metrics")),
+            by_seed={int(seed): dict(values) for seed, values in dict(spec.get("by_seed", {})).items()},
+            by_role_seed=by_role_seed,
+            role=str(spec.get("role", "baseline")),
+            raise_message=spec.get("raise_message"),
+            crash_exit_code=spec.get("crash_exit_code"),
+            fail_datasets=tuple(str(name) for name in list(spec.get("fail_datasets", []))),
+        )
+    if kind != "real":
+        raise ValueError(f"unknown scorer kind: {kind}")
+    scorer = try_real_scorer(
+        cache_dir=Path(str(spec["cache_dir"])),
+        harness_hash=str(spec["harness_hash"]),
+        metrics_config_hash=str(spec["metrics_config_hash"]),
+    )
+    if scorer is None:
+        raise RuntimeError("real scorer is not importable in the fidelity worker")
+    return scorer
+
+
+def real_scorer_spec(*, cache_dir: Path, harness_hash: str, metrics_config_hash: str) -> dict[str, Any]:
+    """Returns a worker specification that builds the real sampler+fidelity scorer."""
+    return {
+        "kind": "real",
+        "cache_dir": str(cache_dir),
+        "harness_hash": harness_hash,
+        "metrics_config_hash": metrics_config_hash,
+    }
 
 
 def try_real_scorer(*, cache_dir: Path, harness_hash: str, metrics_config_hash: str) -> Scorer | None:
