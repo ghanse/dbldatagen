@@ -219,6 +219,7 @@ def _find_quasi_identifier_sets(
         for columns in combinations(candidates[:MAX_QUASI_CANDIDATES], size):
             keys = [tuple(row[column] for column in columns) for row in rows]
             keys = [key for key in keys if all(value is not None for value in key)]
+            keys = [tuple(repr(value) for value in key) for key in keys]
             counts = Counter(keys)
             if not keys:
                 continue

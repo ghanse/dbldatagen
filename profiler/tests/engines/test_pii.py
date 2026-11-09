@@ -200,6 +200,15 @@ def test_detected_profile_validates_against_schema(spark: SparkSession) -> None:
     jsonschema.validate(profile.model_dump(mode="json", exclude_none=True), profile_json_schema())
 
 
+def test_profiles_array_quasi_identifier_candidate(spark: SparkSession) -> None:
+    rows = [([f"item-{index % 2}"], f"group-{index % 2}") for index in range(10)]
+    frame = spark.createDataFrame(rows, "items array<string>, category string")
+
+    profile = profile_dataframe("nested", frame)
+
+    jsonschema.validate(profile.model_dump(mode="json", exclude_none=True), profile_json_schema())
+
+
 def test_nested_array_struct_email_is_detected_substituted_and_domain_consistent(spark: SparkSession) -> None:
     frame = spark.createDataFrame(
         [([Row(email="alice@example.com")], "alice@example.com")],
