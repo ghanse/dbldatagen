@@ -1,0 +1,74 @@
+{
+  "actor": "worker:omnigent/p1-6-runner",
+  "baseline_commit": "9876575c368de30fe1a12cc5d5763c9729441471",
+  "candidate_commit": "9876575c368de30fe1a12cc5d5763c9729441471",
+  "experiment_id": "control-xs-0001",
+  "harness_hash": "4f16a4ccc214502b8fa21645bd23a9d08319ef254959f88cfa3415ff52fbd8e1",
+  "kind": "benchmark",
+  "policy": "0f26f1b433045e5456f3ecb54a1a0d4334a9997c16d7c5b4f5fd70093a29725d",
+  "proposal_id": "control-xs-0001",
+  "results_path": "profiler/rsi/experiments/control-xs-0001",
+  "summary": "Benchmark control-xs-0001 verdict=inconclusive baseline=9876575c368d candidate=9876575c368d",
+  "summary_metrics": {
+    "failed_fidelity": 0,
+    "failed_speed": 0,
+    "fidelity": {
+      "baseline/numeric": {
+        "n": 2,
+        "privacy_all_passed": true,
+        "reconstruction_mean": 0.7196762048721892,
+        "relative_mean": 0.7241868778285658,
+        "structure_mean": 0.30769230769230776
+      },
+      "baseline/retail": {
+        "n": 2,
+        "privacy_all_passed": true,
+        "reconstruction_mean": 0.5831704161766231,
+        "relative_mean": 0.6289532531737989,
+        "structure_mean": 0.28644688644688654
+      },
+      "candidate/numeric": {
+        "n": 2,
+        "privacy_all_passed": true,
+        "reconstruction_mean": 0.7196762048721892,
+        "relative_mean": 0.7241868778285658,
+        "structure_mean": 0.30769230769230776
+      },
+      "candidate/retail": {
+        "n": 2,
+        "privacy_all_passed": true,
+        "reconstruction_mean": 0.5831704161766231,
+        "relative_mean": 0.6289532531737989,
+        "structure_mean": 0.28644688644688654
+      }
+    },
+    "reasons": [
+      "control",
+      "accuracy_crossing_interval"
+    ],
+    "speed": {
+      "baseline/numeric@xs": {
+        "cpu_s_median": 1.6335435000000005,
+        "peak_rss_bytes_median": 138067968.0,
+        "wall_s_median": 3.2156512500000645
+      },
+      "baseline/retail@xs": {
+        "cpu_s_median": 0.716106,
+        "peak_rss_bytes_median": 138354688.0,
+        "wall_s_median": 1.8071740414998203
+      },
+      "candidate/numeric@xs": {
+        "cpu_s_median": 1.7169165,
+        "peak_rss_bytes_median": 139837440.0,
+        "wall_s_median": 3.397304562500267
+      },
+      "candidate/retail@xs": {
+        "cpu_s_median": 0.6708724999999999,
+        "peak_rss_bytes_median": 136781824.0,
+        "wall_s_median": 1.5030653750000056
+      }
+    },
+    "verdict": "inconclusive"
+  },
+  "work_item": "P1.6"
+}

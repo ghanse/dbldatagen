@@ -114,7 +114,7 @@ def run_experiment(config: ExperimentConfig) -> Path:
     determinism = check_profile_determinism(speed_records)
     (samples_dir / "profile_determinism.json").write_text(json.dumps(determinism, indent=2, sort_keys=True) + "\n")
 
-    scorer = config.scorer or try_real_scorer()
+    scorer = config.scorer or try_real_scorer(cache_dir=out / "cache", harness_hash=harness.harness_hash)
     if scorer is None:
         raise RuntimeError("no Scorer available: inject ExperimentConfig.scorer or merge sampler/fidelity modules")
     scorer_baseline: Scorer

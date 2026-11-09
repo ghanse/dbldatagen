@@ -1,0 +1,138 @@
+{
+  "gates": [
+    {
+      "detail": {
+        "expected_fidelity": 8,
+        "expected_speed": 8
+      },
+      "name": "sample_completeness",
+      "passed": true,
+      "reason": "all_samples_ok",
+      "status": "pass"
+    },
+    {
+      "detail": {},
+      "name": "privacy",
+      "passed": true,
+      "reason": "privacy_passed",
+      "status": "pass"
+    },
+    {
+      "detail": {
+        "baseline_hash": "166e9e8e369602d2a269444761183518e78d8a107c6566e70e6dc92b391ff7f2",
+        "candidate_hash": "166e9e8e369602d2a269444761183518e78d8a107c6566e70e6dc92b391ff7f2",
+        "control": true,
+        "same_profiler_src_hash": true
+      },
+      "name": "control",
+      "passed": false,
+      "reason": "control",
+      "status": "inconclusive"
+    },
+    {
+      "detail": {
+        "ci": {
+          "confidence": 0.95,
+          "crosses_zero": true,
+          "high": 0.0,
+          "low": 0.0,
+          "method": "stratified_dataset_mean",
+          "n": 2,
+          "n_bootstrap": 2000,
+          "point": 0.0,
+          "seed": 0,
+          "statistic": "mean"
+        },
+        "ci_floor": 0.0,
+        "estimand": "equally weighted mean across datasets of per-dataset mean paired differences; stratified bootstrap resamples seeds within each dataset (datasets are fixed strata). A hierarchical bootstrap that also resamples datasets is an unused alternative.",
+        "mean_across_datasets": 0.0,
+        "min_improvement": 0.005,
+        "per_dataset_mean_improvement": {
+          "numeric": 0.0,
+          "retail": 0.0
+        }
+      },
+      "name": "accuracy_mean",
+      "passed": false,
+      "reason": "accuracy_crossing_interval",
+      "status": "inconclusive"
+    },
+    {
+      "detail": {
+        "datasets": {
+          "numeric": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 2,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 1,
+            "statistic": "mean"
+          },
+          "retail": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 2,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 1,
+            "statistic": "mean"
+          }
+        },
+        "max_regression": 0.01
+      },
+      "name": "accuracy_per_dataset",
+      "passed": true,
+      "reason": "no_reconstruction_regression",
+      "status": "pass"
+    },
+    {
+      "detail": {
+        "datasets": {
+          "numeric": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 2,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          },
+          "retail": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 2,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          }
+        },
+        "max_regression": 0.02
+      },
+      "name": "structure",
+      "passed": true,
+      "reason": "no_structure_regression",
+      "status": "pass"
+    }
+  ],
+  "interval_note": "Each gate uses a two-sided percentile CI at the policy confidence level; there is no family-wise coverage guarantee across gates.",
+  "proposal_type": "accuracy",
+  "reasons": [
+    "control",
+    "accuracy_crossing_interval"
+  ],
+  "verdict": "inconclusive"
+}

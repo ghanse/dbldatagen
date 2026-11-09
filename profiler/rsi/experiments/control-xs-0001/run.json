@@ -1,0 +1,124 @@
+{
+  "baseline": {
+    "commit": "9876575c368de30fe1a12cc5d5763c9729441471",
+    "dirty": true,
+    "profiler_src_hash": "166e9e8e369602d2a269444761183518e78d8a107c6566e70e6dc92b391ff7f2",
+    "role": "baseline",
+    "worktree": "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring"
+  },
+  "candidate": {
+    "commit": "9876575c368de30fe1a12cc5d5763c9729441471",
+    "dirty": true,
+    "profiler_src_hash": "166e9e8e369602d2a269444761183518e78d8a107c6566e70e6dc92b391ff7f2",
+    "role": "candidate",
+    "worktree": "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring"
+  },
+  "command_line": [
+    "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring/profiler-bench/src/profiler_bench/rsi/__main__.py",
+    "run",
+    "--baseline",
+    "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring",
+    "--candidate",
+    "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring",
+    "--policy",
+    "profiler-bench/tests/runner/control-xs-policy.json",
+    "--experiment-id",
+    "control-xs-0001",
+    "--datasets",
+    "retail",
+    "numeric",
+    "--control",
+    "--repo-root",
+    "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring",
+    "--cache-dir",
+    "profiler-bench/.cache/catalog",
+    "--speed-tiers",
+    "xs"
+  ],
+  "control": true,
+  "datasets": [
+    "retail",
+    "numeric"
+  ],
+  "experiment_id": "control-xs-0001",
+  "fidelity_tier": "xs",
+  "harness": {
+    "commit": "9876575c368de30fe1a12cc5d5763c9729441471",
+    "dirty": true,
+    "harness_hash": "4f16a4ccc214502b8fa21645bd23a9d08319ef254959f88cfa3415ff52fbd8e1",
+    "harness_root": "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring",
+    "hashed_roots": [
+      "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring/profiler-bench/src/profiler_bench",
+      "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring/profiler-bench/policies"
+    ],
+    "metrics_config_hash": "5fbc62012d271b69c3f575bc7b55ae8824fe7ae7dab601aecc14919168de6a3d",
+    "policy_hash": "0f26f1b433045e5456f3ecb54a1a0d4334a9997c16d7c5b4f5fd70093a29725d"
+  },
+  "machine": {
+    "machine": "arm64",
+    "node": "X5R2FN2YQC",
+    "platform": "macOS-26.7.2-arm64-arm-64bit",
+    "processor": "arm",
+    "python": "3.10.20 (main, Mar  3 2026, 00:49:35) [Clang 17.0.0 (clang-1700.6.3.2)]"
+  },
+  "not_measured": [
+    "Spark executor / JVM heap and RSS (driver process RSS only)",
+    "GPU / accelerator time",
+    "network and disk IO bytes",
+    "cluster-scale Spark (local[*] only)",
+    "end-to-end dbldatagen generation from the profile"
+  ],
+  "policy": {
+    "accuracy": {
+      "ci_lower_must_exceed": 0.0,
+      "max_dataset_regression": 0.01,
+      "max_structure_regression": 0.02,
+      "min_mean_improvement": 0.005
+    },
+    "bootstrap": {
+      "confidence": 0.95,
+      "samples": 2000,
+      "seed": 0
+    },
+    "dataset_seed": 0,
+    "fidelity_seeds": 2,
+    "fidelity_tier": "xs",
+    "not_measured": [
+      "Spark executor / JVM heap and RSS (driver process RSS only)",
+      "GPU / accelerator time",
+      "network and disk IO bytes",
+      "cluster-scale Spark (local[*] only)",
+      "end-to-end dbldatagen generation from the profile"
+    ],
+    "privacy": {
+      "hard_guard": true
+    },
+    "spark": {
+      "configs": {
+        "spark.driver.memory": "2g",
+        "spark.sql.session.timeZone": "UTC",
+        "spark.sql.shuffle.partitions": "2",
+        "spark.ui.enabled": "false"
+      },
+      "master": "local[2]"
+    },
+    "speed": {
+      "max_cpu_regression": 0.1,
+      "max_rss_regression_abs_mib": 64.0,
+      "max_rss_regression_frac": 0.05,
+      "max_wall_regression": 0.1,
+      "min_target_improvement": 0.05
+    },
+    "speed_samples": {
+      "xs": 2
+    },
+    "speed_tiers": [
+      "xs"
+    ],
+    "version": "1.0.0"
+  },
+  "policy_path": "/Users/gregory.hansen/code/dbldatagen-profiler/.worktrees/p1-6a-wiring/profiler-bench/tests/runner/control-xs-policy.json",
+  "speed_tiers": [
+    "xs"
+  ]
+}

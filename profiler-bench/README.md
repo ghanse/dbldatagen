@@ -285,9 +285,10 @@ The reference sampler is designed for benchmark tiers up to `s` (about 100,000 r
 harness. Each build is a git worktree plus commit; the worker imports `profiler/src` from that worktree via
 `PYTHONPATH` in a **fresh subprocess**. Speed samples time `profile_tables` (driver wall, process CPU, peak RSS)
 after an untimed warmup, rotate baseline/candidate order across cases, and record profile hashes. Fidelity samples
-take one profile per build/dataset at the fidelity tier and score it with a `Scorer` for K **paired** sampler seeds.
-`--control` runs the baseline against itself. Fidelity metrics are not on this branch yet; inject a `Scorer`
-(tests use `FakeScorer`). `try_real_scorer()` wires to sampler + fidelity when both import.
+take one profile per build/dataset at the fidelity tier and score it with the reference sampler and fidelity metrics
+for K **paired** sampler seeds. Each result includes the full reconstruction, structure, privacy, and real-vs-real
+ceiling detail. Ceilings are cached by dataset, tier, and harness hash in the experiment cache. `--control` runs the
+baseline against itself. Tests can explicitly inject a `FakeScorer`; command-line runs never use it.
 
 `profiler_bench.evaluate` applies `profiler-bench/policies/default.json`. The accuracy mean estimand is the equally
 weighted mean across datasets of each dataset's mean paired-seed difference; its CI uses a **stratified bootstrap**

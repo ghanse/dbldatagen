@@ -32,7 +32,6 @@ def run_fidelity_samples(
     samples_dir.mkdir(parents=True, exist_ok=True)
     profiles = _representative_profiles(speed_records, datasets, tier)
     records: list[dict[str, Any]] = []
-    ceilings: dict[str, float] = {}
     for dataset in datasets:
         if dataset not in profiles.get("baseline", {}) or dataset not in profiles.get("candidate", {}):
             for role in ("baseline", "candidate"):
@@ -49,8 +48,6 @@ def run_fidelity_samples(
                 path.write_text(json.dumps(record, sort_keys=True))
                 records.append(record)
             continue
-        if dataset not in ceilings:
-            ceilings[dataset] = float(scorer_baseline.ceiling(dataset, tier, structure_seed=dataset_seed))
         for seed in seeds:
             for role, scorer in (("baseline", scorer_baseline), ("candidate", scorer_candidate)):
                 record = _one_seed(
@@ -62,7 +59,6 @@ def run_fidelity_samples(
                     scorer=scorer,
                     samples_dir=samples_dir,
                     dataset_seed=dataset_seed,
-                    ceiling=ceilings[dataset],
                 )
                 records.append(record)
     return records
@@ -100,7 +96,6 @@ def _one_seed(
     scorer: Scorer,
     samples_dir: Path,
     dataset_seed: int,
-    ceiling: float,
 ) -> dict[str, Any]:
     path = samples_dir / f"fidelity-{role}-{dataset}-{tier}-seed-{seed}.json"
     try:
@@ -112,9 +107,8 @@ def _one_seed(
             structure_seed=dataset_seed,
             sample_seed=dataset_seed,
         )
-        relative = scores.relative_reconstruction
-        if relative is None and ceiling > 0:
-            relative = min(1.0, scores.reconstruction / ceiling)
+        if scores.ceiling is None or scores.relative_reconstruction is None:
+            raise RuntimeError("scorer did not produce ceiling-relative reconstruction")
         record: dict[str, Any] = {
             "kind": "fidelity",
             "role": role,
@@ -125,8 +119,8 @@ def _one_seed(
             "reconstruction": scores.reconstruction,
             "structure": scores.structure,
             "privacy_passed": scores.privacy_passed,
-            "ceiling": ceiling,
-            "relative_reconstruction": relative,
+            "ceiling": scores.ceiling,
+            "relative_reconstruction": scores.relative_reconstruction,
             "detail": scores.detail,
             "metrics_config_hash": scores.metrics_config_hash,
         }
@@ -138,7 +132,8 @@ def _one_seed(
             "tier": tier,
             "seed": seed,
             "ok": False,
-            "error": f"{type(error).__name__}: {error}",
+            "error_class": type(error).__name__,
+            "error": str(error),
         }
     path.write_text(json.dumps(record, sort_keys=True, default=str))
     return record
