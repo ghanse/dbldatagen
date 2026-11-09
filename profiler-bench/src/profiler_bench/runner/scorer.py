@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
+import os
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 
 if TYPE_CHECKING:
@@ -72,6 +75,9 @@ class FakeScorer:
     by_seed: dict[int, dict[str, Any]] = field(default_factory=dict)
     by_role_seed: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
     role: str = "baseline"
+    raise_message: str | None = None
+    crash_exit_code: int | None = None
+    fail_datasets: tuple[str, ...] = ()
 
     def score(
         self,
@@ -85,6 +91,11 @@ class FakeScorer:
     ) -> FidelityScores:
         """Returns configured scores, optionally overridden per seed or (role, seed)."""
         del profile, tier, structure_seed, sample_seed
+        if not self.fail_datasets or dataset in self.fail_datasets:
+            if self.crash_exit_code is not None:
+                os._exit(int(self.crash_exit_code))
+            if self.raise_message is not None:
+                raise RuntimeError(self.raise_message)
         values: dict[str, Any] = {
             "reconstruction": self.reconstruction,
             "structure": self.structure,
@@ -124,7 +135,70 @@ class FakeScorer:
             by_seed=dict(self.by_seed),
             by_role_seed=dict(self.by_role_seed),
             role=role,
+            raise_message=self.raise_message,
+            crash_exit_code=self.crash_exit_code,
+            fail_datasets=tuple(self.fail_datasets),
         )
+
+    def to_spec(self) -> dict[str, Any]:
+        """Returns a JSON-serializable worker scorer specification."""
+        return {
+            "kind": "fake",
+            "reconstruction": self.reconstruction,
+            "structure": self.structure,
+            "privacy_passed": self.privacy_passed,
+            "ceiling_value": self.ceiling_value,
+            "metrics_config_hash": self.metrics_config_hash,
+            "by_seed": {str(seed): dict(values) for seed, values in self.by_seed.items()},
+            "by_role_seed": {f"{role}:{seed}": dict(values) for (role, seed), values in self.by_role_seed.items()},
+            "role": self.role,
+            "raise_message": self.raise_message,
+            "crash_exit_code": self.crash_exit_code,
+            "fail_datasets": list(self.fail_datasets),
+        }
+
+
+def scorer_from_spec(spec: dict[str, Any]) -> Scorer:
+    """Rebuilds a scorer from a worker specification (`fake` or `real`)."""
+    kind = str(spec.get("kind", "real"))
+    if kind == "fake":
+        by_role_seed: dict[tuple[str, int], dict[str, Any]] = {}
+        for key, values in dict(spec.get("by_role_seed", {})).items():
+            role, seed_text = str(key).split(":", 1)
+            by_role_seed[(role, int(seed_text))] = dict(values)
+        return FakeScorer(
+            reconstruction=float(spec.get("reconstruction", 0.8)),
+            structure=float(spec.get("structure", 0.7)),
+            privacy_passed=bool(spec.get("privacy_passed", True)),
+            ceiling_value=float(spec.get("ceiling_value", 0.9)),
+            metrics_config_hash=str(spec.get("metrics_config_hash", "fake-metrics")),
+            by_seed={int(seed): dict(values) for seed, values in dict(spec.get("by_seed", {})).items()},
+            by_role_seed=by_role_seed,
+            role=str(spec.get("role", "baseline")),
+            raise_message=spec.get("raise_message"),
+            crash_exit_code=spec.get("crash_exit_code"),
+            fail_datasets=tuple(str(name) for name in list(spec.get("fail_datasets", []))),
+        )
+    if kind != "real":
+        raise ValueError(f"unknown scorer kind: {kind}")
+    scorer = try_real_scorer(
+        cache_dir=Path(str(spec["cache_dir"])),
+        harness_hash=str(spec["harness_hash"]),
+        metrics_config_hash=str(spec["metrics_config_hash"]),
+    )
+    if scorer is None:
+        raise RuntimeError("real scorer is not importable in the fidelity worker")
+    return scorer
+
+
+def real_scorer_spec(*, cache_dir: Path, harness_hash: str, metrics_config_hash: str) -> dict[str, Any]:
+    """Returns a worker specification that builds the real sampler+fidelity scorer."""
+    return {
+        "kind": "real",
+        "cache_dir": str(cache_dir),
+        "harness_hash": harness_hash,
+        "metrics_config_hash": metrics_config_hash,
+    }
 
 
 def try_real_scorer(*, cache_dir: Path, harness_hash: str, metrics_config_hash: str) -> Scorer | None:
@@ -187,8 +261,6 @@ class _RealScorer:
         """Returns the full cached real-vs-real ceiling score."""
         from pyspark.sql import SparkSession  # noqa: PLC0415
 
-        from profiler_bench.fidelity import ReconstructionScore  # noqa: PLC0415
-
         key = (dataset, tier, structure_seed, self.harness_hash, self.metrics_config_hash)
         if key not in self._ceiling_cache:
             path = (
@@ -198,22 +270,68 @@ class _RealScorer:
                 / self.metrics_config_hash
                 / f"{dataset}-{tier}-seed-{structure_seed}.json"
             )
-            if path.is_file():
-                result = ReconstructionScore.model_validate_json(path.read_text())
-            else:
+
+            def compute() -> ReconstructionScore:
+                from profiler_bench.fidelity import ReconstructionScore as ScoreModel  # noqa: PLC0415
+
                 spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
                 spark.conf.set("spark.sql.session.timeZone", "UTC")
-                result = self.fidelity_ceiling(
-                    dataset,
-                    tier,
-                    spark=spark,
-                    structure_seed=structure_seed,
-                    sample_seed=structure_seed,
+                return cast(
+                    ScoreModel,
+                    self.fidelity_ceiling(
+                        dataset,
+                        tier,
+                        spark=spark,
+                        structure_seed=structure_seed,
+                        sample_seed=structure_seed,
+                    ),
                 )
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(result.model_dump_json(indent=2) + "\n")
-            self._ceiling_cache[key] = result
+
+            self._ceiling_cache[key] = read_or_compute_ceiling(path, compute)
         return self._ceiling_cache[key]
+
+
+def read_or_compute_ceiling(path: Path, compute: Callable[[], ReconstructionScore]) -> ReconstructionScore:
+    """Loads a ceiling JSON under an fcntl lock, computing once on miss/corruption.
+
+    Readers tolerate a missing or partial file by recomputing under the exclusive lock.
+    Writes use a temp file + ``os.replace`` so observers never see truncated JSON.
+    """
+    from profiler_bench.fidelity import ReconstructionScore  # noqa: PLC0415
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            loaded = _try_load_ceiling(path)
+            if loaded is not None:
+                return loaded
+            result = compute()
+            if not isinstance(result, ReconstructionScore):
+                raise TypeError("ceiling compute must return ReconstructionScore")
+            _atomic_write_text(path, result.model_dump_json(indent=2) + "\n")
+            return result
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _try_load_ceiling(path: Path) -> ReconstructionScore | None:
+    from profiler_bench.fidelity import ReconstructionScore  # noqa: PLC0415
+
+    try:
+        if not path.is_file():
+            return None
+        return ReconstructionScore.model_validate_json(path.read_text())
+    except Exception:
+        return None
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    tmp_path.write_text(text)
+    os.replace(tmp_path, path)
 
 
 def _score_with_real_modules(

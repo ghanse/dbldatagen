@@ -12,11 +12,12 @@ from typing import Any
 
 from profiler_bench.catalog import DATASETS
 from profiler_bench.evaluate.evaluate import evaluate_experiment
-from profiler_bench.runner.fidelity_run import run_fidelity_samples
+from profiler_bench.runner.fidelity_run import DEFAULT_FIDELITY_CELL_TIMEOUT_S, run_fidelity_samples
 from profiler_bench.runner.identity import identify_build, identify_harness, machine_info
 from profiler_bench.runner.measure import check_profile_determinism, run_speed_samples
 from profiler_bench.runner.policy import load_policy
 from profiler_bench.runner.scorer import FakeScorer, Scorer, try_real_scorer
+from profiler_bench.runner.spark_conf import DEFAULT_FIDELITY_DRIVER_MEMORY, fidelity_spark_config
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,8 @@ class ExperimentConfig:
         cache_dir: Optional catalog cache directory for workers.
         proposal: Optional proposal metadata written as `proposal.json`.
         speed_tiers: Override for speed tiers from the policy.
-        fidelity_only_tier: When set, also collect speed samples at this tier for fidelity profiles.
+        fidelity_driver_memory: Driver heap for fidelity workers only (speed policy spark unchanged).
+        fidelity_cell_timeout_s: Wall-clock timeout for one (build, dataset) fidelity worker.
     """
 
     experiment_id: str
@@ -50,6 +52,8 @@ class ExperimentConfig:
     proposal: dict[str, Any] | None = None
     speed_tiers: Sequence[str] | None = None
     command_line: Sequence[str] | None = None
+    fidelity_driver_memory: str = DEFAULT_FIDELITY_DRIVER_MEMORY
+    fidelity_cell_timeout_s: float = DEFAULT_FIDELITY_CELL_TIMEOUT_S
 
 
 def experiment_dir(experiment_id: str, repo_root: Path | None = None) -> Path:
@@ -111,12 +115,16 @@ def run_experiment(config: ExperimentConfig) -> Path:
     proposal = config.proposal or {"type": "accuracy", "targets": datasets}
     (out / "proposal.json").write_text(json.dumps(proposal, indent=2, sort_keys=True) + "\n")
 
+    fidelity_spark = fidelity_spark_config(driver_memory=config.fidelity_driver_memory)
     run_meta = {
         "experiment_id": config.experiment_id,
         "control": config.control,
         "datasets": datasets,
         "speed_tiers": speed_tiers,
         "fidelity_tier": fidelity_tier,
+        "fidelity_spark": fidelity_spark,
+        "fidelity_cell_timeout_s": float(config.fidelity_cell_timeout_s),
+        "fidelity_model_source": "harness",
         "baseline": _recorded_identity(baseline.to_dict(), recording_root),
         "candidate": _recorded_identity(candidate.to_dict(), recording_root),
         "harness": _recorded_identity(harness.to_dict(), recording_root),
@@ -165,6 +173,11 @@ def run_experiment(config: ExperimentConfig) -> Path:
         policy=policy,
         samples_dir=samples_dir,
         dataset_seed=int(policy.get("dataset_seed", 0)),
+        fidelity_spark=fidelity_spark,
+        cache_dir=out / "cache",
+        harness_hash=harness.harness_hash,
+        metrics_config_hash=harness.metrics_config_hash,
+        cell_timeout_s=float(config.fidelity_cell_timeout_s),
     )
     del fidelity_records  # samples are on disk; evaluate reloads them
 

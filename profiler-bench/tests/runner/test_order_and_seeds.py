@@ -67,7 +67,7 @@ def test_scorer_exception_is_a_failed_sample(tmp_path: Path) -> None:
     assert saved == record
 
 
-def test_missing_profile_has_error_class(tmp_path: Path) -> None:
+def test_missing_profile_has_error_class_per_seed(tmp_path: Path) -> None:
     records = run_fidelity_samples(
         speed_records=[],
         scorer_baseline=_BrokenScorer(),
@@ -76,8 +76,15 @@ def test_missing_profile_has_error_class(tmp_path: Path) -> None:
         policy={"fidelity_tier": "xs", "fidelity_seeds": 2},
         samples_dir=tmp_path,
     )
-    assert len(records) == 2
-    assert all(record["error_class"] == "MissingProfileError" for record in records)
+    assert [(record["role"], record["seed"], record["error_class"]) for record in records] == [
+        ("baseline", 0, "MissingProfileError"),
+        ("baseline", 1, "MissingProfileError"),
+        ("candidate", 0, "MissingProfileError"),
+        ("candidate", 1, "MissingProfileError"),
+    ]
+    for record in records:
+        path = tmp_path / f"fidelity-{record['role']}-numeric-xs-seed-{record['seed']}.json"
+        assert json.loads(path.read_text()) == record
 
 
 class _UnmeasuredScorer(_BrokenScorer):

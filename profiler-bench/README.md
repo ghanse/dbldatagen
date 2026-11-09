@@ -283,15 +283,27 @@ The reference sampler is designed for benchmark tiers up to `s` (about 100,000 r
 ## RSI runner and evaluator
 
 `profiler_bench.runner` compares a frozen **baseline** profiler build with a **candidate** build under a frozen
-harness. Each build is a git worktree plus commit; the worker imports `profiler/src` from that worktree via
+harness. Each build is a git worktree plus commit; the **speed** worker imports that worktree's `profiler/src` via
 `PYTHONPATH` in a **fresh subprocess**. Speed samples time `profile_tables` (driver wall, process CPU, peak RSS)
-after an untimed warmup, rotate baseline/candidate order across cases, and record profile hashes. Fidelity samples
-take one profile per build/dataset at the fidelity tier and score it with the reference sampler and fidelity metrics
-for K **paired** sampler seeds. Each result includes the full reconstruction, structure, privacy, and real-vs-real
-ceiling detail. Ceilings are cached by dataset, tier, and harness hash in the experiment cache. `--control` runs the
-baseline against itself. Unmeasured privacy checks keep the sample successful with `privacy_passed=false` and are
-listed in `privacy_unmeasured`, so the evaluator's hard guard rejects them. Tests can explicitly inject a `FakeScorer`;
-command-line runs never use it.
+after an untimed warmup, rotate baseline/candidate order across cases, and record profile hashes under the policy's
+timed Spark config (unchanged by fidelity settings). Fidelity samples take one profile per build/dataset at the
+fidelity tier and score it with the reference sampler and fidelity metrics for K **paired** sampler seeds. Each
+`(build, dataset)` cell runs in its own fidelity worker subprocess with a fresh SparkSession (profile in via file,
+score JSON out via file; all K seeds share that process; default per-cell timeout 45 minutes via
+`ExperimentConfig.fidelity_cell_timeout_s`, recorded as `fidelity_cell_timeout_s`). On timeout the parent SIGTERMs
+then SIGKILLs the worker process group so orphan JVMs cannot survive. Builds rotate per dataset the same way speed
+samples do. A crash, timeout, or invalid worker payload in one cell cannot affect any other cell; that cell's seed
+records are `ok=false` with `error_class` (`WorkerTimeout`, `WorkerCrashed`, `WorkerOutputInvalid`,
+`WorkerOutputMismatch`, or `MissingProfileError`). Fidelity workers use a fixed Spark config recorded in `run.json`
+as `fidelity_spark` (default `spark.driver.memory=8g`, override with `ExperimentConfig.fidelity_driver_memory`;
+shuffle partitions sized for `local[N]`). Fidelity workers deliberately parse profiles with the **frozen harness**
+`dbldatagen_profiler.model` (`run.json` records `fidelity_model_source: harness`): the harness, sampler, and scorer
+are frozen per experiment, and a candidate's profile JSON is the only candidate input. Speed workers keep importing
+the candidate profiler from its worktree. Each result includes the full reconstruction, structure, privacy, and
+real-vs-real ceiling detail. Ceilings are cached by dataset, tier, and harness hash in the experiment cache under an
+fcntl lock with atomic writes. `--control` runs the baseline against itself. Unmeasured privacy checks keep the
+sample successful with `privacy_passed=false` and are listed in `privacy_unmeasured`, so the evaluator's hard guard
+rejects them. Tests can explicitly inject a `FakeScorer`; command-line runs never use it.
 
 `profiler_bench.evaluate` applies `profiler-bench/policies/default.json`. The accuracy mean estimand is the equally
 weighted mean across datasets of each dataset's mean paired-seed difference; its CI uses a **stratified bootstrap**

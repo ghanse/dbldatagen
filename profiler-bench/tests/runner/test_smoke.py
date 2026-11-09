@@ -62,6 +62,8 @@ def test_control_smoke_never_accepted(tmp_path: Path, smoke_policy: Path, catalo
         run = json.loads((out / "run.json").read_text())
         assert run["baseline"]["commit"] == run["candidate"]["commit"]
         assert "not_measured" in run
+        assert run["fidelity_spark"]["configs"]["spark.driver.memory"] == "8g"
+        assert run["policy"]["spark"]["configs"]["spark.driver.memory"] == "2g"
         artifacts = [
             out / name for name in ("run.json", "summary.json", "verdict.json", "REPORT.md", "benchmark_entry.json")
         ]
