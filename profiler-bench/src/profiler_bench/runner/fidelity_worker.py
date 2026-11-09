@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import sys
 import traceback
 from pathlib import Path
 from typing import Any
@@ -35,6 +37,8 @@ def main(argv: list[str] | None = None) -> int:
         "dataset": args.dataset,
         "tier": args.tier,
         "records": [],
+        "profiler_module_file": _harness_profiler_module_file(),
+        "sys_path": list(sys.path),
     }
     spark = None
     try:
@@ -73,10 +77,31 @@ def main(argv: list[str] | None = None) -> int:
         result["traceback"] = traceback.format_exc()
     finally:
         if spark is not None:
-            spark.stop()
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(result, sort_keys=True, default=str))
+            with contextlib.suppress(Exception):
+                spark.stop()
+        result["profiler_module_file"] = _harness_profiler_module_file()
+        result["sys_path"] = list(sys.path)
+        _atomic_write_json(args.out, result)
     return 0 if result.get("ok") else 1
+
+
+def _harness_profiler_module_file() -> str | None:
+    """Returns the frozen-harness dbldatagen_profiler module path when importable."""
+    try:
+        import dbldatagen_profiler  # noqa: PLC0415
+    except ImportError:
+        return None
+    if dbldatagen_profiler.__file__ is None:
+        return None
+    return str(Path(dbldatagen_profiler.__file__).resolve())
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Writes JSON via a temp file + os.replace so readers never see a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    tmp_path.write_text(json.dumps(payload, sort_keys=True, default=str))
+    os.replace(tmp_path, path)
 
 
 if __name__ == "__main__":

@@ -5,13 +5,21 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 from profiler_bench.fidelity import ReconstructionScore
 from profiler_bench.rsi.__main__ import main
-from profiler_bench.runner.scorer import FakeScorer, _RealScorer, _score_with_real_modules, try_real_scorer
+from profiler_bench.runner.scorer import (
+    FakeScorer,
+    _RealScorer,
+    _score_with_real_modules,
+    read_or_compute_ceiling,
+    try_real_scorer,
+)
 
 
 class _Score:
@@ -139,6 +147,49 @@ def test_ceiling_cache_keys_harness_and_metrics_hashes(tmp_path: Path, spark: An
     assert len(calls) == 3
     assert all(call["structure_seed"] == 7 and call["sample_seed"] == 7 for call in calls)
     assert len(list((tmp_path / "ceilings").glob("*/*/*.json"))) == 3
+
+
+def _concurrent_ceiling_worker(path: str, counter: str, ready: Any, go: Any) -> None:
+    def compute() -> ReconstructionScore:
+        with open(counter, "a", encoding="utf-8") as handle:
+            handle.write("x")
+        time.sleep(0.3)
+        return ReconstructionScore(
+            dataset="numeric",
+            tier="xs",
+            seed=0,
+            config_version="test",
+            config_hash="metrics-a",
+            tables=[],
+            score=0.91,
+        )
+
+    ready.set()
+    go.wait(timeout=5)
+    result = read_or_compute_ceiling(Path(path), compute)
+    assert result.score == 0.91
+
+
+def test_ceiling_cache_concurrent_creation_writes_one_valid_file(tmp_path: Path) -> None:
+    path = tmp_path / "ceiling.json"
+    counter = tmp_path / "compute-count"
+    ready_a = multiprocessing.Event()
+    ready_b = multiprocessing.Event()
+    go = multiprocessing.Event()
+    workers = [
+        multiprocessing.Process(target=_concurrent_ceiling_worker, args=(str(path), str(counter), ready_a, go)),
+        multiprocessing.Process(target=_concurrent_ceiling_worker, args=(str(path), str(counter), ready_b, go)),
+    ]
+    for worker in workers:
+        worker.start()
+    assert ready_a.wait(timeout=5) and ready_b.wait(timeout=5)
+    go.set()
+    for worker in workers:
+        worker.join(timeout=10)
+        assert worker.exitcode == 0
+    loaded = ReconstructionScore.model_validate_json(path.read_text())
+    assert loaded.score == 0.91
+    assert counter.read_text() == "x"
 
 
 def test_cli_and_factory_default_to_real_scorer(monkeypatch: Any, tmp_path: Path) -> None:

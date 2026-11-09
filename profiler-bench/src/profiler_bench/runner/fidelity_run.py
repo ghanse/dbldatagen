@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -13,6 +16,10 @@ from typing import Any
 from profiler_bench.runner.measure import rotate_order
 from profiler_bench.runner.scorer import FakeScorer, FidelityScores, Scorer, real_scorer_spec
 from profiler_bench.runner.spark_conf import DEFAULT_FIDELITY_DRIVER_MEMORY, fidelity_spark_config
+
+
+DEFAULT_FIDELITY_CELL_TIMEOUT_S = 45 * 60
+DEFAULT_WORKER_KILL_GRACE_S = 5.0
 
 
 def paired_seeds(k: int, *, start: int = 0) -> list[int]:
@@ -34,6 +41,9 @@ def run_fidelity_samples(
     harness_hash: str = "",
     metrics_config_hash: str = "",
     python_exe: str | None = None,
+    cell_timeout_s: float = DEFAULT_FIDELITY_CELL_TIMEOUT_S,
+    worker_prefix: Sequence[str] | None = None,
+    kill_grace_s: float = DEFAULT_WORKER_KILL_GRACE_S,
 ) -> list[dict[str, Any]]:
     """Scores one representative profile per build/dataset in an isolated worker.
 
@@ -54,19 +64,18 @@ def run_fidelity_samples(
         order = rotate_order(0, case_index)
         if dataset not in profiles.get("baseline", {}) or dataset not in profiles.get("candidate", {}):
             for role in order:
-                record = {
-                    "kind": "fidelity",
-                    "role": role,
-                    "dataset": dataset,
-                    "tier": tier,
-                    "ok": False,
-                    "error_class": "MissingProfileError",
-                    "error": "missing speed profile for fidelity scoring",
-                    "seeds": seeds,
-                }
-                path = samples_dir / f"fidelity-{role}-{dataset}-{tier}-missing.json"
-                path.write_text(json.dumps(record, sort_keys=True))
-                records.append(record)
+                for seed in seeds:
+                    records.append(
+                        _failed_seed(
+                            role,
+                            dataset,
+                            tier,
+                            seed,
+                            "MissingProfileError",
+                            "missing speed profile for fidelity scoring",
+                            samples_dir,
+                        )
+                    )
             continue
         for role in order:
             cell_records = _run_cell(
@@ -83,6 +92,9 @@ def run_fidelity_samples(
                 harness_hash=harness_hash,
                 metrics_config_hash=metrics_config_hash,
                 python_exe=exe,
+                cell_timeout_s=cell_timeout_s,
+                worker_prefix=worker_prefix,
+                kill_grace_s=kill_grace_s,
             )
             records.extend(cell_records)
     return records
@@ -180,6 +192,9 @@ def _run_cell(
     harness_hash: str,
     metrics_config_hash: str,
     python_exe: str,
+    cell_timeout_s: float,
+    worker_prefix: Sequence[str] | None,
+    kill_grace_s: float,
 ) -> list[dict[str, Any]]:
     """Runs one (role, dataset) cell in a fresh worker subprocess."""
     with tempfile.TemporaryDirectory(prefix="rsi-fidelity-") as tmp:
@@ -193,10 +208,13 @@ def _run_cell(
         scorer_path.write_text(json.dumps(_scorer_spec(scorer, cache_dir, harness_hash, metrics_config_hash)))
         spark_path.write_text(json.dumps(fidelity_spark, sort_keys=True))
         seeds_path.write_text(json.dumps(list(seeds)))
+        prefix = (
+            list(worker_prefix)
+            if worker_prefix is not None
+            else [python_exe, "-m", "profiler_bench.runner.fidelity_worker"]
+        )
         command = [
-            python_exe,
-            "-m",
-            "profiler_bench.runner.fidelity_worker",
+            *prefix,
             "--profile-json",
             str(profile_path),
             "--scorer-json",
@@ -218,7 +236,7 @@ def _run_cell(
         ]
         if cache_dir is not None:
             command.extend(["--cache-dir", str(cache_dir)])
-        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+        completed = _run_worker_command(command, timeout_s=cell_timeout_s, kill_grace_s=kill_grace_s)
         return _records_from_worker(
             role=role,
             dataset=dataset,
@@ -228,6 +246,75 @@ def _run_cell(
             samples_dir=samples_dir,
             completed=completed,
         )
+
+
+def _run_worker_command(
+    command: Sequence[str],
+    *,
+    timeout_s: float,
+    kill_grace_s: float,
+) -> subprocess.CompletedProcess[str]:
+    """Runs a worker in its own process group and enforces `timeout_s`."""
+    proc = subprocess.Popen(
+        list(command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    timed_out = False
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _terminate_process_group(proc.pid, grace_s=kill_grace_s)
+        stdout, stderr = proc.communicate()
+    result = subprocess.CompletedProcess(
+        args=list(command),
+        returncode=proc.returncode if proc.returncode is not None else -1,
+        stdout=stdout or "",
+        stderr=stderr or "",
+    )
+    result.timed_out = timed_out  # type: ignore[attr-defined]
+    return result
+
+
+def _terminate_process_group(pid: int, *, grace_s: float) -> None:
+    """SIGTERM the worker process group, then SIGKILL after `grace_s`."""
+    if not _signal_process_group(pid, signal.SIGTERM):
+        return
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        if not _process_alive(pid):
+            return
+        time.sleep(0.05)
+    _signal_process_group(pid, signal.SIGKILL)
+
+
+def _signal_process_group(pid: int, sig: signal.Signals | int) -> bool:
+    """Signals a process group; falls back to the leader pid. False if already gone."""
+    try:
+        os.killpg(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        try:
+            os.kill(pid, sig)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+
+
+def _process_alive(pid: int) -> bool:
+    """Returns whether `pid` (the session/process-group leader) is still alive."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 def _scorer_spec(
@@ -257,22 +344,108 @@ def _records_from_worker(
     samples_dir: Path,
     completed: subprocess.CompletedProcess[str],
 ) -> list[dict[str, Any]]:
-    if out_path.is_file():
-        payload = json.loads(out_path.read_text())
-        raw_records = payload.get("records")
-        if payload.get("ok") and isinstance(raw_records, list) and len(raw_records) == len(seeds):
-            records = [dict(record) for record in raw_records]
-            for record in records:
-                _write_sample(samples_dir, record)
-            return records
-        error_class = str(payload.get("error_class") or "FidelityWorkerError")
-        error = str(payload.get("error") or "fidelity worker failed")
-    else:
-        error_class = "FidelityWorkerCrash"
-        error = (
-            f"fidelity worker produced no output (returncode={completed.returncode}); "
-            f"stderr={completed.stderr[-2000:]}"
+    timed_out = bool(getattr(completed, "timed_out", False))
+    if timed_out:
+        return _failed_cell(
+            role,
+            dataset,
+            tier,
+            seeds,
+            "WorkerTimeout",
+            f"fidelity worker exceeded cell timeout (returncode={completed.returncode})",
+            samples_dir,
         )
+
+    payload, parse_error = _load_worker_payload(out_path)
+    if completed.returncode != 0:
+        detail = parse_error or (payload or {}).get("error") or completed.stderr[-2000:]
+        return _failed_cell(
+            role,
+            dataset,
+            tier,
+            seeds,
+            "WorkerCrashed",
+            f"fidelity worker exited {completed.returncode}: {detail}",
+            samples_dir,
+        )
+    if payload is None:
+        return _failed_cell(
+            role,
+            dataset,
+            tier,
+            seeds,
+            "WorkerOutputInvalid",
+            parse_error or "fidelity worker produced missing or invalid JSON",
+            samples_dir,
+        )
+
+    raw_records = payload.get("records")
+    if not payload.get("ok") or not isinstance(raw_records, list):
+        return _failed_cell(
+            role,
+            dataset,
+            tier,
+            seeds,
+            "WorkerOutputInvalid",
+            str(payload.get("error") or "fidelity worker payload missing ok records"),
+            samples_dir,
+        )
+
+    records = [dict(record) for record in raw_records]
+    mismatch = _payload_mismatch(records, role=role, dataset=dataset, tier=tier, seeds=seeds)
+    if mismatch is not None:
+        return _failed_cell(role, dataset, tier, seeds, "WorkerOutputMismatch", mismatch, samples_dir)
+
+    for record in records:
+        _write_sample(samples_dir, record)
+    return records
+
+
+def _load_worker_payload(out_path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    if not out_path.is_file():
+        return None, "fidelity worker produced no output file"
+    try:
+        payload = json.loads(out_path.read_text())
+    except json.JSONDecodeError as error:
+        return None, f"truncated or invalid JSON: {error}"
+    if not isinstance(payload, dict):
+        return None, "worker output JSON must be an object"
+    return payload, None
+
+
+def _payload_mismatch(
+    records: Sequence[dict[str, Any]],
+    *,
+    role: str,
+    dataset: str,
+    tier: str,
+    seeds: Sequence[int],
+) -> str | None:
+    expected = list(seeds)
+    actual_seeds = [record.get("seed") for record in records]
+    if actual_seeds != expected:
+        return f"seed set mismatch: expected {expected}, got {actual_seeds}"
+    for record in records:
+        if record.get("role") != role:
+            return f"role mismatch: expected {role!r}, got {record.get('role')!r}"
+        if record.get("dataset") != dataset:
+            return f"dataset mismatch: expected {dataset!r}, got {record.get('dataset')!r}"
+        if record.get("tier") != tier:
+            return f"tier mismatch: expected {tier!r}, got {record.get('tier')!r}"
+        if record.get("kind") != "fidelity":
+            return f"kind mismatch: expected 'fidelity', got {record.get('kind')!r}"
+    return None
+
+
+def _failed_cell(
+    role: str,
+    dataset: str,
+    tier: str,
+    seeds: Sequence[int],
+    error_class: str,
+    error: str,
+    samples_dir: Path,
+) -> list[dict[str, Any]]:
     return [_failed_seed(role, dataset, tier, seed, error_class, error, samples_dir) for seed in seeds]
 
 

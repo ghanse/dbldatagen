@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 
 if TYPE_CHECKING:
@@ -259,8 +261,6 @@ class _RealScorer:
         """Returns the full cached real-vs-real ceiling score."""
         from pyspark.sql import SparkSession  # noqa: PLC0415
 
-        from profiler_bench.fidelity import ReconstructionScore  # noqa: PLC0415
-
         key = (dataset, tier, structure_seed, self.harness_hash, self.metrics_config_hash)
         if key not in self._ceiling_cache:
             path = (
@@ -270,22 +270,68 @@ class _RealScorer:
                 / self.metrics_config_hash
                 / f"{dataset}-{tier}-seed-{structure_seed}.json"
             )
-            if path.is_file():
-                result = ReconstructionScore.model_validate_json(path.read_text())
-            else:
+
+            def compute() -> ReconstructionScore:
+                from profiler_bench.fidelity import ReconstructionScore as ScoreModel  # noqa: PLC0415
+
                 spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
                 spark.conf.set("spark.sql.session.timeZone", "UTC")
-                result = self.fidelity_ceiling(
-                    dataset,
-                    tier,
-                    spark=spark,
-                    structure_seed=structure_seed,
-                    sample_seed=structure_seed,
+                return cast(
+                    ScoreModel,
+                    self.fidelity_ceiling(
+                        dataset,
+                        tier,
+                        spark=spark,
+                        structure_seed=structure_seed,
+                        sample_seed=structure_seed,
+                    ),
                 )
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(result.model_dump_json(indent=2) + "\n")
-            self._ceiling_cache[key] = result
+
+            self._ceiling_cache[key] = read_or_compute_ceiling(path, compute)
         return self._ceiling_cache[key]
+
+
+def read_or_compute_ceiling(path: Path, compute: Callable[[], ReconstructionScore]) -> ReconstructionScore:
+    """Loads a ceiling JSON under an fcntl lock, computing once on miss/corruption.
+
+    Readers tolerate a missing or partial file by recomputing under the exclusive lock.
+    Writes use a temp file + ``os.replace`` so observers never see truncated JSON.
+    """
+    from profiler_bench.fidelity import ReconstructionScore  # noqa: PLC0415
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            loaded = _try_load_ceiling(path)
+            if loaded is not None:
+                return loaded
+            result = compute()
+            if not isinstance(result, ReconstructionScore):
+                raise TypeError("ceiling compute must return ReconstructionScore")
+            _atomic_write_text(path, result.model_dump_json(indent=2) + "\n")
+            return result
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _try_load_ceiling(path: Path) -> ReconstructionScore | None:
+    from profiler_bench.fidelity import ReconstructionScore  # noqa: PLC0415
+
+    try:
+        if not path.is_file():
+            return None
+        return ReconstructionScore.model_validate_json(path.read_text())
+    except Exception:
+        return None
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    tmp_path.write_text(text)
+    os.replace(tmp_path, path)
 
 
 def _score_with_real_modules(
