@@ -206,6 +206,8 @@ def _find_quasi_identifier_sets(
     }
     candidates = []
     for field in frame.schema:
+        if isinstance(field.dataType, (T.StructType, T.ArrayType, T.MapType)):
+            continue
         values = [row[field.name] for row in rows if row[field.name] is not None]
         distinct = len({repr(value) for value in values})
         semantic = semantics.get(field.name)
