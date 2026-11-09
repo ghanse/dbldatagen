@@ -206,6 +206,8 @@ def _find_quasi_identifier_sets(
     }
     candidates = []
     for field in frame.schema:
+        if isinstance(field.dataType, (T.StructType, T.ArrayType, T.MapType)):
+            continue
         values = [row[field.name] for row in rows if row[field.name] is not None]
         distinct = len({repr(value) for value in values})
         semantic = semantics.get(field.name)
@@ -219,6 +221,7 @@ def _find_quasi_identifier_sets(
         for columns in combinations(candidates[:MAX_QUASI_CANDIDATES], size):
             keys = [tuple(row[column] for column in columns) for row in rows]
             keys = [key for key in keys if all(value is not None for value in key)]
+            keys = [tuple(repr(value) for value in key) for key in keys]
             counts = Counter(keys)
             if not keys:
                 continue
