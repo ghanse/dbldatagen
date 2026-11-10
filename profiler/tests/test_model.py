@@ -1,4 +1,5 @@
 import json
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
 
@@ -6,7 +7,15 @@ import pytest
 from conftest import EXAMPLES, read_json
 from pydantic import ValidationError
 
-from dbldatagen_profiler.model import ColumnProfile, Profile, dump_profile, load_profile
+from dbldatagen_profiler.model import (
+    ColumnProfile,
+    LogicalType,
+    Profile,
+    canonicalize_iso_fraction,
+    dump_profile,
+    load_profile,
+    parse_temporal,
+)
 
 
 def column(**overrides: object) -> dict[str, Any]:
@@ -197,6 +206,59 @@ def test_temporal_literals_follow_iso_format(logical_type: str, valid: list[obje
     for value in invalid:
         with pytest.raises(ValidationError):
             ColumnProfile.model_validate(column(logical_type=logical_type, temporal={"min": value}))
+
+
+@pytest.mark.parametrize(
+    ("value", "kind", "expected"),
+    [
+        ("2024-02-04T16:27:43Z", LogicalType.TIMESTAMP, datetime(2024, 2, 4, 16, 27, 43, tzinfo=timezone.utc)),
+        (
+            "2024-02-04T16:27:43.7Z",
+            LogicalType.TIMESTAMP,
+            datetime(2024, 2, 4, 16, 27, 43, 700000, tzinfo=timezone.utc),
+        ),
+        (
+            "2024-02-04T16:27:43.791Z",
+            LogicalType.TIMESTAMP,
+            datetime(2024, 2, 4, 16, 27, 43, 791000, tzinfo=timezone.utc),
+        ),
+        (
+            "2024-02-04T16:27:43.79144Z",
+            LogicalType.TIMESTAMP,
+            datetime(2024, 2, 4, 16, 27, 43, 791440, tzinfo=timezone.utc),
+        ),
+        (
+            "2024-02-04T16:27:43.791440Z",
+            LogicalType.TIMESTAMP,
+            datetime(2024, 2, 4, 16, 27, 43, 791440, tzinfo=timezone.utc),
+        ),
+        ("2024-02-04T16:27:43", LogicalType.TIMESTAMP_NTZ, datetime(2024, 2, 4, 16, 27, 43)),
+        ("2024-02-04T16:27:43.7", LogicalType.TIMESTAMP_NTZ, datetime(2024, 2, 4, 16, 27, 43, 700000)),
+        ("2024-02-04T16:27:43.791", LogicalType.TIMESTAMP_NTZ, datetime(2024, 2, 4, 16, 27, 43, 791000)),
+        ("2024-02-04T16:27:43.79144", LogicalType.TIMESTAMP_NTZ, datetime(2024, 2, 4, 16, 27, 43, 791440)),
+        ("2024-02-04T16:27:43.791440", LogicalType.TIMESTAMP_NTZ, datetime(2024, 2, 4, 16, 27, 43, 791440)),
+        ("08:30:00.5", LogicalType.TIME, time(8, 30, 0, 500000)),
+        ("2024-02-04", LogicalType.DATE, date(2024, 2, 4)),
+    ],
+)
+def test_parse_temporal_accepts_odd_fraction_lengths(
+    value: str, kind: LogicalType, expected: date | time | datetime
+) -> None:
+    assert parse_temporal(value, kind) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "canonical"),
+    [
+        ("2024-02-04T16:27:43.79144", "2024-02-04T16:27:43.791440"),
+        ("2024-02-04T16:27:43.791440", "2024-02-04T16:27:43.791440"),
+        ("2024-02-04T16:27:43.000000", "2024-02-04T16:27:43"),
+        ("2024-02-04T16:27:43.7Z", "2024-02-04T16:27:43.700000Z"),
+        ("2024-02-04T16:27:43", "2024-02-04T16:27:43"),
+    ],
+)
+def test_canonicalize_iso_fraction(raw: str, canonical: str) -> None:
+    assert canonicalize_iso_fraction(raw) == canonical
 
 
 @pytest.mark.parametrize(

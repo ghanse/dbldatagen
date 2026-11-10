@@ -1370,7 +1370,7 @@
       "type": "object"
     },
     "TemporalStats": {
-      "description": "Statistics for a date, time, or timestamp column.\n\nValues are ISO-8601 strings: `YYYY-MM-DD` for `date`, `HH:MM:SS[.f]` for\n`time`, `YYYY-MM-DDTHH:MM:SS[.f]` followed by `Z` or `+HH:MM` for\n`timestamp`, and the same without an offset for `timestamp_ntz`. Fractions\nhave up to nine digits.\n\nAttributes:\n    min: Optional earliest value.\n    max: Optional latest value.\n    quantiles: Optional list of quantiles.",
+      "description": "Statistics for a date, time, or timestamp column.\n\nValues are ISO-8601 strings: `YYYY-MM-DD` for `date`, `HH:MM:SS[.f]` for\n`time`, `YYYY-MM-DDTHH:MM:SS[.f]` followed by `Z` or `+HH:MM` for\n`timestamp`, and the same without an offset for `timestamp_ntz`. Fractions\nhave up to nine digits. Producers emit exactly six fractional digits when the\nvalue has a non-zero sub-second component and omit the fraction otherwise.\n\nAttributes:\n    min: Optional earliest value.\n    max: Optional latest value.\n    quantiles: Optional list of quantiles.",
       "properties": {
         "min": {
           "anyOf": [

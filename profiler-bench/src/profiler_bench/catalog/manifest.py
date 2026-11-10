@@ -36,6 +36,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from dbldatagen_profiler.model import LogicalType, parse_temporal
+
 
 MANIFEST_VERSION = "0.2.0"
 
@@ -123,7 +125,13 @@ def _order_key(value: object) -> float:
         try:
             return float(Decimal(value))
         except InvalidOperation:
-            moment = datetime.fromisoformat(value.removesuffix("Z"))
+            kind = LogicalType.DATE if len(value) == 10 else LogicalType.TIMESTAMP
+            parsed = parse_temporal(value, kind)
+            moment = (
+                datetime(parsed.year, parsed.month, parsed.day)
+                if not isinstance(parsed, datetime)
+                else parsed.replace(tzinfo=None)
+            )
             return (moment - datetime(1970, 1, 1)).total_seconds()
     if isinstance(value, int | float) and not isinstance(value, bool):
         return float(value)

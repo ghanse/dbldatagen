@@ -30,8 +30,14 @@ from dbldatagen_profiler.model import (
     TableProfile,
     TemporalStats,
     ValueTreatment,
+    canonicalize_iso_fraction,
 )
 from dbldatagen_profiler.pii.detect import analyze_table
+
+
+# Spark session is forced to UTC; date_format emits a fixed microsecond fraction so Python
+# 3.10 consumers never see Spark's cast-to-string odd-length fractions (e.g. ".79144").
+_TIMESTAMP_FORMAT = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
 
 
 _VALUE = "__profile_value"
@@ -196,8 +202,8 @@ def _aggregate_expressions(column: Column, data_type: T.DataType, index: int) ->
     elif isinstance(data_type, _temporal_types()):
         expressions.extend(
             [
-                F.min(column).cast("string").alias(f"{prefix}_min"),
-                F.max(column).cast("string").alias(f"{prefix}_max"),
+                _temporal_extreme_literal(F.min(column), data_type).alias(f"{prefix}_min"),
+                _temporal_extreme_literal(F.max(column), data_type).alias(f"{prefix}_max"),
             ]
         )
     elif isinstance(data_type, T.BooleanType):
@@ -356,29 +362,46 @@ def _temporal_stats(
     )
 
 
+def _temporal_extreme_literal(extreme: Column, data_type: T.DataType) -> Column:
+    """Formats a min/max temporal aggregate as a canonical ISO string in the UTC session."""
+    if isinstance(data_type, (T.DateType, *_time_types())):
+        return extreme.cast("string")
+    # Timestamp and timestamp_ntz: always six fractional digits from Spark, then strip .000000
+    # in Python so whole-second values keep the existing `...:00Z` form.
+    return F.date_format(extreme, _TIMESTAMP_FORMAT)
+
+
 def _encode_temporal(value: object, data_type: T.DataType) -> str | None:
     if value is None:
         return None
     if isinstance(value, str):
         return _encode_temporal_string(value, data_type)
-    if isinstance(data_type, T.DateType) and isinstance(value, date):
+    if isinstance(data_type, T.DateType) and isinstance(value, date) and not isinstance(value, datetime):
         return value.isoformat()
     if isinstance(data_type, _time_types()) and isinstance(value, time):
-        return value.isoformat()
+        return canonicalize_iso_fraction(value.isoformat())
     if not isinstance(value, datetime):
         raise TypeError(f"unexpected temporal value {value!r}")
-    rendered = value.isoformat()
     if isinstance(data_type, _timestamp_ntz_types()):
-        return rendered
-    return value.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+        body = value.replace(tzinfo=None)
+        timespec = "microseconds" if body.microsecond else "seconds"
+        return canonicalize_iso_fraction(body.isoformat(timespec=timespec))
+    utc = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    body = utc.replace(tzinfo=None)
+    timespec = "microseconds" if body.microsecond else "seconds"
+    return f"{canonicalize_iso_fraction(body.isoformat(timespec=timespec))}Z"
 
 
 def _encode_temporal_string(value: str, data_type: T.DataType) -> str:
-    """Encodes a temporal value rendered in the UTC Spark session."""
-    rendered = value.replace(" ", "T")
+    """Encodes a temporal value rendered in the UTC Spark session.
+
+    Fractional seconds are canonicalized to exactly six digits when non-zero (and omitted
+    when zero) so profile literals round-trip through Python 3.10 `fromisoformat`.
+    """
+    rendered = canonicalize_iso_fraction(value.replace(" ", "T"))
     if isinstance(data_type, (*_timestamp_ntz_types(), T.DateType, *_time_types())):
         return rendered
-    return f"{rendered}Z"
+    return rendered if rendered.endswith("Z") else f"{rendered}Z"
 
 
 def _logical_type(data_type: T.DataType) -> LogicalType:
