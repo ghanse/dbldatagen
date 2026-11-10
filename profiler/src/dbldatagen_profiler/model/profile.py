@@ -40,6 +40,10 @@ _UNSIGNED_RE = re.compile(r"^(0|[1-9]\d*)$")
 _DECIMAL_RE = re.compile(r"^-?(0|[1-9]\d*)(\.\d+)?$")
 _DATE = r"\d{4}-\d{2}-\d{2}"
 _TIME = r"\d{2}:\d{2}:\d{2}(\.\d{1,9})?"
+# Fractional seconds before an optional UTC offset / Z. Spec allows 1-9 digits; Python 3.10's
+# fromisoformat only accepts 0, 3, or 6, so parsers normalize through this pattern.
+_ISO_FRACTION_RE = re.compile(r"(\.\d{1,9})(?=(Z|[+-]\d{2}:\d{2})?$)")
+_ISO_FRACTION_ANY_RE = re.compile(r"(\.\d+)(?=(Z|[+-]\d{2}:\d{2})?$)")
 
 
 class _SpecModel(BaseModel):
@@ -167,7 +171,7 @@ def _is_in_domain(value: str, column: ColumnProfile) -> bool:
         return len(fraction) <= column.scale and whole_digits <= column.precision - column.scale
     if column.logical_type in TEMPORAL_TYPES:
         try:
-            parsed = _parse_temporal(re.sub(r"\.\d+", "", value).replace("Z", "+00:00"), column.logical_type)
+            parsed = parse_temporal(value, column.logical_type)
         except ValueError:
             return False
         offset = parsed.utcoffset() if isinstance(parsed, datetime) else None
@@ -175,17 +179,52 @@ def _is_in_domain(value: str, column: ColumnProfile) -> bool:
     return True
 
 
-def _parse_temporal(value: str, logical_type: LogicalType) -> date | time | datetime:
-    """Parses an ISO-8601 date, time, or timestamp without fractional seconds.
+def canonicalize_iso_fraction(value: str) -> str:
+    """Returns `value` with fractional seconds in the producer canonical form.
+
+    When a sub-second component is present and non-zero, it is normalized to exactly
+    six digits (microseconds; longer fractions are truncated). An all-zero fraction is
+    omitted. This matches Spark's microsecond timestamps and avoids Python 3.10's
+    `fromisoformat` rejecting odd-length fractions such as Spark's cast-to-string output.
+    """
+    match = _ISO_FRACTION_ANY_RE.search(value)
+    if match is None:
+        return value
+    digits = match.group(1)[1:]
+    if int(digits) == 0:
+        return value[: match.start()] + value[match.end() :]
+    normalized = (digits + "000000")[:6]
+    return f"{value[: match.start()]}.{normalized}{value[match.end() :]}"
+
+
+def _normalize_iso_fraction_for_parse(value: str) -> str:
+    """Pads or truncates fractional seconds to six digits for Python 3.10 `fromisoformat`."""
+    match = _ISO_FRACTION_RE.search(value)
+    if match is None:
+        return value
+    digits = match.group(1)[1:]
+    if len(digits) == 6:
+        return value
+    digits = digits.ljust(6, "0") if len(digits) < 6 else digits[:6]
+    return f"{value[: match.start(1)]}.{digits}{value[match.end(1) :]}"
+
+
+def parse_temporal(value: str, logical_type: LogicalType) -> date | time | datetime:
+    """Parses an ISO-8601 date, time, or timestamp literal from a profile.
+
+    Accepts 1-9 fractional digits (the spec maximum) on Python 3.10 by normalizing to
+    microseconds before calling `fromisoformat`. `Z` is treated as UTC. Sub-microsecond
+    digits beyond six are truncated.
 
     Raises:
-        ValueError: If `value` is not a real date, time, or timestamp.
+        ValueError: If `value` is not a real date, time, or timestamp for `logical_type`.
     """
     if logical_type == LogicalType.DATE:
         return date.fromisoformat(value)
     if logical_type == LogicalType.TIME:
-        return time.fromisoformat(value)
-    return datetime.fromisoformat(value)
+        return time.fromisoformat(_normalize_iso_fraction_for_parse(value))
+    normalized = _normalize_iso_fraction_for_parse(value.replace("Z", "+00:00"))
+    return datetime.fromisoformat(normalized)
 
 
 def _to_decimal(value: Scalar) -> Decimal:
@@ -353,7 +392,8 @@ class TemporalStats(_SpecModel):
     Values are ISO-8601 strings: `YYYY-MM-DD` for `date`, `HH:MM:SS[.f]` for
     `time`, `YYYY-MM-DDTHH:MM:SS[.f]` followed by `Z` or `+HH:MM` for
     `timestamp`, and the same without an offset for `timestamp_ntz`. Fractions
-    have up to nine digits.
+    have up to nine digits. Producers emit exactly six fractional digits when the
+    value has a non-zero sub-second component and omit the fraction otherwise.
 
     Attributes:
         min: Optional earliest value.

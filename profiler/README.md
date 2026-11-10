@@ -93,6 +93,10 @@ Literal values (min, max, quantiles, histogram edges, range bounds, enumeration 
 | `time` | `HH:MM:SS[.fffffffff]` | `"08:30:00"` |
 | `timestamp` | `YYYY-MM-DDTHH:MM:SS[.f]` with `Z` or `±HH:MM` | `"2026-11-06T08:30:00Z"` |
 | `timestamp_ntz` | the same without an offset | `"2026-11-06T08:30:00"` |
+
+Producers emit exactly six fractional digits when a temporal value has a non-zero sub-second
+component (e.g. `"2024-02-04T16:27:43.791440Z"`) and omit the fraction otherwise. Consumers parse
+1–9 fractional digits via `parse_temporal` so odd lengths from older profiles still load on Python 3.10.
 | `string` | JSON string | `"gold"` |
 | `boolean` | JSON boolean | `true` |
 
