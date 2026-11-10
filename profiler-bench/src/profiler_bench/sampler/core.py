@@ -523,6 +523,20 @@ def _apply_pool(
     size = column.distinct_count.value if column.distinct_count else _bucket_size(column.cardinality, len(values))
     if size is None or size <= 0 or not values:
         return values
+    # Equal-weight quantile slots assign mass 1/K to each selected atom, including rare
+    # integer/decimal endpoints. When the draw already fits the cardinality budget, keep it.
+    try:
+        unique_count = len(set(values))
+    except TypeError:
+        unique_count = len(values)
+    if unique_count <= size:
+        if column.distinct_count is not None:
+            report.add(path, "used", "distinct_count")
+            if not column.distinct_count.exact:
+                report.add(path, "approximated", "distinct_count.approximate")
+        elif column.cardinality is not None:
+            report.add(path, "used", "cardinality")
+        return values
     ordered = sorted(values)
     pool_size = min(size, len(ordered))
     positions = np.linspace(0, len(ordered) - 1, pool_size, dtype=int)
@@ -1292,6 +1306,61 @@ def _truncated_moments_exact(mean: Decimal, stddev: Decimal, low: Decimal, high:
         return mean + stddev * Decimal(str(delta)), stddev * Decimal(str(scale))
 
 
+def _exact_quantum(column: ColumnProfile) -> Decimal:
+    """Returns the lattice step for exact ordered types (1 for integers, 10^-scale for decimals)."""
+    if column.logical_type in _INTEGER_TYPES:
+        return Decimal(1)
+    return Decimal(1).scaleb(-(column.scale or 0))
+
+
+def _truncated_cdf_standardized(z: float, alpha: float, beta: float) -> float:
+    """CDF of a standard normal truncated to [alpha, beta], evaluated at standardized z."""
+    if z <= alpha:
+        return 0.0
+    if z >= beta:
+        return 1.0
+    span = _cdf_diff(alpha, beta)
+    if span <= 0.0 or not math.isfinite(span):
+        return 1.0
+    return _cdf_diff(alpha, z) / span
+
+
+def _discrete_truncated_ppf(
+    uniform: float,
+    alpha: float,
+    beta: float,
+    mu: Decimal,
+    sigma: Decimal,
+    low_units: int,
+    high_units: int,
+    quantum: Decimal,
+    half: Decimal,
+) -> int:
+    """Inverse CDF over lattice units: each k gets P(k*q - half <= X < k*q + half) under the TN.
+
+    No clamping of continuous draws onto endpoints: endpoint mass equals the modeled half-bin
+    tail. Copula uniforms stay usable via the discrete inverse CDF.
+    """
+    u = min(max(float(uniform), np.nextafter(0.0, 1.0)), np.nextafter(1.0, 0.0))
+    if low_units >= high_units:
+        return low_units
+
+    def cdf_at(units: int) -> float:
+        # P(K <= units) = P(X < units*q + half) under TN on [low-half, high+half].
+        edge = Decimal(units) * quantum + half
+        z = float((edge - mu) / sigma)
+        return _truncated_cdf_standardized(z, alpha, beta)
+
+    lo, hi = low_units, high_units
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cdf_at(mid) >= u:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
 def _exact_truncated_normal(
     uniforms: np.ndarray,
     mean: float | str | Decimal,
@@ -1300,10 +1369,11 @@ def _exact_truncated_normal(
     high: Decimal,
     column: ColumnProfile,
 ) -> list[Any]:
-    """Draws truncated-normal z in float, then maps mu+sigma*z with Decimal/int exact arithmetic.
+    """Samples the discrete distribution induced by a truncated normal on the half-bin span.
 
-    Exact quantities (min/max/mean/stddev/mid/offsets) stay Decimal; only standardized (a, b)
-    and z are floats, each from a Decimal division (or inverse-CDF) first.
+    Continuous model: Normal truncated to [min - q/2, max + q/2] (q = 1 for ints, decimal
+    quantum otherwise). Each lattice point k receives P(k - q/2 <= X < k + q/2). Exact
+    quantities stay Decimal; only standardized (a, b) and CDF ranks use float.
     """
     if high < low:
         low, high = high, low
@@ -1314,15 +1384,22 @@ def _exact_truncated_normal(
         if high == low or std_d <= 0:
             center = min(high, max(low, mean_d))
             return [_convert_exact(center, column) for _ in uniforms]
-        mu_d, sigma_d = _calibrate_truncated_parameters_exact(mean_d, std_d, low, high)
+        quantum = _exact_quantum(column)
+        half = quantum / Decimal(2)
+        cont_low = low - half
+        cont_high = high + half
+        mu_d, sigma_d = _calibrate_truncated_parameters_exact(mean_d, std_d, cont_low, cont_high)
         if sigma_d <= 0:
             return [_convert_exact(min(high, max(low, mu_d)), column) for _ in uniforms]
-        alpha, beta = _standardized_bounds(low, high, mu_d, sigma_d)
+        alpha, beta = _standardized_bounds(cont_low, cont_high, mu_d, sigma_d)
+        low_units = int(low / quantum)
+        high_units = int(high / quantum)
         values: list[Any] = []
         for uniform in _open_unit(uniforms):
-            z = _truncated_standard_ppf(float(uniform), alpha, beta)
-            value = mu_d + sigma_d * Decimal(str(z))
-            values.append(_convert_exact(min(high, max(low, value)), column))
+            units = _discrete_truncated_ppf(
+                float(uniform), alpha, beta, mu_d, sigma_d, low_units, high_units, quantum, half
+            )
+            values.append(_convert_exact(Decimal(units) * quantum, column))
         return values
 
 
