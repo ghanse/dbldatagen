@@ -1,16 +1,17 @@
 """Deterministic, FK-preserving input subsets for the data-volume RSI objective.
 
-The harness, not the profiler, chooses which rows the profiler sees. Root tables
-(and tables with no foreign keys) take a seeded uniform row sample at fraction
-``f``. Child tables keep only rows whose foreign keys land in the already-sampled
-parent key sets, so referential integrity holds in the subset. The method name
+The harness, not the profiler, chooses which rows the profiler sees. Every table is
+sampled independently at fraction ``f`` with a seeded hash of its primary key (or of
+the full row content when there is no PK). The subset is then closed upward under
+foreign keys: repeatedly add every parent row referenced by a selected child
+(composite keys included) until a fixpoint. Self-references and cycles are handled
+by the same closure; children are never thinned toward ``f**N``. The method name
 recorded on every sample is ``fk_preserving_uniform``.
 """
 
 from __future__ import annotations
 
 import copy
-from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +21,7 @@ from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
 
 from profiler_bench.catalog.manifest import ForeignKey, Manifest
+from profiler_bench.fidelity.frames import HASH_RANGE, identifier
 
 
 METHOD = "fk_preserving_uniform"
@@ -34,9 +36,11 @@ class SubsetResult:
         tables: Subset frames keyed by table name.
         full_row_counts: Row counts of the full tables before subsetting.
         subset_row_counts: Row counts after subsetting.
-        scales: ``full_rows / subset_rows`` per table (1.0 when the subset is empty).
-        fraction: Requested input fraction.
-        subset_seed: Seed that fixes the uniform draws.
+        scales: ``full_rows / subset_rows`` per non-empty table (omitted when full is empty).
+        fraction: Requested grid fraction ``f`` (indexes ``n*``).
+        actual_fractions: Realized ``subset_rows / full_rows`` per table (0.0 when full is empty).
+        overall_actual_fraction: ``sum(subset_rows) / sum(full_rows)`` across tables (0.0 if all empty).
+        subset_seed: Seed that fixes the hash draws.
         method: Sampling method name recorded for the experiment.
     """
 
@@ -45,6 +49,8 @@ class SubsetResult:
     subset_row_counts: dict[str, int]
     scales: dict[str, float]
     fraction: float
+    actual_fractions: dict[str, float]
+    overall_actual_fraction: float
     subset_seed: int
     method: str = METHOD
 
@@ -52,6 +58,8 @@ class SubsetResult:
         """Returns JSON-serializable subset metadata (no DataFrames)."""
         return {
             "fraction": self.fraction,
+            "actual_fractions": dict(self.actual_fractions),
+            "overall_actual_fraction": self.overall_actual_fraction,
             "subset_seed": self.subset_seed,
             "method": self.method,
             "full_row_counts": dict(self.full_row_counts),
@@ -73,10 +81,10 @@ def subset_tables(
         frames: Full real tables.
         manifest: Ground-truth manifest providing foreign keys.
         fraction: Target row fraction in ``(0, 1]``. ``1.0`` returns the inputs unchanged.
-        subset_seed: Seed for the uniform parent draws.
+        subset_seed: Seed mixed into the per-row content/key hash.
 
     Returns:
-        Subset frames plus per-table scales for the reference sampler.
+        Subset frames plus per-table scales and realized input fractions.
 
     Raises:
         ValueError: If ``fraction`` is outside ``(0, 1]`` or a frame is missing.
@@ -89,55 +97,32 @@ def subset_tables(
 
     full_counts = {name: int(frame.count()) for name, frame in frames.items()}
     if fraction == 1.0:
-        scales = dict.fromkeys(full_counts, 1.0)
-        return SubsetResult(
+        return _result(
             tables=dict(frames),
-            full_row_counts=full_counts,
-            subset_row_counts=dict(full_counts),
-            scales=scales,
+            full_counts=full_counts,
+            subset_counts=dict(full_counts),
             fraction=fraction,
             subset_seed=subset_seed,
         )
 
-    order = _table_order([table.name for table in manifest.tables], manifest.foreign_keys)
-    parents_of = _parents_of(manifest.foreign_keys)
-    selected_keys: dict[tuple[str, tuple[str, ...]], DataFrame] = {}
-    subset: dict[str, DataFrame] = {}
+    tables_by_name = {table.name: table for table in manifest.tables}
+    selected: dict[str, DataFrame] = {}
+    for name, frame in frames.items():
+        table = tables_by_name.get(name)
+        key_columns = list(table.primary_key) if table is not None and table.primary_key else []
+        selected[name] = _hash_sample(
+            frame,
+            fraction=fraction,
+            seed=_table_seed(subset_seed, name),
+            key_columns=key_columns,
+        )
 
-    for table_name in order:
-        frame = frames[table_name]
-        parent_fks = parents_of.get(table_name, [])
-        kept = frame
-        for fk in parent_fks:
-            parent_key = selected_keys.get((fk.parent_table, tuple(fk.parent_columns)))
-            if parent_key is None:
-                raise RuntimeError(f"parent keys missing for {fk.parent_table} before child {table_name}")
-            kept = _semi_join(kept, parent_key, list(fk.child_columns), list(fk.parent_columns))
-        if not parent_fks:
-            kept = _uniform_sample(kept, fraction=fraction, seed=_table_seed(subset_seed, table_name))
-        subset[table_name] = kept
-        table_meta = next(table for table in manifest.tables if table.name == table_name)
-        if table_meta.primary_key:
-            selected_keys[(table_name, tuple(table_meta.primary_key))] = kept.select(
-                *list(table_meta.primary_key)
-            ).distinct()
-        for unique in table_meta.unique_keys:
-            selected_keys[(table_name, tuple(unique))] = kept.select(*list(unique)).distinct()
-
-    for name in frames:
-        if name not in subset:
-            subset[name] = _uniform_sample(frames[name], fraction=fraction, seed=_table_seed(subset_seed, name))
-
-    subset_counts = {name: int(frame.count()) for name, frame in subset.items()}
-    scales = {
-        name: (float(full_counts[name]) / float(subset_counts[name]) if subset_counts[name] > 0 else 1.0)
-        for name in full_counts
-    }
-    return SubsetResult(
-        tables=subset,
-        full_row_counts=full_counts,
-        subset_row_counts=subset_counts,
-        scales=scales,
+    selected = _upward_closure(frames, selected, manifest.foreign_keys)
+    subset_counts = {name: int(frame.count()) for name, frame in selected.items()}
+    return _result(
+        tables=selected,
+        full_counts=full_counts,
+        subset_counts=subset_counts,
         fraction=fraction,
         subset_seed=subset_seed,
     )
@@ -163,80 +148,153 @@ def apply_table_scales(profile: dict[str, Any], scales: Mapping[str, float]) -> 
     return out
 
 
-def _uniform_sample(frame: DataFrame, *, fraction: float, seed: int) -> DataFrame:
-    """Takes a deterministic without-replacement sample of ``round(n * fraction)`` rows."""
+def _result(
+    *,
+    tables: dict[str, DataFrame],
+    full_counts: Mapping[str, int],
+    subset_counts: Mapping[str, int],
+    fraction: float,
+    subset_seed: int,
+) -> SubsetResult:
+    scales: dict[str, float] = {}
+    actual: dict[str, float] = {}
+    for name, full in full_counts.items():
+        kept = int(subset_counts[name])
+        if full > 0:
+            if kept <= 0:
+                raise RuntimeError(f"non-empty table {name} produced an empty subset")
+            scales[name] = float(full) / float(kept)
+            actual[name] = float(kept) / float(full)
+        else:
+            actual[name] = 0.0
+    total_full = sum(int(value) for value in full_counts.values())
+    total_kept = sum(int(value) for value in subset_counts.values())
+    overall = (float(total_kept) / float(total_full)) if total_full > 0 else 0.0
+    return SubsetResult(
+        tables=tables,
+        full_row_counts=dict(full_counts),
+        subset_row_counts=dict(subset_counts),
+        scales=scales,
+        fraction=fraction,
+        actual_fractions=actual,
+        overall_actual_fraction=overall,
+        subset_seed=subset_seed,
+    )
+
+
+def _hash_sample(
+    frame: DataFrame,
+    *,
+    fraction: float,
+    seed: int,
+    key_columns: Sequence[str],
+) -> DataFrame:
+    """Keeps rows whose seeded key/content hash falls below ``fraction``, at least one if non-empty."""
     n = int(frame.count())
     if n == 0 or fraction >= 1.0:
         return frame
-    k = max(1, round(n * fraction)) if fraction > 0 else 0
-    if k >= n:
-        return frame
-    # Stable order + seeded permutation of row positions.
-    ordered = frame.withColumn("__dv_row", F.monotonically_increasing_id())
-    ids = [int(row[0]) for row in ordered.select("__dv_row").collect()]
-    rng = np.random.default_rng(seed)
-    chosen = set(rng.choice(ids, size=k, replace=False).tolist())
-    return ordered.filter(F.col("__dv_row").isin(list(chosen))).drop("__dv_row")
+    hashed = frame.withColumn("__dv_h", _row_hash_column(frame, seed=seed, key_columns=key_columns))
+    threshold = max(1, int(HASH_RANGE * fraction))
+    sampled = hashed.where(F.pmod(F.col("__dv_h"), F.lit(HASH_RANGE)) < F.lit(threshold))
+    if sampled.take(1):
+        return sampled.drop("__dv_h")
+    # Deterministic fallback: the row with the smallest hash (stable under repartition).
+    return hashed.orderBy(F.col("__dv_h").asc()).limit(1).drop("__dv_h")
+
+
+def _row_hash_column(frame: DataFrame, *, seed: int, key_columns: Sequence[str]) -> Column:
+    """Returns a seeded 64-bit hash of the PK columns, or of the full row when there is no PK."""
+    if key_columns:
+        parts = ", ".join(identifier(column) for column in key_columns)
+        return F.expr(f"xxhash64({int(seed)}, {parts})")
+    columns = ", ".join(identifier(column) for column in frame.columns)
+    return F.expr(f"xxhash64({int(seed)}, to_json(struct({columns})))")
+
+
+def _upward_closure(
+    full: Mapping[str, DataFrame],
+    selected: Mapping[str, DataFrame],
+    foreign_keys: Sequence[ForeignKey],
+) -> dict[str, DataFrame]:
+    """Adds every parent row referenced by a selected child until a fixpoint (bounded by sizes)."""
+    current = dict(selected)
+    if not foreign_keys:
+        return current
+    max_rows = sum(int(frame.count()) for frame in full.values())
+    for _ in range(max(1, max_rows)):
+        changed = False
+        for fk in foreign_keys:
+            if fk.child_table not in current or fk.parent_table not in full:
+                continue
+            child = current[fk.child_table]
+            parent_full = full[fk.parent_table]
+            parent_selected = current[fk.parent_table]
+            child_keys = child.select(*list(fk.child_columns)).distinct()
+            needed = _semi_join(
+                parent_full,
+                child_keys,
+                list(fk.parent_columns),
+                list(fk.child_columns),
+            )
+            new_rows = _anti_join(
+                needed,
+                parent_selected,
+                list(fk.parent_columns),
+                list(fk.parent_columns),
+            )
+            if not new_rows.take(1):
+                continue
+            current[fk.parent_table] = parent_selected.unionByName(new_rows)
+            changed = True
+        if not changed:
+            return current
+    raise RuntimeError("upward FK closure exceeded table-size bound")
 
 
 def _semi_join(
-    child: DataFrame,
-    parent_keys: DataFrame,
-    child_columns: Sequence[str],
-    parent_columns: Sequence[str],
+    left: DataFrame,
+    right_keys: DataFrame,
+    left_columns: Sequence[str],
+    right_columns: Sequence[str],
 ) -> DataFrame:
-    """Keeps child rows whose key columns match a selected parent key."""
-    renamed = parent_keys
+    """Keeps ``left`` rows whose key columns match a key in ``right_keys``."""
+    renamed = right_keys
     aliases: list[str] = []
-    for index, column in enumerate(parent_columns):
-        alias = f"__dv_p{index}"
+    for index, column in enumerate(right_columns):
+        alias = f"__dv_k{index}"
         renamed = renamed.withColumnRenamed(column, alias)
         aliases.append(alias)
     cond: Column | None = None
-    for child_col, alias in zip(child_columns, aliases, strict=True):
-        piece = F.col(child_col).eqNullSafe(F.col(alias))
+    for left_col, alias in zip(left_columns, aliases, strict=True):
+        piece = F.col(left_col).eqNullSafe(F.col(alias))
         cond = piece if cond is None else (cond & piece)
     assert cond is not None
-    joined = child.join(renamed, on=cond, how="left_semi")
-    return joined
+    return left.join(renamed, on=cond, how="left_semi")
 
 
-def _parents_of(foreign_keys: Sequence[ForeignKey]) -> dict[str, list[ForeignKey]]:
-    out: dict[str, list[ForeignKey]] = defaultdict(list)
-    for fk in foreign_keys:
-        out[fk.child_table].append(fk)
-    return dict(out)
-
-
-def _table_order(tables: Sequence[str], foreign_keys: Sequence[ForeignKey]) -> list[str]:
-    """Topological order: parents before children. Isolated tables keep input order."""
-    nodes = list(tables)
-    indegree = dict.fromkeys(nodes, 0)
-    edges: dict[str, list[str]] = defaultdict(list)
-    for fk in foreign_keys:
-        if fk.parent_table not in indegree or fk.child_table not in indegree:
-            continue
-        if fk.parent_table == fk.child_table:
-            continue
-        edges[fk.parent_table].append(fk.child_table)
-        indegree[fk.child_table] += 1
-    queue = deque([name for name in nodes if indegree[name] == 0])
-    order: list[str] = []
-    while queue:
-        name = queue.popleft()
-        order.append(name)
-        for child in edges.get(name, []):
-            indegree[child] -= 1
-            if indegree[child] == 0:
-                queue.append(child)
-    if len(order) != len(nodes):
-        # Cycle or missing edge bookkeeping: fall back to declaration order.
-        return list(nodes)
-    return order
+def _anti_join(
+    left: DataFrame,
+    right: DataFrame,
+    left_columns: Sequence[str],
+    right_columns: Sequence[str],
+) -> DataFrame:
+    """Keeps ``left`` rows whose key columns are absent from ``right``."""
+    renamed = right.select(*list(right_columns))
+    aliases: list[str] = []
+    for index, column in enumerate(right_columns):
+        alias = f"__dv_a{index}"
+        renamed = renamed.withColumnRenamed(column, alias)
+        aliases.append(alias)
+    cond: Column | None = None
+    for left_col, alias in zip(left_columns, aliases, strict=True):
+        piece = F.col(left_col).eqNullSafe(F.col(alias))
+        cond = piece if cond is None else (cond & piece)
+    assert cond is not None
+    return left.join(renamed, on=cond, how="left_anti")
 
 
 def _table_seed(subset_seed: int, table_name: str) -> int:
-    """Derives a stable per-table RNG seed from the subset seed and table name."""
+    """Derives a stable per-table hash seed from the subset seed and table name."""
     material = f"{subset_seed}:{table_name}".encode()
-    # 31-bit positive seed for numpy Generator.
+    # Keep in signed 32-bit range for Spark integer literals in xxhash64.
     return int.from_bytes(material, "little") % (2**31 - 1)

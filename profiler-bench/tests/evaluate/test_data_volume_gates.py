@@ -4,13 +4,19 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from profiler_bench.evaluate.data_volume import (
     calibrate_targets_from_records,
     evaluate_data_volume_gates,
     geometric_mean,
+    load_f1_regression_bound,
+    require_calibrated_targets,
     search_nstar,
 )
 from profiler_bench.evaluate.gates import evaluate_gates
+from profiler_bench.runner.fidelity_run import DEFAULT_FIDELITY_CELL_TIMEOUT_S
+from profiler_bench.runner.policy import DEFAULT_POLICY, load_policy
 
 
 FRACTIONS = (0.05, 0.1, 0.2, 0.5, 1.0)
@@ -131,7 +137,7 @@ def test_gate_incomplete_samples_rejected() -> None:
     assert "failed_or_missing_samples" in verdict["reasons"]
 
 
-def test_gate_privacy_failure_rejects() -> None:
+def test_gate_candidate_privacy_failure_rejects() -> None:
     fidelity = _curve_records(
         baseline={0.05: 0.5, 0.1: 0.5, 0.2: 0.5, 0.5: 0.85, 1.0: 0.90},
         candidate={0.05: 0.5, 0.1: 0.5, 0.2: 0.85, 0.5: 0.90, 1.0: 0.91},
@@ -150,24 +156,95 @@ def test_gate_privacy_failure_rejects() -> None:
     assert "privacy_guard_failed" in verdict["reasons"]
 
 
-def test_calibrate_targets_from_f1_records() -> None:
-    records = []
-    for seed in range(4):
-        records.append(
-            {
-                "kind": "fidelity",
-                "role": "baseline",
-                "dataset": "numeric",
-                "fraction": 1.0,
-                "subset_seed": 0,
-                "seed": seed,
-                "ok": True,
-                "relative_reconstruction": 0.84,
-            }
-        )
-    targets = calibrate_targets_from_records(records, margin=0.01)
-    assert targets["numeric"]["T_d"] == 0.83
+def test_gate_baseline_privacy_failure_inconclusive() -> None:
+    fidelity = _curve_records(
+        baseline={0.05: 0.5, 0.1: 0.5, 0.2: 0.5, 0.5: 0.85, 1.0: 0.90},
+        candidate={0.05: 0.5, 0.1: 0.5, 0.2: 0.85, 0.5: 0.90, 1.0: 0.91},
+        seeds=4,
+    )
+    for record in fidelity:
+        if record["role"] == "baseline" and record["fraction"] == 0.5:
+            record["privacy_passed"] = False
+    verdict = evaluate_data_volume_gates(
+        fidelity_records=fidelity,
+        policy=_policy(target=0.80),
+        proposal={"type": "data_volume", "targets": ["numeric"]},
+        run=_run(),
+    )
+    assert verdict["verdict"] == "inconclusive"
+    assert "baseline_privacy" in verdict["reasons"]
+
+
+def test_calibrate_targets_writes_noise_width() -> None:
+    scores = [0.84 + 0.01 * (seed % 2) for seed in range(4)]
+    records: list[dict[str, Any]] = [
+        {
+            "kind": "fidelity",
+            "role": "baseline",
+            "dataset": "numeric",
+            "fraction": 1.0,
+            "subset_seed": 0,
+            "seed": seed,
+            "ok": True,
+            "relative_reconstruction": score,
+        }
+        for seed, score in enumerate(scores)
+    ]
+    targets, noise = calibrate_targets_from_records(records, margin=0.01, n_bootstrap=200)
+    mean = sum(scores) / len(scores)
+    assert targets["numeric"]["T_d"] == pytest.approx(mean - 0.01)
+    assert "numeric" in noise
+    assert noise["numeric"] >= 0.0
     assert "provenance" in targets["numeric"]
+
+
+def test_require_calibrated_targets_fails_loudly() -> None:
+    policy = {
+        "targets": {"numeric": {"T_d": None}},
+        "data_volume": {"control_noise_width": {}},
+    }
+    try:
+        require_calibrated_targets(policy, ["numeric"])
+    except ValueError as error:
+        assert "T_d missing" in str(error)
+        assert "control_noise_width missing" in str(error)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_f1_regression_bound_loaded_from_default_by_reference() -> None:
+    fidelity = _curve_records(
+        baseline={0.05: 0.5, 0.1: 0.5, 0.2: 0.5, 0.5: 0.85, 1.0: 0.90},
+        candidate={0.05: 0.5, 0.1: 0.5, 0.2: 0.85, 0.5: 0.90, 1.0: 0.91},
+        seeds=4,
+    )
+    policy = _policy(target=0.80)
+    # Deliberately omit / poison any local accuracy copy — bound must come from default.json.
+    policy.pop("accuracy", None)
+    verdict = evaluate_data_volume_gates(
+        fidelity_records=fidelity,
+        policy=policy,
+        proposal={"type": "data_volume", "targets": ["numeric"]},
+        run=_run(),
+    )
+    gate = next(item for item in verdict["gates"] if item["name"] == "data_volume_f1_regression")
+    bound, digest = load_f1_regression_bound()
+    assert gate["detail"]["max_regression"] == bound
+    assert gate["detail"]["bound_source"] == "default.json"
+    assert gate["detail"]["default_policy_hash"] == digest
+
+
+def test_default_policy_gates_and_worker_timing_unchanged() -> None:
+    """Data-volume work must not alter the default accuracy/speed policy surface."""
+    policy = load_policy(DEFAULT_POLICY)
+    assert policy["accuracy"]["max_dataset_regression"] == 0.01
+    assert policy["accuracy"]["min_mean_improvement"] == 0.005
+    assert policy["speed"]["min_target_improvement"] == 0.05
+    assert policy["fidelity_seeds"] == 5
+    assert DEFAULT_FIDELITY_CELL_TIMEOUT_S == 2700.0
+    bound, digest = load_f1_regression_bound()
+    assert bound == 0.01
+    assert len(digest) == 64
 
 
 def test_geometric_mean() -> None:
@@ -214,7 +291,6 @@ def _policy(*, target: float, subset_seeds: int = 1, fidelity_seeds: int = 4) ->
         "fidelity_tier": "xs",
         "targets": {"numeric": {"T_d": target, "provenance": "test"}},
         "data_volume": {"control_noise_width": {"numeric": 0.0}},
-        "accuracy": {"max_dataset_regression": 0.01},
     }
 
 

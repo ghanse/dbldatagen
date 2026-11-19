@@ -328,30 +328,36 @@ uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi evaluate
 `profiler-bench/policies/data_volume.json` freezes a second RSI objective: the least input fraction `n*` that still
 reaches a per-dataset accuracy target `T_d`. The harness, not the profiler, chooses the input. For each fraction
 `f` on the geometric grid `(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0)` and each subset seed, it
-builds a deterministic **FK-preserving uniform** subset (sample parent tables at `f`, keep child rows whose foreign
-keys land in the sampled parents; method name `fk_preserving_uniform`). The profiler sees only that subset and is
-not told the full row counts. Reconstruction is scored against the **full** real tables; before sampling, each
-profiled `row_count` is scaled by `full_rows / profile_rows` for that table (equivalent to calling the reference
-sampler with a per-table scale) so synthetic row counts match. Distinct counts, cardinality, FK fan-out, and
-extrema remain the profiler's job to extrapolate.
+builds a deterministic **FK-preserving uniform** subset: sample **every** table independently at `f` with a seeded
+hash of the primary key (or full row content when there is no PK), then take the **upward closure** under foreign
+keys (add every parent row referenced by a selected child, including composite keys, self-references, and cycles)
+until a fixpoint; method name `fk_preserving_uniform`. Realized per-table and overall input fractions are recorded
+alongside the grid `f` that indexes `n*`. Every non-empty table keeps at least one row. The profiler sees only that
+subset and is not told the full row counts. Reconstruction is scored against the **full** real tables; before
+sampling, each profiled `row_count` is scaled by `full_rows / profile_rows` for that table (equivalent to calling
+the reference sampler with a per-table scale) so synthetic row counts match. Distinct counts, cardinality, FK
+fan-out, and extrema remain the profiler's job to extrapolate.
 
-`T_d` is frozen per dataset as (full-data baseline relative reconstruction) − 0.01, with provenance in the policy.
-Compute a proposed policy from a baseline run at `f = 1` with:
+`T_d` and the control noise width are frozen per dataset by `calibrate-targets` from a same-build control at
+`f = 1` (K × S seeds), with provenance (commit, harness hash, run id). `run --mode data-volume` refuses to start
+unless every selected dataset has both. Compute a proposed policy with:
 
 ```bash
 uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi calibrate-targets \
-  --baseline profiler/rsi/experiments/<baseline-id> \
+  --baseline profiler/rsi/experiments/<control-at-f1> \
   --output /tmp/data_volume.proposed.json
 ```
 
 Polly freezes the accepted file. The measured curve reports relative reconstruction at every grid fraction over
 `S` subset seeds and `K` sampler seeds; `n*_d` is the smallest fraction whose paired-bootstrap CI lower bound on
-the mean clears `T_d` minus the control noise width (half the baseline `f = 1` CI width unless overridden). If no
-fraction reaches `T_d`, `n* = 1.0` and the dataset is flagged. Privacy remains a hard guard at every fraction.
+the mean clears `T_d` minus the frozen control noise width. If no fraction reaches `T_d`, `n* = 1.0` and the
+dataset is flagged. A candidate privacy failure anywhere rejects; a baseline privacy failure is inconclusive
+(`baseline_privacy`). Completeness covers both builds. The `f = 1` reconstruction regression bound is loaded by
+reference from `default.json` (`accuracy.max_dataset_regression`), with that file's hash recorded on the gate.
 
 A `data_volume` proposal is accepted when the geometric mean of `n*` decreases by at least one grid step, at least
 one declared target improves by one grid step, no dataset's `n*` increases, reconstruction at `f = 1` does not
-regress beyond the default per-dataset bound, privacy passes everywhere, and every expected sample is present.
+regress beyond the default bound, candidate privacy passes, and every expected sample is present on both builds.
 Crossing intervals are inconclusive. Control runs are never accepted.
 
 ```bash

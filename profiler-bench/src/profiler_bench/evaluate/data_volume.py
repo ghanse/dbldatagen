@@ -2,11 +2,13 @@
 
 For each dataset the harness records relative reconstruction on a fixed geometric
 fraction grid. ``n*_d`` is the smallest fraction whose paired-bootstrap CI lower
-bound on the mean relative score clears ``T_d`` minus the control noise width.
-A ``data_volume`` proposal is accepted when at least one declared target improves
-by one grid step, no dataset's ``n*`` increases, reconstruction at ``f = 1`` does
-not regress beyond the default per-dataset bound, privacy passes everywhere, and
-every expected sample is present. Control runs are never accepted.
+bound on the mean relative score clears ``T_d`` minus the frozen control noise
+width. A ``data_volume`` proposal is accepted when at least one declared target
+improves by one grid step, no dataset's ``n*`` increases, reconstruction at
+``f = 1`` does not regress beyond the default policy's per-dataset bound (loaded
+by reference from ``default.json``), privacy passes on the candidate (baseline
+privacy failures are inconclusive), and every expected sample is present on both
+builds. Control runs are never accepted.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from typing import Any, Literal
 
 from profiler_bench.evaluate.bootstrap import paired_bootstrap_ci
 from profiler_bench.evaluate.gates import GateResult, _combine, _control_guard
+from profiler_bench.runner.policy import DEFAULT_POLICY, load_policy, policy_path_hash
 from profiler_bench.runner.subset import DEFAULT_FRACTIONS
 
 
@@ -141,24 +144,35 @@ def evaluate_data_volume_gates(
     gates: list[GateResult] = []
     expected = expected_data_volume_keys(run)
     gates.append(_data_volume_completeness(fidelity_records, expected))
-    gates.append(_data_volume_privacy(fidelity_records, expected))
+    gates.extend(_data_volume_privacy_gates(fidelity_records, expected))
     gates.append(_control_guard(run))
 
     curves = _curves_by_role(fidelity_records)
     boot = policy.get("bootstrap") or {}
     fractions = [float(value) for value in (run.get("fractions") or policy.get("fractions") or DEFAULT_FRACTIONS)]
     targets = _targets_from_policy(policy)
-    noise = _noise_widths(curves.get("baseline", {}), policy, boot, fractions)
+    noise = frozen_noise_widths(policy)
     per_role_nstar: dict[str, dict[str, Any]] = {}
     for role, datasets in curves.items():
         per_role_nstar[role] = {}
         for dataset, curve in datasets.items():
             if dataset not in targets:
                 continue
+            if dataset not in noise:
+                gates.append(
+                    GateResult(
+                        name="data_volume_noise_width",
+                        passed=False,
+                        status="fail",
+                        reason="missing_frozen_noise_width",
+                        detail={"dataset": dataset},
+                    )
+                )
+                continue
             per_role_nstar[role][dataset] = search_nstar(
                 curve,
                 target=float(targets[dataset]["T_d"]),
-                noise_width=float(noise.get(dataset, 0.0)),
+                noise_width=float(noise[dataset]),
                 fractions=fractions,
                 n_bootstrap=int(boot.get("samples", 2000)),
                 seed=int(boot.get("seed", 0)),
@@ -229,8 +243,16 @@ def calibrate_targets_from_records(
     role: str = "baseline",
     fraction: float = 1.0,
     margin: float = 0.01,
-) -> dict[str, dict[str, Any]]:
-    """Computes ``T_d = mean_relative(f=1) - margin`` per dataset from baseline records."""
+    n_bootstrap: int = 2000,
+    bootstrap_seed: int = 0,
+    confidence: float = 0.95,
+) -> tuple[dict[str, dict[str, Any]], dict[str, float]]:
+    """Computes ``T_d`` and control noise widths from a same-build control at ``f``.
+
+    ``T_d = mean_relative(f) - margin``. The noise width is half the paired-bootstrap
+    CI width of that mean (K x S cells). Both are frozen into the policy by
+    ``calibrate-targets``.
+    """
     by_dataset: dict[str, list[float]] = defaultdict(list)
     for record in fidelity_records:
         if record.get("kind") != "fidelity" or not record.get("ok"):
@@ -243,6 +265,7 @@ def calibrate_targets_from_records(
             continue
         by_dataset[str(record["dataset"])].append(float(record["relative_reconstruction"]))
     targets: dict[str, dict[str, Any]] = {}
+    noise: dict[str, float] = {}
     for dataset, scores in sorted(by_dataset.items()):
         mean = float(sum(scores) / len(scores))
         targets[dataset] = {
@@ -257,12 +280,50 @@ def calibrate_targets_from_records(
                 f"minus {margin} (n={len(scores)} paired cells)"
             ),
         }
-    return targets
+        if len(scores) < 2:
+            noise[dataset] = 0.0
+            continue
+        ci = paired_bootstrap_ci(
+            scores,
+            statistic="mean",
+            n_bootstrap=n_bootstrap,
+            seed=bootstrap_seed + 17,
+            confidence=confidence,
+        )
+        noise[dataset] = 0.5 * (ci.high - ci.low)
+    return targets, noise
 
 
 def fraction_token(fraction: float) -> str:
     """Returns a filesystem-safe token for a fraction on the grid."""
     return f"{fraction:.6f}".rstrip("0").rstrip(".")
+
+
+def frozen_noise_widths(policy: Mapping[str, Any]) -> dict[str, float]:
+    """Returns the frozen per-dataset control noise widths from the policy (no fallback)."""
+    configured = (policy.get("data_volume") or {}).get("control_noise_width") or {}
+    return {str(name): float(width) for name, width in dict(configured).items()}
+
+
+def require_calibrated_targets(policy: Mapping[str, Any], datasets: Sequence[str]) -> None:
+    """Raises ``ValueError`` unless every dataset has a frozen ``T_d`` and noise width."""
+    targets = _targets_from_policy(policy)
+    noise = frozen_noise_widths(policy)
+    missing_td = [name for name in datasets if name not in targets]
+    missing_noise = [name for name in datasets if name not in noise]
+    if missing_td or missing_noise:
+        raise ValueError(
+            "data-volume policy is missing frozen calibration for selected datasets: "
+            f"T_d missing={missing_td or []}; control_noise_width missing={missing_noise or []}. "
+            "Run `python -m profiler_bench.rsi calibrate-targets` on a same-build control at f=1."
+        )
+
+
+def load_f1_regression_bound() -> tuple[float, str]:
+    """Loads ``accuracy.max_dataset_regression`` from ``default.json`` and returns ``(bound, file_hash)``."""
+    default_policy = load_policy(DEFAULT_POLICY)
+    bound = float((default_policy.get("accuracy") or {}).get("max_dataset_regression", 0.01))
+    return bound, policy_path_hash(DEFAULT_POLICY)
 
 
 def _targets_from_policy(policy: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -295,33 +356,6 @@ def _curves_by_role(
         role: {dataset: {frac: list(scores) for frac, scores in curve.items()} for dataset, curve in datasets.items()}
         for role, datasets in out.items()
     }
-
-
-def _noise_widths(
-    baseline_curves: Mapping[str, Mapping[float, Sequence[float]]],
-    policy: Mapping[str, Any],
-    boot: Mapping[str, Any],
-    fractions: Sequence[float],
-) -> dict[str, float]:
-    configured = (policy.get("data_volume") or {}).get("control_noise_width") or {}
-    out: dict[str, float] = {str(name): float(width) for name, width in dict(configured).items()}
-    f1 = 1.0 if 1.0 in fractions else (max(fractions) if fractions else 1.0)
-    for dataset, curve in baseline_curves.items():
-        if dataset in out:
-            continue
-        scores = list(curve.get(f1, []))
-        if len(scores) < 2:
-            out[dataset] = 0.0
-            continue
-        ci = paired_bootstrap_ci(
-            scores,
-            statistic="mean",
-            n_bootstrap=int(boot.get("samples", 2000)),
-            seed=int(boot.get("seed", 0)) + 17,
-            confidence=float(boot.get("confidence", 0.95)),
-        )
-        out[dataset] = 0.5 * (ci.high - ci.low)
-    return out
 
 
 def _nstar_improvement_gate(
@@ -445,9 +479,9 @@ def _f1_regression_gate(
     policy: Mapping[str, Any],
     boot: Mapping[str, Any],
 ) -> GateResult:
-    """Reuses the default per-dataset reconstruction regression bound at f = 1."""
-    cfg = policy.get("accuracy") or {}
-    max_reg = float(cfg.get("max_dataset_regression", 0.01))
+    """Reuses the default per-dataset reconstruction regression bound at f = 1 by reference."""
+    del policy  # Bound comes from default.json, not the data-volume policy copy.
+    max_reg, default_hash = load_f1_regression_bound()
     paired: dict[str, list[float]] = defaultdict(list)
     by: dict[tuple[str, int, int], dict[str, float]] = defaultdict(dict)
     for record in fidelity_records:
@@ -494,7 +528,14 @@ def _f1_regression_gate(
         passed=status == "pass",
         status=status,
         reason=reason,
-        detail={"datasets": details, "max_regression": max_reg, "fraction": 1.0},
+        detail={
+            "datasets": details,
+            "max_regression": max_reg,
+            "fraction": 1.0,
+            "bound_source": str(DEFAULT_POLICY.name),
+            "bound_path": "accuracy.max_dataset_regression",
+            "default_policy_hash": default_hash,
+        },
     )
 
 
@@ -551,21 +592,53 @@ def _data_volume_completeness(
     )
 
 
-def _data_volume_privacy(fidelity_records: Sequence[dict[str, Any]], expected: set[str]) -> GateResult:
+def _data_volume_privacy_gates(
+    fidelity_records: Sequence[dict[str, Any]],
+    expected: set[str],
+) -> list[GateResult]:
+    """Candidate privacy failures reject; baseline privacy failures are inconclusive."""
     by_key = {data_volume_sample_key(record): record for record in fidelity_records}
-    failures: list[str] = []
+    candidate_failures: list[str] = []
+    baseline_failures: list[str] = []
     for key in sorted(expected):
-        if "/candidate/" not in key:
-            continue
         record = by_key.get(key)
-        if record is None or not record.get("ok") or record.get("privacy_passed") is not True:
-            failures.append(key)
-    if failures:
-        return GateResult(
-            name="privacy",
-            passed=False,
-            status="fail",
-            reason="privacy_guard_failed",
-            detail={"failed": failures},
+        failed = record is None or not record.get("ok") or record.get("privacy_passed") is not True
+        if not failed:
+            continue
+        if "/candidate/" in key:
+            candidate_failures.append(key)
+        elif "/baseline/" in key:
+            baseline_failures.append(key)
+    gates: list[GateResult] = []
+    if candidate_failures:
+        gates.append(
+            GateResult(
+                name="privacy",
+                passed=False,
+                status="fail",
+                reason="privacy_guard_failed",
+                detail={"failed": candidate_failures},
+            )
         )
-    return GateResult(name="privacy", passed=True, status="pass", reason="privacy_passed")
+    else:
+        gates.append(GateResult(name="privacy", passed=True, status="pass", reason="privacy_passed"))
+    if baseline_failures:
+        gates.append(
+            GateResult(
+                name="baseline_privacy",
+                passed=False,
+                status="inconclusive",
+                reason="baseline_privacy",
+                detail={"failed": baseline_failures},
+            )
+        )
+    else:
+        gates.append(
+            GateResult(
+                name="baseline_privacy",
+                passed=True,
+                status="pass",
+                reason="baseline_privacy_passed",
+            )
+        )
+    return gates

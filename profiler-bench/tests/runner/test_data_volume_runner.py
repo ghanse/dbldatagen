@@ -7,12 +7,87 @@ from pathlib import Path
 
 import pytest
 
-from profiler_bench.runner.data_volume import DataVolumeConfig, run_data_volume_experiment
+from profiler_bench.runner.data_volume import DataVolumeConfig, calibrate_targets, run_data_volume_experiment
 from profiler_bench.runner.scorer import FakeScorer
 from profiler_bench.runner.subset import apply_table_scales
 
 
 REPO = Path(__file__).resolve().parents[3]
+
+
+def test_run_fails_up_front_without_frozen_targets(tmp_path: Path) -> None:
+    policy = tmp_path / "policy.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "bootstrap": {"samples": 200, "seed": 0, "confidence": 0.95},
+                "fractions": [1.0],
+                "subset_seeds": 1,
+                "fidelity_seeds": 1,
+                "fidelity_tier": "xs",
+                "targets": {"numeric": {"T_d": None, "provenance": "unset"}},
+                "data_volume": {"control_noise_width": {}},
+                "dataset_seed": 0,
+                "spark": {"master": "local[1]", "configs": {"spark.ui.enabled": "false"}},
+                "not_measured": [],
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="missing frozen calibration"):
+        run_data_volume_experiment(
+            DataVolumeConfig(
+                experiment_id="dv-missing-targets",
+                baseline_worktree=REPO,
+                candidate_worktree=REPO,
+                policy_path=policy,
+                datasets=["numeric"],
+                control=True,
+                scorer=FakeScorer(reconstruction=0.9, structure=0.5, privacy_passed=True, ceiling_value=1.0),
+                repo_root=tmp_path,
+                fractions=[1.0],
+                subset_seeds=1,
+                fidelity_seeds=1,
+            )
+        )
+
+
+def test_calibrate_targets_freezes_noise_width(tmp_path: Path) -> None:
+    experiment = tmp_path / "exp"
+    samples = experiment / "samples"
+    samples.mkdir(parents=True)
+    (experiment / "run.json").write_text(
+        json.dumps(
+            {
+                "experiment_id": "dv-control-f1",
+                "control": True,
+                "baseline": {"commit": "abc123", "profiler_src_hash": "prof"},
+                "harness": {"commit": "harness1", "harness_hash": "hh"},
+                "policy": {"bootstrap": {"samples": 200, "seed": 0, "confidence": 0.95}},
+            }
+        )
+    )
+    for seed in range(4):
+        record = {
+            "kind": "fidelity",
+            "role": "baseline",
+            "dataset": "numeric",
+            "tier": "xs",
+            "fraction": 1.0,
+            "subset_seed": 0,
+            "seed": seed,
+            "ok": True,
+            "relative_reconstruction": 0.9 + 0.01 * (seed % 2),
+            "privacy_passed": True,
+        }
+        (samples / f"fidelity-baseline-numeric-xs-f-1-subset-0-seed-{seed}.json").write_text(json.dumps(record) + "\n")
+    out = tmp_path / "proposed.json"
+    policy = calibrate_targets(baseline_experiment=experiment, output_policy=out, margin=0.01)
+    assert policy["targets"]["numeric"]["T_d"] is not None
+    assert "numeric" in policy["data_volume"]["control_noise_width"]
+    assert policy["data_volume"]["control_noise_width_provenance"]["run_id"] == "dv-control-f1"
+    assert policy["data_volume"]["control_noise_width_provenance"]["harness_hash"] == "hh"
+    assert policy["data_volume"]["f1_regression_bound"]["source"] == "default.json"
+    assert "accuracy" not in policy
 
 
 def test_nstar_on_fake_scorer_curve(tmp_path: Path) -> None:

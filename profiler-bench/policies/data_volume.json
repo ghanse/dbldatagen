@@ -15,44 +15,43 @@
   "targets": {
     "edge": {
       "T_d": null,
-      "provenance": "Unset until P3.3 calibrate-targets freezes T_d from the full-data baseline (relative - 0.01)."
+      "provenance": "Unset until calibrate-targets freezes T_d from a same-build control at f=1 (relative - 0.01)."
     },
     "nested": {
       "T_d": null,
-      "provenance": "Unset until P3.3 calibrate-targets freezes T_d from the full-data baseline (relative - 0.01)."
+      "provenance": "Unset until calibrate-targets freezes T_d from a same-build control at f=1 (relative - 0.01)."
     },
     "numeric": {
       "T_d": null,
-      "provenance": "Unset until P3.3 calibrate-targets freezes T_d from the full-data baseline (relative - 0.01)."
+      "provenance": "Unset until calibrate-targets freezes T_d from a same-build control at f=1 (relative - 0.01)."
     },
     "retail": {
       "T_d": null,
-      "provenance": "Unset until P3.3 calibrate-targets freezes T_d from the full-data baseline (relative - 0.01)."
+      "provenance": "Unset until calibrate-targets freezes T_d from a same-build control at f=1 (relative - 0.01)."
     },
     "strings": {
       "T_d": null,
-      "provenance": "Unset until P3.3 calibrate-targets freezes T_d from the full-data baseline (relative - 0.01)."
+      "provenance": "Unset until calibrate-targets freezes T_d from a same-build control at f=1 (relative - 0.01)."
     },
     "temporal": {
       "T_d": null,
-      "provenance": "Unset until P3.3 calibrate-targets freezes T_d from the full-data baseline (relative - 0.01)."
+      "provenance": "Unset until calibrate-targets freezes T_d from a same-build control at f=1 (relative - 0.01)."
     }
   },
   "data_volume": {
     "min_nstar_improvement_steps": 1,
     "reached_rule": "ci_lower >= T_d - control_noise_width",
-    "reached_rule_note": "Paired bootstrap over (subset seed, sampler seed) for the per-fraction mean relative reconstruction. A fraction is reached only if the CI lower bound clears T_d minus the control noise width (half the baseline f=1 CI width, unless overridden in control_noise_width). A crossing interval is inconclusive.",
-    "control_noise_width": {}
-  },
-  "accuracy": {
-    "min_mean_improvement": 0.005,
-    "ci_lower_must_exceed": 0.0,
-    "max_dataset_regression": 0.01,
-    "max_structure_regression": 0.02
+    "reached_rule_note": "Paired bootstrap over (subset seed, sampler seed) for the per-fraction mean relative reconstruction. A fraction is reached only if the CI lower bound clears T_d minus the frozen control noise width written by calibrate-targets. A crossing interval is inconclusive.",
+    "control_noise_width": {},
+    "f1_regression_bound": {
+      "source": "default.json",
+      "path": "accuracy.max_dataset_regression",
+      "note": "Loaded by reference from default.json at gate time; not duplicated in this policy."
+    }
   },
   "privacy": {
     "hard_guard": true,
-    "note": "Privacy cannot be disabled; every candidate dataset x fraction x subset seed x sampler seed must set privacy_passed=true."
+    "note": "A candidate privacy failure anywhere rejects. A baseline privacy failure is inconclusive (reason baseline_privacy). Completeness covers both builds."
   },
   "spark": {
     "master": "local[2]",

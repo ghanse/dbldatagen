@@ -60,6 +60,11 @@ def run_data_volume_experiment(config: DataVolumeConfig) -> Path:
 
     policy = load_policy(config.policy_path)
     repo_root = (config.repo_root or Path(__file__).resolve().parents[4]).resolve()
+    datasets = list(config.datasets) if config.datasets is not None else sorted(DATASETS)
+    from profiler_bench.evaluate.data_volume import require_calibrated_targets  # noqa: PLC0415
+
+    require_calibrated_targets(policy, datasets)
+
     out = experiment_dir(config.experiment_id, repo_root)
     if out.exists():
         shutil.rmtree(out)
@@ -71,8 +76,6 @@ def run_data_volume_experiment(config: DataVolumeConfig) -> Path:
     candidate = identify_build("candidate", candidate_path)
     harness = identify_harness(policy=policy)
     recording_root = Path(harness.harness_root)
-
-    datasets = list(config.datasets) if config.datasets is not None else sorted(DATASETS)
     fidelity_tier = str(policy.get("fidelity_tier", "s"))
     fractions = (
         [float(value) for value in config.fractions]
@@ -257,16 +260,19 @@ def _profile_subset(
     if not use_worker:
         # FakeScorer path: invent a minimal profile and synthetic subset meta.
         del scorer
+        kept = max(1, int(1000 * fraction))
         return {
             "ok": True,
-            "profile": {"tables": [{"name": "t", "row_count": max(1, int(1000 * fraction))}]},
+            "profile": {"tables": [{"name": "t", "row_count": kept}]},
             "subset": {
                 "fraction": fraction,
+                "actual_fractions": {"t": kept / 1000.0},
+                "overall_actual_fraction": kept / 1000.0,
                 "subset_seed": subset_seed,
                 "method": "fk_preserving_uniform",
                 "full_row_counts": {"t": 1000},
-                "subset_row_counts": {"t": max(1, int(1000 * fraction))},
-                "scales": {"t": 1000.0 / max(1, int(1000 * fraction))},
+                "subset_row_counts": {"t": kept},
+                "scales": {"t": 1000.0 / kept},
             },
             "wall_s": 0.01,
             "role": role,
@@ -563,27 +569,61 @@ def calibrate_targets(
     base_policy: Path | None = None,
     margin: float = 0.01,
 ) -> dict[str, Any]:
-    """Writes a proposed data-volume policy with ``T_d`` from a baseline run at f = 1."""
+    """Writes a proposed data-volume policy with ``T_d`` and frozen control noise widths.
+
+    Expects ``baseline_experiment`` to be a same-build control scored at ``f = 1``
+    over K sampler seeds x S subset seeds. Both ``T_d`` and the per-dataset noise
+    width (half the f=1 mean CI width) are written with provenance (commit, harness
+    hash, run id).
+    """
     from profiler_bench.evaluate.data_volume import calibrate_targets_from_records  # noqa: PLC0415
     from profiler_bench.evaluate.evaluate import load_samples  # noqa: PLC0415
-    from profiler_bench.runner.policy import DEFAULT_POLICY  # noqa: PLC0415
+    from profiler_bench.runner.policy import DEFAULT_POLICY, policy_path_hash  # noqa: PLC0415
 
     root = Path(baseline_experiment)
     run = json.loads((root / "run.json").read_text())
     _speed, fidelity = load_samples(root / "samples")
-    targets = calibrate_targets_from_records(fidelity, role="baseline", fraction=1.0, margin=margin)
+    boot = (run.get("policy") or {}).get("bootstrap") or {}
+    targets, noise = calibrate_targets_from_records(
+        fidelity,
+        role="baseline",
+        fraction=1.0,
+        margin=margin,
+        n_bootstrap=int(boot.get("samples", 2000)),
+        bootstrap_seed=int(boot.get("seed", 0)),
+        confidence=float(boot.get("confidence", 0.95)),
+    )
     policy_path = base_policy or Path(__file__).resolve().parents[3] / "policies" / "data_volume.json"
     if policy_path.is_file():
         policy = json.loads(policy_path.read_text())
     else:
         policy = json.loads((base_policy or DEFAULT_POLICY).read_text())
-    policy["targets"] = targets
-    policy["targets_provenance"] = {
+    harness = run.get("harness") or {}
+    baseline = run.get("baseline") or {}
+    provenance = {
         "baseline_experiment": str(root),
-        "baseline_experiment_id": run.get("experiment_id"),
+        "run_id": run.get("experiment_id"),
+        "commit": baseline.get("commit") or harness.get("commit"),
+        "harness_hash": harness.get("harness_hash"),
+        "profiler_src_hash": baseline.get("profiler_src_hash"),
+        "control": bool(run.get("control")),
+        "fraction": 1.0,
         "margin": margin,
-        "note": "Proposed by calibrate-targets; polly freezes the accepted file.",
+        "note": ("Proposed by calibrate-targets from a same-build control at f=1; " "polly freezes the accepted file."),
     }
+    policy["targets"] = targets
+    policy["targets_provenance"] = provenance
+    data_volume = dict(policy.get("data_volume") or {})
+    data_volume["control_noise_width"] = noise
+    data_volume["control_noise_width_provenance"] = provenance
+    data_volume["f1_regression_bound"] = {
+        "source": "default.json",
+        "path": "accuracy.max_dataset_regression",
+        "default_policy_hash": policy_path_hash(DEFAULT_POLICY),
+        "note": "Loaded by reference from default.json at gate time; not duplicated here.",
+    }
+    policy["data_volume"] = data_volume
+    policy.pop("accuracy", None)
     output_policy.parent.mkdir(parents=True, exist_ok=True)
     output_policy.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n")
     return cast(dict[str, Any], policy)
