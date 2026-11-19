@@ -740,6 +740,9 @@ dependencies = [
 spark = [
     { name = "pyspark", extra = ["sql"] },
 ]
+yaml = [
+    { name = "pyyaml" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -765,8 +768,9 @@ test = [
 requires-dist = [
     { name = "pydantic", specifier = ">=2.0,<3" },
     { name = "pyspark", extras = ["sql"], marker = "extra == 'spark'", specifier = ">=3.4.1,<4.2" },
+    { name = "pyyaml", marker = "extra == 'yaml'", specifier = ">=6.0" },
 ]
-provides-extras = ["spark"]
+provides-extras = ["spark", "yaml"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -196,7 +196,11 @@ def _pii_substitute(args: argparse.Namespace) -> int:
 def _pii_policy(args: argparse.Namespace) -> int:
     """Prints the default PII handling policy as YAML."""
     policy_module = import_module("dbldatagen_profiler.pii")
-    sys.stdout.write(policy_module.PiiPolicy().to_yaml())
+    try:
+        sys.stdout.write(policy_module.PiiPolicy().to_yaml())
+    except ValueError as error:
+        print(f"dbldatagen-profile pii policy: {error}", file=sys.stderr)
+        return 1
     return 0
 
 

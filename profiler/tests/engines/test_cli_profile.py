@@ -1,14 +1,15 @@
 """End-to-end CLI tests for Spark profiling."""
 
 import json
+from datetime import date
 from pathlib import Path
 
 import pytest
 from pyspark.sql import SparkSession
 
 from dbldatagen_profiler.cli import main
-from dbldatagen_profiler.model import load_profile
-from dbldatagen_profiler.pii import PiiPolicy
+from dbldatagen_profiler.model import PiiClass, load_profile
+from dbldatagen_profiler.pii import PiiAction, PiiPolicy, PiiRule, dump_policy_json
 
 
 pytestmark = [pytest.mark.spark, pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")]
@@ -17,9 +18,17 @@ pytestmark = [pytest.mark.spark, pytest.mark.filterwarnings("ignore::pytest.Pyte
 def test_profile_parquet_end_to_end(spark: SparkSession, tmp_path: Path) -> None:
     source = tmp_path / "input.parquet"
     output = tmp_path / "profile.json"
-    policy = tmp_path / "policy.yaml"
-    policy.write_text(PiiPolicy().to_yaml(), encoding="utf-8")
-    spark.createDataFrame([(1, "a"), (2, None)], "id long, label string").write.parquet(str(source))
+    policy_output = tmp_path / "profile-policy.json"
+    policy = tmp_path / "policy.json"
+    policy.write_text(
+        dump_policy_json(PiiPolicy(pii_class={PiiClass.DATE_OF_BIRTH: PiiRule(action=PiiAction.DROP)})),
+        encoding="utf-8",
+    )
+    spark.createDataFrame(
+        [(index, date(1980 + index, 1, 2), f"user{index}@example.com") for index in range(10)],
+        "id long, date_of_birth date, email string",
+    ).write.parquet(str(source))
+    assert main(["profile", "--table", f"items={source}", "--format", "parquet", "-o", str(output)]) == 0
     assert (
         main(
             [
@@ -31,19 +40,25 @@ def test_profile_parquet_end_to_end(spark: SparkSession, tmp_path: Path) -> None
                 "--policy",
                 str(policy),
                 "-o",
-                str(output),
+                str(policy_output),
             ]
         )
         == 0
     )
     profile = load_profile(json.loads(output.read_text(encoding="utf-8")), strict=True)
+    policy_profile = load_profile(json.loads(policy_output.read_text(encoding="utf-8")), strict=True)
     assert profile.tables[0].name == "items"
-    assert profile.tables[0].row_count == 2
+    assert profile.tables[0].row_count == 10
     assert profile.source is not None
     assert profile.source.name == "items"
     assert profile.source.format == "parquet"
     assert profile.source.location is None
     assert str(source) not in output.read_text(encoding="utf-8")
+    dob = next(column for column in profile.tables[0].columns if column.name == "date_of_birth")
+    protected_dob = next(column for column in policy_profile.tables[0].columns if column.name == "date_of_birth")
+    assert dob.temporal is not None and dob.temporal.min is not None and dob.temporal.max is not None
+    assert protected_dob.temporal is not None
+    assert protected_dob.temporal.min is None and protected_dob.temporal.max is None
 
 
 def test_profile_reports_spark_read_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

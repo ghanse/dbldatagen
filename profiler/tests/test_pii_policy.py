@@ -18,7 +18,23 @@ def test_default_policy_yaml_and_json_round_trip() -> None:
     assert load_policy(dump_policy_json(policy)) == policy
     assert load_policy(json.loads(dump_policy_json(policy))) == policy
     assert all(policy.sensitivity[kind].action == PiiAction.SUBSTITUTE for kind in Sensitivity)
-    assert policy.min_confidence == 0.5
+    assert policy.min_confidence == 0.25
+
+
+def test_yaml_round_trip_preserves_overrides_and_parameters() -> None:
+    policy = PiiPolicy(
+        pii_class={PiiClass.POSTAL_CODE: PiiRule(action=PiiAction.GENERALIZE, parameters={"prefix_length": 3})},
+        columns={"people.city": PiiRule(action=PiiAction.SUPPRESS)},
+    )
+    assert load_policy(policy.to_yaml()) == policy
+
+
+def test_long_json_string_is_parsed_as_content() -> None:
+    text = dump_policy_json(
+        PiiPolicy(columns={f"table.column_{index}": PiiRule(action=PiiAction.KEEP) for index in range(30)})
+    )
+    assert len(text) > 255
+    assert load_policy(text).columns == load_policy(json.loads(text)).columns
 
 
 def test_column_then_class_then_sensitivity_precedence() -> None:

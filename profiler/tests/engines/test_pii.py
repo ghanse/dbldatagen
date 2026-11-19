@@ -11,7 +11,7 @@ import pytest
 from pyspark.sql import DataFrame, Row, SparkSession
 
 from dbldatagen_profiler.cli import main
-from dbldatagen_profiler.engines.spark import profile_dataframe
+from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
 from dbldatagen_profiler.model import (
     EngineInfo,
     KeyCandidate,
@@ -19,11 +19,20 @@ from dbldatagen_profiler.model import (
     PrivacyPolicy,
     Profile,
     Relationship,
+    Sensitivity,
     TableProfile,
     dump_profile,
     profile_json_schema,
 )
-from dbldatagen_profiler.pii import PiiAction, PiiPolicy, PiiRule, SubstitutionOptions, detect, substitute
+from dbldatagen_profiler.pii import (
+    PiiAction,
+    PiiPolicy,
+    PiiRule,
+    SubstitutionOptions,
+    detect,
+    dump_policy_json,
+    substitute,
+)
 from dbldatagen_profiler.pii.detect import analyze_table
 from dbldatagen_profiler.pii.substitute import _mapping_surrogate
 
@@ -399,6 +408,7 @@ def test_generalization_and_collision_hook(spark: SparkSession) -> None:
         {"t": frame}, profile, key=b"key", options=SubstitutionOptions(generalize={"t.postal_code": "postal_prefix"})
     )
     assert {row.postal_code for row in result.tables["t"].collect()} == {"123**"}
+    assert result.report["columns"][0]["rule_source"] == "column"
 
 
 def test_quasi_identifier_is_substituted_by_default(spark: SparkSession) -> None:
@@ -410,55 +420,142 @@ def test_quasi_identifier_is_substituted_by_default(spark: SparkSession) -> None
     assert result.report["columns"][0]["action"] == "substitute"
 
 
-def test_default_policy_substitutes_zip_dob_and_gender_without_changing_statistics(spark: SparkSession) -> None:
-    rows = [
-        ("person-a", "02110", date(1980, 1, 2), "F"),
-        ("person-b", "02110", date(1981, 2, 3), "F"),
-        ("person-c", "10001", date(1990, 3, 4), "M"),
-        ("person-d", None, None, None),
+def test_default_policy_substitutes_realistic_detected_columns_and_low_confidence_fk(spark: SparkSession) -> None:
+    customers = spark.createDataFrame(
+        [
+            ("c-1", "Alice", "1 Main St", "Boston", "02110", "alice@example.com"),
+            ("c-2", "Bob", "2 Oak Ave", "New York", "10001", "bob@example.com"),
+        ],
+        "customer_id string, first_name string, street string, city string, zip string, email string",
+    )
+    orders = spark.createDataFrame([("c-1",), ("c-1",), ("c-2",)], "customer_id string")
+    profile = profile_tables({"customers": customers, "orders": orders})
+    profile.tables[0].primary_key = KeyCandidate(columns=["customer_id"], confidence=1.0)
+    profile.relationships = [
+        Relationship(
+            child_table="orders",
+            child_columns=["customer_id"],
+            parent_table="customers",
+            parent_columns=["customer_id"],
+            coverage=1.0,
+        )
     ]
-    frame = spark.createDataFrame(rows, "entity_id string, zip string, dob date, gender string")
+    detected = {
+        f"{table.name}.{column.name}": column.semantic
+        for table in profile.tables
+        for column in table.columns
+        if column.semantic is not None
+    }
+    assert detected["orders.customer_id"].confidence == 0.3
+    source = {"customers": customers, "orders": orders}
+    output = substitute(source, profile, key=b"realistic-default-key").tables
+    for name in ("customer_id", "first_name", "street", "city", "zip", "email"):
+        originals = {row[name] for row in customers.select(name).collect()}
+        replacements = {row[name] for row in output["customers"].select(name).collect()}
+        assert originals.isdisjoint(replacements)
+    assert _relationship_stats(source, "orders", ["customer_id"], "customers", ["customer_id"]) == (
+        _relationship_stats(output, "orders", ["customer_id"], "customers", ["customer_id"])
+    )
+
+
+def test_default_policy_substitutes_zip_dob_and_gender_without_changing_statistics(spark: SparkSession) -> None:
+    people_rows = [
+        ("person-a", "02110", date(1980, 1, 2), "F"),
+        ("person-b", "10001", date(1990, 3, 4), "M"),
+        ("person-c", None, None, None),
+    ]
+    event_rows = [people_rows[0], people_rows[0], people_rows[1], people_rows[1], people_rows[2]]
+    schema = "entity_id string, zip string, dob date, gender string"
+    people = spark.createDataFrame(people_rows, schema)
+    events = spark.createDataFrame(event_rows, schema)
     quasi = _semantic("other", "quasi_identifier")
+    direct = _semantic("account_id", "direct_identifier")
+    qi_columns = [
+        _column("entity_id", direct),
+        _column("zip", {**quasi, "pii_class": "postal_code"}),
+        _typed_column("dob", "date", {**quasi, "pii_class": "date_of_birth"}),
+        _column("gender", quasi),
+    ]
     profile = _profile(
         [
-            (
-                "people",
-                len(rows),
-                [
-                    _column("entity_id", None),
-                    _column("zip", {**quasi, "pii_class": "postal_code"}),
-                    _typed_column("dob", "date", {**quasi, "pii_class": "date_of_birth"}),
-                    _column("gender", quasi),
-                ],
+            ("people", len(people_rows), qi_columns),
+            ("events", len(event_rows), qi_columns),
+        ],
+        relationships=[
+            Relationship(
+                child_table="events",
+                child_columns=["entity_id"],
+                parent_table="people",
+                parent_columns=["entity_id"],
+                coverage=1.0,
             )
-        ]
+        ],
     )
     profile.tables[0].primary_key = KeyCandidate(columns=["entity_id"], confidence=1.0)
-    output = substitute({"people": frame}, profile, key=b"default-qi-key").tables["people"]
+    source = {"people": people, "events": events}
+    options = SubstitutionOptions(
+        domains={
+            "zip-domain": ["people.zip", "events.zip"],
+            "dob-domain": ["people.dob", "events.dob"],
+            "gender-domain": ["people.gender", "events.gender"],
+        }
+    )
+    result = substitute(source, profile, key=b"default-qi-key", options=options)
+    output = result.tables
+    assert _relationship_stats(source, "events", ["entity_id"], "people", ["entity_id"]) == _relationship_stats(
+        output, "events", ["entity_id"], "people", ["entity_id"]
+    )
     for name in ("zip", "dob", "gender"):
-        original = [row[name] for row in frame.select(name).collect()]
-        replaced = [row[name] for row in output.select(name).collect()]
+        original = [row[name] for frame in source.values() for row in frame.select(name).collect()]
+        replaced = [row[name] for frame in output.values() for row in frame.select(name).collect()]
         assert {value for value in original if value is not None}.isdisjoint(
             value for value in replaced if value is not None
         )
         assert sorted(Counter(original).values()) == sorted(Counter(replaced).values())
         assert len(set(original)) == len(set(replaced))
         assert sum(value is None for value in original) == sum(value is None for value in replaced)
+    dob_reports = [item for item in result.report["columns"] if item["class"] == "date_of_birth"]
+    assert dob_reports and all(item["date_shift_key"] == "entity" for item in dob_reports)
 
 
 def test_low_confidence_is_skipped_until_a_class_override_names_it(spark: SparkSession) -> None:
     frame = spark.createDataFrame([("Boston",)], "city string")
-    weak = {**_semantic("city", "quasi_identifier"), "confidence": 0.3}
+    weak = {**_semantic("city", "quasi_identifier"), "confidence": 0.2}
     profile = _profile([("t", 1, [_column("city", weak)])])
-    skipped = substitute({"t": frame}, profile, key=b"weak-key")
+    raised_threshold = PiiPolicy(min_confidence=0.5)
+    skipped = substitute({"t": frame}, profile, key=b"weak-key", policy=raised_threshold)
     skipped_row = skipped.tables["t"].first()
     assert skipped_row is not None and skipped_row.city == "Boston"
     assert skipped.report["columns"][0]["skipped_reason"] == "skipped_low_confidence"
-    policy = PiiPolicy(pii_class={PiiClass.CITY: PiiRule(action=PiiAction.SUPPRESS)})
+    assert skipped.report["columns"][0]["rule_source"] == "min_confidence"
+    policy = PiiPolicy(min_confidence=0.5, pii_class={PiiClass.CITY: PiiRule(action=PiiAction.SUPPRESS)})
     overridden = substitute({"t": frame}, profile, key=b"weak-key", policy=policy)
     overridden_row = overridden.tables["t"].first()
     assert overridden_row is not None and overridden_row.city is None
     assert overridden.report["columns"][0]["rule_source"] == "pii_class"
+
+
+def test_low_confidence_direct_identifier_and_secret_are_never_skipped(spark: SparkSession) -> None:
+    frame = spark.createDataFrame([("Alice", "token-value")], "first_name string, secret string")
+    weak = 0.1
+    profile = _profile(
+        [
+            (
+                "t",
+                1,
+                [
+                    _column("first_name", {**_semantic("person_name", "direct_identifier"), "confidence": weak}),
+                    _column("secret", {**_semantic("secret_token", "secret"), "confidence": weak}),
+                ],
+            )
+        ]
+    )
+    row = (
+        substitute({"t": frame}, profile, key=b"fail-safe-key", policy=PiiPolicy(min_confidence=1.0))
+        .tables["t"]
+        .first()
+    )
+    assert row is not None and row.first_name != "Alice" and row.secret != "token-value"
 
 
 def test_policy_actions_and_generalization_parameters(spark: SparkSession) -> None:
@@ -493,7 +590,53 @@ def test_policy_actions_and_generalization_parameters(spark: SparkSession) -> No
     assert (row.zip, row.age, row.city, row.gender) == ("021", 20.0, None, "F")
 
 
-def test_partial_fk_drop_is_rejected(spark: SparkSession) -> None:
+def test_each_action_is_applied_to_real_data_for_every_sensitivity(spark: SparkSession) -> None:
+    values = ("alice@example.com", "02110", "token-value", "contact alice@example.com")
+    frame = spark.createDataFrame([values], "direct string, quasi string, secret string, free_text string")
+    profile = _profile(
+        [
+            (
+                "t",
+                1,
+                [
+                    _column("direct", _semantic("email", "direct_identifier")),
+                    _column("quasi", _semantic("postal_code", "quasi_identifier")),
+                    _column("secret", _semantic("secret_token", "secret")),
+                    _column("free_text", _semantic("free_text_pii", "free_text")),
+                ],
+            )
+        ]
+    )
+    columns = ["direct", "quasi", "secret", "free_text"]
+    for action in PiiAction:
+        parameters = {"prefix_length": 2} if action == PiiAction.GENERALIZE else {}
+        policy = PiiPolicy(sensitivity={kind: PiiRule(action=action, parameters=parameters) for kind in Sensitivity})
+        output = substitute({"t": frame}, profile, key=b"all-actions-key", policy=policy).tables["t"]
+        if action == PiiAction.DROP:
+            assert output.columns == []
+            continue
+        row = output.first()
+        assert row is not None
+        actual = tuple(row[column] for column in columns)
+        if action == PiiAction.SUPPRESS:
+            assert actual == (None, None, None, None)
+        elif action == PiiAction.KEEP:
+            assert actual == values
+        elif action == PiiAction.GENERALIZE:
+            assert actual == tuple(value[:2] for value in values)
+        else:
+            assert all(replacement != original for replacement, original in zip(actual, values, strict=True))
+
+
+def test_date_generalization_to_year(spark: SparkSession) -> None:
+    frame = spark.createDataFrame([(date(1980, 5, 17),)], "dob date")
+    profile = _profile([("t", 1, [_typed_column("dob", "date", _semantic("date_of_birth", "quasi_identifier"))])])
+    policy = PiiPolicy(columns={"t.dob": PiiRule(action=PiiAction.GENERALIZE, parameters={"date_granularity": "year"})})
+    row = substitute({"t": frame}, profile, key=b"year-key", policy=policy).tables["t"].first()
+    assert row is not None and row.dob == date(1980, 1, 1)
+
+
+def test_conflicting_explicit_fk_rules_are_rejected_with_both_columns(spark: SparkSession) -> None:
     parent = spark.createDataFrame([("a",)], "id string")
     child = spark.createDataFrame([("a",)], "id string")
     semantic = _semantic("account_id", "direct_identifier")
@@ -509,9 +652,65 @@ def test_partial_fk_drop_is_rejected(spark: SparkSession) -> None:
             )
         ],
     )
-    policy = PiiPolicy(columns={"child.id": PiiRule(action=PiiAction.DROP)})
-    with pytest.raises(ValueError, match="cannot drop only part"):
+    policy = PiiPolicy(columns={"child.id": PiiRule(action=PiiAction.KEEP)})
+    with pytest.raises(ValueError, match=r"conflicting explicit.*child\.id=keep.*parent\.id=substitute"):
         substitute({"parent": parent, "child": child}, profile, key=b"drop-key", policy=policy)
+
+
+def test_fk_domain_uses_strictest_implicit_action(spark: SparkSession) -> None:
+    parent = spark.createDataFrame([("02110",), ("10001",)], "zip string")
+    child = spark.createDataFrame([("02110",), ("02110",), ("10001",)], "zip string")
+    profile = _profile(
+        [
+            ("parent", 2, [_column("zip", {**_semantic("postal_code", "quasi_identifier"), "confidence": 0.9})]),
+            ("child", 3, [_column("zip", {**_semantic("postal_code", "quasi_identifier"), "confidence": 0.2})]),
+        ],
+        relationships=[
+            Relationship(
+                child_table="child",
+                child_columns=["zip"],
+                parent_table="parent",
+                parent_columns=["zip"],
+                coverage=1.0,
+            )
+        ],
+    )
+    source = {"parent": parent, "child": child}
+    output = substitute(source, profile, key=b"strict-domain-key").tables
+    assert _relationship_stats(source, "child", ["zip"], "parent", ["zip"]) == _relationship_stats(
+        output, "child", ["zip"], "parent", ["zip"]
+    )
+    assert {row.zip for row in output["child"].collect()}.isdisjoint({"02110", "10001"})
+
+
+def test_full_fk_drop_is_allowed(spark: SparkSession) -> None:
+    parent = spark.createDataFrame([("a",)], "id string")
+    child = spark.createDataFrame([("a",)], "id string")
+    semantic = _semantic("account_id", "direct_identifier")
+    profile = _profile(
+        [("parent", 1, [_column("id", semantic)]), ("child", 1, [_column("id", semantic)])],
+        relationships=[
+            Relationship(
+                child_table="child",
+                child_columns=["id"],
+                parent_table="parent",
+                parent_columns=["id"],
+                coverage=1.0,
+            )
+        ],
+    )
+    drop = PiiRule(action=PiiAction.DROP)
+    policy = PiiPolicy(columns={"parent.id": drop, "child.id": drop})
+    output = substitute({"parent": parent, "child": child}, profile, key=b"full-drop-key", policy=policy).tables
+    assert output["parent"].columns == [] and output["child"].columns == []
+
+
+def test_unknown_column_rule_is_rejected(spark: SparkSession) -> None:
+    frame = spark.createDataFrame([("Boston",)], "city string")
+    profile = _profile([("t", 1, [_column("city", _semantic("city", "quasi_identifier"))])])
+    policy = PiiPolicy(columns={"t.ctiy": PiiRule(action=PiiAction.SUPPRESS)})
+    with pytest.raises(ValueError, match=r"match no profile column.*t\.ctiy"):
+        substitute({"t": frame}, profile, key=b"typo-key", policy=policy)
 
 
 def test_profile_policy_cannot_loosen_direct_identifier_floor(spark: SparkSession) -> None:
@@ -807,7 +1006,7 @@ def test_cli_detect_and_substitute_end_to_end(spark: SparkSession, tmp_path: Pat
     semantic_path = tmp_path / "semantic.json"
     profile_path = tmp_path / "profile.json"
     key_path = tmp_path / "key.bin"
-    policy_path = tmp_path / "policy.yaml"
+    policy_path = tmp_path / "policy.json"
     output = tmp_path / "output"
     frame = spark.createDataFrame([("a@example.com",), ("b@example.com",)], "email string")
     frame.write.parquet(str(source))
@@ -816,7 +1015,7 @@ def test_cli_detect_and_substitute_end_to_end(spark: SparkSession, tmp_path: Pat
     profile_path.write_text(dump_profile(profile_dataframe("customers", frame)), encoding="utf-8")
     key_path.write_bytes(b"cli-test-key".ljust(32, b"!"))
     key_path.chmod(0o600)
-    policy_path.write_text(PiiPolicy(pii_class={PiiClass.EMAIL: PiiRule(action=PiiAction.SUPPRESS)}).to_yaml())
+    policy_path.write_text(dump_policy_json(PiiPolicy(pii_class={PiiClass.EMAIL: PiiRule(action=PiiAction.SUPPRESS)})))
     assert (
         main(
             [

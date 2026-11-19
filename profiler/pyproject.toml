@@ -24,6 +24,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+yaml = [
+    "pyyaml>=6.0",
+]
 spark = [
     "pyspark[sql]>=3.4.1,<4.2",
 ]

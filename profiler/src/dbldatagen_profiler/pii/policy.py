@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from enum import Enum
+from importlib import import_module
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -44,7 +46,7 @@ class PiiPolicy(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    min_confidence: float = Field(default=0.25, ge=0.0, le=1.0)
     sensitivity: dict[Sensitivity, PiiRule] = Field(
         default_factory=lambda: {kind: PiiRule(action=PiiAction.SUBSTITUTE) for kind in Sensitivity}
     )
@@ -74,21 +76,18 @@ class PiiPolicy(BaseModel):
 
     def to_yaml(self) -> str:
         """Serializes the policy to stable YAML."""
-        return _dump_yaml_mapping(self.model_dump(mode="json"))
+        yaml = _yaml_module()
+        return str(yaml.safe_dump(self.model_dump(mode="json"), sort_keys=False))
 
 
 def load_policy(source: str | bytes | Path | dict[str, Any]) -> PiiPolicy:
     """Loads a policy from YAML, JSON, a path, or an already parsed mapping."""
     if isinstance(source, Path):
-        payload = _load_yaml(source.read_text(encoding="utf-8"))
+        payload = _load_text(source.read_text(encoding="utf-8"))
     elif isinstance(source, bytes):
-        payload = _load_yaml(source.decode())
+        payload = _load_text(source.decode())
     elif isinstance(source, str):
-        candidate = Path(source)
-        if "\n" not in source and candidate.is_file():
-            payload = _load_yaml(candidate.read_text(encoding="utf-8"))
-        else:
-            payload = _load_yaml(source)
+        payload = _load_text(source)
     else:
         payload = source
     if not isinstance(payload, dict):
@@ -101,73 +100,17 @@ def dump_policy_json(policy: PiiPolicy) -> str:
     return json.dumps(policy.model_dump(mode="json"), indent=2) + "\n"
 
 
-def _load_yaml(text: str) -> object:
-    """Loads the mapping-only YAML subset used by policy files."""
+def _load_text(text: str) -> object:
+    """Loads JSON, or YAML when the optional YAML extra is installed."""
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        pass
-    root: dict[str, Any] = {}
-    stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
-    for line_number, raw in enumerate(text.splitlines(), start=1):
-        stripped = raw.lstrip(" ")
-        if not stripped or stripped.startswith("#"):
-            continue
-        indent = len(raw) - len(stripped)
-        key, separator, value = stripped.partition(":")
-        if not separator or not key.strip():
-            raise ValueError(f"invalid policy YAML on line {line_number}")
-        while indent <= stack[-1][0]:
-            stack.pop()
-        parent = stack[-1][1]
-        key = key.strip()
-        value = value.strip()
-        if not value:
-            child: dict[str, Any] = {}
-            parent[key] = child
-            stack.append((indent, child))
-        else:
-            parent[key] = _yaml_scalar(value)
-    return root
+        return _yaml_module().safe_load(text)
 
 
-def _yaml_scalar(value: str) -> object:
-    if value.startswith("{") and value.endswith("}"):
-        entries = [item.strip() for item in value[1:-1].split(",") if item.strip()]
-        return {key.strip(): _yaml_scalar(item.strip()) for entry in entries for key, _, item in [entry.partition(":")]}
-    if value in {"true", "false"}:
-        return value == "true"
-    if value in {"null", "~"}:
-        return None
+def _yaml_module() -> ModuleType:
+    """Returns PyYAML or raises an actionable optional-extra error."""
     try:
-        return int(value)
-    except ValueError:
-        try:
-            return float(value)
-        except ValueError:
-            return value.strip("'\"")
-
-
-def _dump_yaml_mapping(mapping: dict[str, Any], indent: int = 0) -> str:
-    lines: list[str] = []
-    prefix = " " * indent
-    for key, value in mapping.items():
-        if isinstance(value, dict):
-            if value:
-                lines.append(f"{prefix}{key}:")
-                lines.append(_dump_yaml_mapping(value, indent + 2).rstrip())
-            else:
-                lines.append(f"{prefix}{key}: {{}}")
-        else:
-            lines.append(f"{prefix}{key}: {_dump_yaml_scalar(value)}")
-    return "\n".join(lines) + "\n"
-
-
-def _dump_yaml_scalar(value: object) -> str:
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if value is None:
-        return "null"
-    return str(value)
+        return import_module("yaml")
+    except ModuleNotFoundError as error:
+        raise ValueError("YAML policy support requires dbldatagen-profiler[yaml]; JSON policies always work") from error

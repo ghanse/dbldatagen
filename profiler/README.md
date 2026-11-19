@@ -143,14 +143,20 @@ joins. Dates of birth use an entity-keyed date shift. This keeps those statistic
 original geography and ordering semantics; choose `generalize` or `keep` when those semantics are required. Print the
 default policy with `dbldatagen-profile pii policy --default`.
 
+Date-of-birth surrogates changed from the previous release: the entity-keyed shift now excludes zero, so a substituted
+DOB is always changed when `date_shift_days` is positive.
+
 Policies are JSON or YAML mappings. A fully-qualified column rule (including nested paths) wins over a PII-class rule,
-which wins over a sensitivity rule. Detections below `min_confidence` are reported as `skipped_low_confidence` and
-left unchanged unless a class or column override names them. Available actions are `substitute`, `generalize`,
-`suppress`, `drop`, and `keep`. Generalization parameters include `prefix_length`, `date_granularity` (`month` or
-`year`), and `bucket_width`. For example:
+which wins over a sensitivity rule. The default `min_confidence` is 0.25, so name-only detections are substituted.
+Direct identifiers and secrets are never skipped for low confidence. Other detections below the configured threshold
+are reported as `skipped_low_confidence` and left unchanged unless a class or column override names them. Linked FK
+columns use one action for the whole substitution domain (`drop` > `suppress` > `substitute` > `generalize` > `keep`);
+conflicting explicit rules are rejected. Available actions are `substitute`, `generalize`, `suppress`, `drop`, and
+`keep`. Generalization parameters include `prefix_length`, `date_granularity` (`month` or `year`), and `bucket_width`.
+For example:
 
 ```yaml
-min_confidence: 0.5
+min_confidence: 0.25
 sensitivity:
   direct_identifier: {action: substitute}
   quasi_identifier: {action: substitute}
@@ -166,7 +172,11 @@ columns:
 
 The same file can be passed to `dbldatagen-profile profile --policy policy.yaml`. At profile time, policy rules may
 only remove or coarsen emitted information. They cannot weaken the spec 0.2.0 floor for direct identifiers and
-secrets; a conflicting `keep` rule is rejected.
+secrets; a conflicting `keep` rule is rejected. Profile-time `generalize` and `drop` strip sensitive statistics just
+like `suppress`; they do not change the source schema or calculate generalized statistics.
+
+JSON policy files always work. YAML policy files and `pii policy --default` require the optional
+`dbldatagen-profiler[yaml]` extra.
 
 Format preservation also preserves value length, so length remains visible. HMAC substitution of low-entropy values
 such as SSNs and phone numbers is safe only while the key remains secret: keep the key under restricted custody and

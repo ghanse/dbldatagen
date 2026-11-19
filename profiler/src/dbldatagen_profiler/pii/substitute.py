@@ -18,7 +18,7 @@ from pyspark.sql import functions as F
 from pyspark.sql import types as T
 from pyspark.sql.window import Window
 
-from dbldatagen_profiler.model import ColumnProfile, PiiClass, Profile, Semantic
+from dbldatagen_profiler.model import ColumnProfile, PiiClass, Profile, Semantic, Sensitivity
 from dbldatagen_profiler.pii.policy import PiiAction, PiiPolicy, PiiRule
 
 
@@ -67,7 +67,7 @@ def substitute(  # noqa: PLR0912, PLR0915
         raise ValueError(f"tables are absent from profile: {missing}")
     domains = _domains(profile, opts)
     decisions = _decisions(profile, handling, opts)
-    _check_partial_relationship_drops(profile, decisions)
+    decisions = _domain_decisions(profile, domains, decisions, handling)
     domain_semantics: dict[str, Semantic] = {}
     for table_name, path, column in _profile_columns(profile):
         decision = decisions.get(f"{table_name}.{path}")
@@ -242,18 +242,27 @@ def substitute(  # noqa: PLR0912, PLR0915
 
 def _decisions(profile: Profile, policy: PiiPolicy, options: SubstitutionOptions) -> dict[str, tuple[PiiRule, str]]:
     decisions: dict[str, tuple[PiiRule, str]] = {}
+    references = {f"{table}.{path}" for table, path, _ in _profile_columns(profile)}
+    unknown = sorted(set(policy.columns) - references)
+    if unknown:
+        raise ValueError(f"PII policy column rules match no profile column: {unknown}")
     for table, path, column in _profile_columns(profile):
-        semantic = column.semantic
-        if semantic is None:
-            continue
         reference = f"{table}.{path}"
         if reference in options.generalize or path.rsplit(".", maxsplit=1)[-1] in options.generalize:
             method = options.generalize.get(reference) or options.generalize[path.rsplit(".", maxsplit=1)[-1]]
             decisions[reference] = (PiiRule(action=PiiAction.GENERALIZE, parameters={"method": str(method)}), "column")
-        elif semantic.confidence < policy.min_confidence and not policy.has_override(reference, semantic):
-            decisions[reference] = (PiiRule(action=PiiAction.KEEP), "default")
+        elif reference in policy.columns:
+            decisions[reference] = (policy.columns[reference], "column")
+        elif column.semantic is None:
+            continue
+        elif (
+            column.semantic.sensitivity not in {Sensitivity.DIRECT_IDENTIFIER, Sensitivity.SECRET}
+            and column.semantic.confidence < policy.min_confidence
+            and not policy.has_override(reference, column.semantic)
+        ):
+            decisions[reference] = (PiiRule(action=PiiAction.KEEP), "min_confidence")
         else:
-            decisions[reference] = policy.resolve(reference, semantic)
+            decisions[reference] = policy.resolve(reference, column.semantic)
     return decisions
 
 
@@ -268,16 +277,43 @@ def _profile_columns(profile: Profile) -> Iterator[tuple[str, str, ColumnProfile
             yield from descendants(table.name, column.name, column)
 
 
-def _check_partial_relationship_drops(profile: Profile, decisions: dict[str, tuple[PiiRule, str]]) -> None:
-    dropped = {reference for reference, (rule, _) in decisions.items() if rule.action == PiiAction.DROP}
-    for relationship in profile.relationships or []:
-        linked = {
-            *(f"{relationship.child_table}.{column}" for column in relationship.child_columns),
-            *(f"{relationship.parent_table}.{column}" for column in relationship.parent_columns),
-        }
-        if dropped.intersection(linked) and not linked.issubset(dropped):
-            missing = sorted(linked - dropped)
-            raise ValueError(f"cannot drop only part of an FK-linked column set; also drop {missing}")
+def _domain_decisions(
+    profile: Profile,
+    domains: dict[str, str],
+    decisions: dict[str, tuple[PiiRule, str]],
+    policy: PiiPolicy,
+) -> dict[str, tuple[PiiRule, str]]:
+    """Makes one join-safe decision per substitution domain."""
+    by_domain: dict[str, list[str]] = {}
+    for reference, domain in domains.items():
+        if reference in decisions:
+            by_domain.setdefault(domain, []).append(reference)
+    rank = {
+        PiiAction.KEEP: 0,
+        PiiAction.GENERALIZE: 1,
+        PiiAction.SUBSTITUTE: 2,
+        PiiAction.SUPPRESS: 3,
+        PiiAction.DROP: 4,
+    }
+    resolved = dict(decisions)
+    for members in by_domain.values():
+        rules = {reference: decisions[reference] for reference in members}
+        explicit = [
+            reference
+            for reference, (_, source) in rules.items()
+            if source in {"column", "pii_class"}
+            or (source == "sensitivity" and "sensitivity" in policy.model_fields_set)
+        ]
+        if explicit and len({rule.model_dump_json() for rule, _ in rules.values()}) > 1:
+            descriptions = ", ".join(f"{reference}={rules[reference][0].action.value}" for reference in sorted(rules))
+            raise ValueError(f"conflicting explicit PII rules for linked columns: {descriptions}")
+        winner_reference = max(members, key=lambda reference: rank[rules[reference][0].action])
+        winner = rules[winner_reference]
+        domain = domains[winner_reference]
+        for reference, member_domain in domains.items():
+            if member_domain == domain:
+                resolved[reference] = winner
+    return resolved
 
 
 def _entity_columns(profile: Profile, table_name: str) -> list[str]:
