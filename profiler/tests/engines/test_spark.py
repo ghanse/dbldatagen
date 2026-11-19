@@ -155,6 +155,28 @@ def test_profiles_empty_table(spark: SparkSession) -> None:
     assert table.columns[0].distinct_count.value == 0
 
 
+def test_timestamp_fraction_is_canonical_six_digits(spark: SparkSession) -> None:
+    """Spark cast-to-string drops trailing zeros (5 digits here); the engine must pad to micros."""
+    frame = spark.sql(
+        """
+        SELECT
+          TIMESTAMP '2024-02-04 16:27:43.79144' AS ts,
+          TIMESTAMP_NTZ '2024-02-04 16:27:43.79144' AS ntz,
+          TIMESTAMP '2024-02-04 16:27:43' AS whole
+        """
+    )
+    columns = {column.name: column for column in profile_dataframe("fractions", frame).tables[0].columns}
+    assert columns["ts"].temporal is not None
+    assert columns["ntz"].temporal is not None
+    assert columns["whole"].temporal is not None
+    assert columns["ts"].temporal.min == "2024-02-04T16:27:43.791440Z"
+    assert columns["ts"].temporal.max == "2024-02-04T16:27:43.791440Z"
+    assert columns["ntz"].temporal.min == "2024-02-04T16:27:43.791440"
+    assert columns["ntz"].temporal.max == "2024-02-04T16:27:43.791440"
+    assert columns["whole"].temporal.min == "2024-02-04T16:27:43Z"
+    assert columns["whole"].temporal.max == "2024-02-04T16:27:43Z"
+
+
 def test_timestamp_extremes_are_utc_when_host_is_not(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
     try:
         with monkeypatch.context() as patch:

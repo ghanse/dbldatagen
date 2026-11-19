@@ -14,7 +14,7 @@ import math
 import re
 import zlib
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -27,9 +27,11 @@ from dbldatagen_profiler.model import (
     ComparisonConstraint,
     EnumerationConstraint,
     ExpressionConstraint,
+    LogicalType,
     Profile,
     RangeConstraint,
     TableProfile,
+    parse_temporal,
 )
 from profiler_bench.catalog.manifest import (
     Bound,
@@ -220,8 +222,9 @@ def _number(value: Bound | bool) -> float | None:
         pass
     try:
         if len(value) == 10:
-            return float(date.fromisoformat(value).toordinal())
-        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return float(parse_temporal(value, LogicalType.DATE).toordinal())
+        moment = parse_temporal(value, LogicalType.TIMESTAMP)
+        assert isinstance(moment, datetime)
         moment = moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
         return moment.timestamp() / 86_400
     except ValueError:

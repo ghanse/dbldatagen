@@ -32,6 +32,7 @@ from dbldatagen_profiler.model import (
     RangeConstraint,
     Relationship,
     TableProfile,
+    parse_temporal,
 )
 
 from .regex import UnsupportedRegex, generate_regex
@@ -1380,13 +1381,11 @@ def _literal(value: Any, column: ColumnProfile) -> Any:  # noqa: ANN401, PLR0911
         return float(value)
     if kind == LogicalType.DECIMAL:
         return Decimal(str(value))
-    if kind == LogicalType.DATE:
-        return date.fromisoformat(str(value))
-    if kind == LogicalType.TIME:
-        return time.fromisoformat(str(value))
-    if kind in (LogicalType.TIMESTAMP, LogicalType.TIMESTAMP_NTZ):
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return parsed if kind == LogicalType.TIMESTAMP else parsed.replace(tzinfo=None)
+    if kind in _TEMPORAL_TYPES:
+        parsed = parse_temporal(str(value), kind)
+        if kind == LogicalType.TIMESTAMP_NTZ and isinstance(parsed, datetime):
+            return parsed.replace(tzinfo=None)
+        return parsed
     return value
 
 

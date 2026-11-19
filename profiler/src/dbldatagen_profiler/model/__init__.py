@@ -43,7 +43,9 @@ from dbldatagen_profiler.model.profile import (
     TemporalStats,
     ValueFrequency,
     ValueTreatment,
+    canonicalize_iso_fraction,
     is_valid_literal,
+    parse_temporal,
 )
 
 
@@ -84,9 +86,11 @@ __all__ = [
     "TemporalStats",
     "ValueFrequency",
     "ValueTreatment",
+    "canonicalize_iso_fraction",
     "dump_profile",
     "is_valid_literal",
     "load_profile",
+    "parse_temporal",
     "profile_json_schema",
     "render_json_schema",
 ]
