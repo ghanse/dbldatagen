@@ -118,6 +118,14 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P3.3 | Calibrate data-volume targets T_d from the frozen baseline and run the first data-volume baseline | P1.8, P3.2 | todo |
 | P3.4 | Real public datasets via Databricks Marketplace / samples, exported with `genie exec` (replaces P1.3b) | P1.3 | exploring |
 
+### Phase 4 — Queued features (human request 2026-11-18; start after Phase 1 baseline, P2.3, P3.1, P3.2)
+
+| ID | Item | Depends on | Status |
+|----|------|------------|--------|
+| P4.1 | Profile subsets by criteria: random, stratified by key, temporal by date range/window, and LLM-prompted (natural-language criterion translated to a reviewed, deterministic filter/sample spec). Record the subset spec in profile source metadata | P3.2 (shares subset machinery) | queued |
+| P4.2 | Fit regex pattern(s) to fixed-length text columns: per-position character-class inference, multiple patterns with coverage, privacy-safe (dialect + k rules from P1.5). Enters RSI as an accuracy proposal | P1.8 | queued |
+| P4.3 | Variable-length text: privacy-safe summary in the profile (length dist, k-thresholded vocabulary/topics, PII masked) and a lightweight NLP generator in the sampler that produces like text; new fidelity metrics for text (spec 0.3) | P2.3, P1.8 | queued (design questions open) |
+
 ### Phase 2 — RSI iterations (Step 2)
 
 Candidate proposal areas (they enter the log as proposals when triaged):
