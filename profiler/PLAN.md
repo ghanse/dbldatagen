@@ -109,7 +109,9 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P2.1 | PII detection (spec 0.2.0 `semantic` + quasi-identifier sets) and keyed, format-preserving, join-consistent substitution of real data (contract: `.polly/contracts/p2-1-pii.md`) | P1.2 | merged (PR #13) |
 | P2.2 | Benchmark side: catalog PII ground truth for every PII class, detection precision/recall metric, substitution fidelity (stats + relational integrity preserved) and leakage metrics, sampler consumes `semantic.pii_class` | P1.5, P2.1 | todo |
 
-| P2.3 | Configurable PII handling policy: QIs substituted by default; per sensitivity / pii_class / column actions (substitute, generalize, suppress, drop, keep) (human decision 2026-11-18; contract `.polly/contracts/p2-3-pii-policy.md`) | P2.1 | in-progress |
+| P2.3 | Configurable PII handling policy: QIs substituted by default; per sensitivity / pii_class / column actions (substitute, generalize, suppress, drop, keep) (human decision 2026-11-18; contract `.polly/contracts/p2-3-pii-policy.md`) | P2.1 | merged (PR #21) |
+
+| P2.3a | PII policy follow-ups: clearer error for NaN/Inf in generic float substitution; document that generic int/decimal surrogates don't keep magnitude; capacity pre-check for small value spaces; replace the _protect_column argument shim by updating the streaming call site | P2.3, P3.1 | todo |
 
 ### Phase 3 — Streaming and data volume (human request 2026-11-18)
 
