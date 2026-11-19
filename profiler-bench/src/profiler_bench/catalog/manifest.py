@@ -39,7 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from dbldatagen_profiler.model import LogicalType, parse_temporal
 
 
-MANIFEST_VERSION = "0.2.0"
+MANIFEST_VERSION = "0.3.0"
 
 Fraction = Annotated[float, Field(ge=0.0, le=1.0)]
 Bound = int | float | str
@@ -554,6 +554,9 @@ class Manifest(_Model):
         manifest_version: Version of this schema.
         declared_values: Always `generating_parameters`: declared values are what the generator sampled
             from, not statistics of this instance (see `profiler_bench.catalog.realized`).
+        ground_truth: `planted` for generated datasets. `none` for real datasets: only the schema, row
+            counts, keys, foreign keys, and privacy classes are claims; every other column and table field
+            keeps its default and claims nothing, so structure scoring skips the dataset.
         dataset: Catalog dataset name.
         tier: Scale tier the data was generated at.
         structure_seed: Seed of the generating parameters and vocabularies. The manifest depends only on
@@ -566,6 +569,7 @@ class Manifest(_Model):
 
     manifest_version: str = MANIFEST_VERSION
     declared_values: Literal["generating_parameters"] = "generating_parameters"
+    ground_truth: Literal["planted", "none"] = "planted"
     dataset: str
     tier: str
     structure_seed: int

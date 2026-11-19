@@ -90,11 +90,47 @@ The fingerprint hashes the generator source, the shared catalog code, and the nu
 versions, so editing a generator or upgrading a library invalidates the cache. Logical hashes do not depend on the
 parquet writer, but a new numpy version may change the generated values and so the hashes.
 
+### Real datasets
+
+`profiler_bench.catalog.real_datasets` registers four real datasets (`REAL_DATASETS`). Each declares its source
+tables, the export SQL (`SELECT * FROM <source> ORDER BY <primary key>`, or `ORDER BY ALL` without one), the expected
+row counts, the schema, and the logical hash of every exported table, pinned after the first export. Data is
+never committed: it lives in the gitignored cache under `real/<dataset>/<tier>`.
+
+```bash
+export DATABRICKS_CONFIG_PROFILE=fevm-gh-ws-001 DATABRICKS_WAREHOUSE_ID=<warehouse id>
+python -m profiler_bench.catalog real --tier full   # export, check rows, schema, and pinned hashes
+python -m profiler_bench.catalog real               # tier s, derived from the cached export
+```
+
+`real.materialize(dataset, tier)` exports through the Statement Execution API (`EXTERNAL_LINKS`, `ARROW_STREAM`). It
+requests each chunk's link just before downloading the chunk and requests it again if it expired, so every chunk is
+fetched while its link is valid. Credentials come from `DATABRICKS_HOST` and `DATABRICKS_TOKEN`, or from
+`databricks auth token -p $DATABRICKS_CONFIG_PROFILE` (unset a stale `DATABRICKS_WORKSPACE_ID` if that fails).
+Without a warehouse or credentials, or offline, it raises `Unavailable` with the reason, and the command line prints
+`skipped <dataset>: <reason>`. A cached tier needs neither.
+
+| Tier | Contents |
+|---|---|
+| `full` | the export |
+| `s` | a table over 100,000 rows keeps the rows whose primary key (all non-nested columns without one) hashes below `100,000 / rows`; then, parents first, rows that reference a dropped parent through a declared foreign key are dropped |
+
+Real data has no planted truth. Its manifest is marked `ground_truth: none` and claims only the schema, row counts,
+documented primary, unique, and foreign keys that hold in the data, and privacy classes; it makes no distribution
+claims. `verify` checks just those. Structure scoring must skip these manifests. Reconstruction and privacy can still
+run, but each real dataset has one sample, so there is no independent holdout or ceiling (see COVERAGE.md).
+
+| Dataset | Source | Licence and terms |
+|---|---|---|
+| `tpcds_sf1` | `samples.tpcds_sf1`: `customer`, `customer_address`, `date_dim`, `item`, `store_sales`, `web_sales` | Internal use, no stated licence. TPC caveat: the data comes from the TPC-DS generator, and results measured on it are not TPC-DS benchmark results and must not be published as such (TPC fair-use policy) |
+| `wanderbricks` | `samples.wanderbricks`, all 16 tables | Internal use, no stated licence |
+| `nyctaxi_trips` | `samples.nyctaxi.trips` | Internal use, no stated licence |
+| `simulated_retail` | Marketplace listing *Simulated Retail Customer Data* (provider Databricks), installed in fevm-gh-ws-001 as catalog `simulated_retail_customer_data`; schema `v01`: `customers`, `sales`, `sales_orders` | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) under the [Marketplace consumer terms](https://cms.databricks.com/sites/default/files/2023-01/marketplace-consumer-terms_0.pdf). Attribution: "Simulated Retail Customer Data" by Databricks, Databricks Marketplace, CC BY 4.0 |
+
 ### Public datasets
 
-`profiler_bench.catalog.public` downloads a registered real dataset once, verifies its SHA-256, and returns None when
-the URL cannot be reached, so callers can skip it offline. Real datasets have no planted truth and carry no manifest.
-None are registered yet.
+`profiler_bench.catalog.public` downloads a dataset from a URL once, verifies its SHA-256, and returns None when the
+URL cannot be reached, so callers can skip it offline. None are registered.
 
 ## Fidelity metrics
 
@@ -381,3 +417,6 @@ Spark, and end-to-end dbldatagen generation from the profile (see `not_measured`
 make bench-test    # pytest profiler-bench/tests (m-tier tests are marked slow; add -m slow to run them)
 make bench-lint    # black, ruff, mypy
 ```
+
+Tests marked `network` export one tiny real table from a warehouse; they are skipped unless selected with
+`-m network` and skip themselves when no warehouse is configured.

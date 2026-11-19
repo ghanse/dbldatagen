@@ -41,9 +41,45 @@ Declared values are the generating parameters, not statistics of the sample. A p
 recovers what was planted, and the sample's own noise is part of what it sees. `realized(manifest, frames)` gives the
 sample statistics for metrics that need them.
 
+## Real datasets
+
+`python -m profiler_bench.catalog real` exports four real datasets (27 tables) from a Databricks SQL warehouse
+into the cache, at tiers `full` (the export) and `s` (a deterministic primary-key-hash subset of at most 100,000
+rows per table, closed under the declared foreign keys). Their manifests are `ground_truth: none`: they claim the
+schema, row counts, keys, foreign keys, and privacy classes, and nothing about distributions. Data is never
+committed.
+
+| Dataset | Licence | What it adds over the synthetic catalog |
+|---|---|---|
+| `tpcds_sf1` | internal use, no stated licence; TPC caveat: not publishable as TPC-DS results | Star schema with real fan-out skew (store_sales rows per item p99 347, per customer p99 79), composite keys, `decimal(7,2)` measures, about 4.5% null foreign keys in `store_sales`, customer quasi-identifiers (birth date and country, address, zip) |
+| `wanderbricks` | internal use, no stated licence | 16 tables with `struct` and `array<struct>` columns, emails, phones, and free text, skewed hosts-to-properties fan-out (p99 34, max 119), duplicated "id" columns, and orphaned child keys |
+| `nyctaxi_trips` | internal use, no stated licence | Heavy-tailed trip distances and fares, negative fares, zip quasi-identifiers |
+| `simulated_retail` | CC BY 4.0, Marketplace consumer terms; attribution "Simulated Retail Customer Data" by Databricks | Change-data-capture customer versions (`customer_id` repeats; the key is `(customer_id, valid_from)`), JSON held in strings (`ordered_products`, `clicked_items`, `promo_info`, `product`), tax ids and addresses |
+
+Privacy classes: `direct_identifier` for names, emails, phones, logins, tax ids, full addresses, and record ids
+(`c_customer_id`, `ca_address_id`); `quasi_identifier` for birth dates and countries, street parts, cities, zips,
+coordinates, `company_name`, and `users.country`; `free_text` for `reviews.comment`, `properties.description`, and
+`customer_support_logs.messages[].message`.
+
+Documented keys that do **not** hold, so they are not declared (measured on the full sources):
+
+| Table | Column | Finding |
+|---|---|---|
+| `wanderbricks.page_views` | `view_id` | 5,000 distinct values over 500,000 rows |
+| `wanderbricks.reviews` | `review_id` | 1,000 distinct over 99,793 rows |
+| `wanderbricks.payments` | `payment_id` | 45,173 distinct over 49,638 rows; 8 `booking_id` values have no booking |
+| `wanderbricks.booking_updates` | `booking_update_id` | 75,125 distinct over 83,068 rows; 47 `booking_id` values have no booking |
+| `simulated_retail.customers` | `customer_id` | 28,670 distinct over 28,813 rows (CDC versions), so `sales.customer_id` and `sales_orders.customer_id` reference no key |
+| `simulated_retail.sales_orders` | `order_number` | 4,000 distinct over 4,074 rows |
+
+Each real dataset has one sample, so reconstruction and privacy have no independent holdout or real-vs-real ceiling,
+and structure scoring has no planted truth to compare against. Wiring real datasets into the evaluator (skip
+structure when `ground_truth` is `none`; split a holdout) is not done yet.
+
 ## Not covered yet
 
-- Real public datasets. The download-and-checksum hook exists; no dataset is registered.
+- Real datasets in the evaluator: structure scoring does not yet skip `ground_truth: none`, and privacy has no
+  holdout for a real dataset.
 - Cross-table aggregate constraints, e.g. an order total equal to the sum of its lines.
 - Composite foreign keys, self-references (hierarchies), many-to-many bridge tables, and orphaned child keys
   (coverage below 1).

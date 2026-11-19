@@ -4,10 +4,13 @@ Each dataset is a seeded numpy/Arrow generator plus a manifest describing the st
 `load(name, tier, seed, spark)` materializes the dataset to a parquet cache and returns DataFrames;
 `verify(manifest, frames)` checks that the manifest is true of the data, and `realized(manifest, frames)`
 returns the statistics one instance actually has (manifests declare generating parameters).
+`real.materialize(REAL_DATASETS[name], tier)` exports a real dataset, whose manifest has `ground_truth: none`.
 """
 
 from profiler_bench.catalog.datasets import DATASETS
 from profiler_bench.catalog.manifest import Manifest
+from profiler_bench.catalog.real import RealDataset, RealTable, Unavailable
+from profiler_bench.catalog.real_datasets import REAL_DATASETS
 from profiler_bench.catalog.realized import Realized, realized, realized_statistics
 from profiler_bench.catalog.registry import DEFAULT_TIER, TIERS, Dataset, generate
 from profiler_bench.catalog.store import Materialized, cache_dir, get, load, materialize
@@ -17,11 +20,15 @@ from profiler_bench.catalog.verification import verify
 __all__ = [
     "DATASETS",
     "DEFAULT_TIER",
+    "REAL_DATASETS",
     "TIERS",
     "Dataset",
     "Manifest",
     "Materialized",
+    "RealDataset",
+    "RealTable",
     "Realized",
+    "Unavailable",
     "cache_dir",
     "generate",
     "get",
