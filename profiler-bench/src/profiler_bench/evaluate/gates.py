@@ -56,13 +56,23 @@ def evaluate_gates(
     run: dict[str, Any],
 ) -> dict[str, Any]:
     """Applies the frozen policy and returns a verdict with per-gate reasons."""
+    proposal_type = str(proposal.get("type", "accuracy"))
+    if proposal_type == "data_volume":
+        from profiler_bench.evaluate.data_volume import evaluate_data_volume_gates  # noqa: PLC0415
+
+        return evaluate_data_volume_gates(
+            fidelity_records=fidelity_records,
+            policy=policy,
+            proposal=proposal,
+            run=run,
+        )
+
     gates: list[GateResult] = []
     expected = expected_sample_keys(run)
     gates.append(_sample_completeness(speed_records, fidelity_records, expected))
     gates.append(_privacy_guard(fidelity_records, expected))
     gates.append(_control_guard(run))
 
-    proposal_type = str(proposal.get("type", "accuracy"))
     if proposal_type == "accuracy":
         gates.extend(_accuracy_gates(fidelity_records, policy))
     elif proposal_type == "speed":

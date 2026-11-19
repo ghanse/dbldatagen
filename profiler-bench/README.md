@@ -323,6 +323,54 @@ uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi evaluate
   profiler/rsi/experiments/demo
 ```
 
+### Data-volume objective
+
+`profiler-bench/policies/data_volume.json` freezes a second RSI objective: the least input fraction `n*` that still
+reaches a per-dataset accuracy target `T_d`. The harness, not the profiler, chooses the input. For each fraction
+`f` on the geometric grid `(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0)` and each subset seed, it
+builds a deterministic **FK-preserving uniform** subset: sample **every** table independently at `f` with a seeded
+hash of the primary key (or full row content when there is no PK), then take the **upward closure** under foreign
+keys (add every parent row referenced by a selected child, including composite keys, self-references, and cycles)
+until a fixpoint; method name `fk_preserving_uniform`. Closure truncates Spark lineage each iteration and is capped
+by policy `data_volume.max_closure_iterations` (default 64, recorded in `run.json`); exceeding the cap fails
+loudly. Realized per-table and overall input fractions are recorded alongside the grid `f` that indexes `n*`
+(gates stay on nominal `f`; `REPORT.md` / `benchmark_entry.json` show both). Every non-empty table keeps at least
+one row. The profiler sees only that subset and is not told the full row counts. Reconstruction is scored against
+the **full** real tables; before sampling, each profiled `row_count` is scaled by `full_rows / profile_rows` for
+that table (equivalent to calling the reference sampler with a per-table scale) so synthetic row counts match.
+Distinct counts, cardinality, FK fan-out, and extrema remain the profiler's job to extrapolate.
+
+`T_d` and the control noise width are frozen per dataset by `calibrate-targets` from a same-build control at
+`f = 1` (K × S seeds), with provenance (commit, harness hash, run id). Calibration refuses to write unless
+`run.control` is true, baseline/candidate `profiler_src_hash` match, the f=1 matrix is complete (every cell ok),
+and privacy passed on every f=1 record. `run --mode data-volume` refuses to start unless every selected dataset
+has both. Compute a proposed policy with:
+
+```bash
+uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi calibrate-targets \
+  --baseline profiler/rsi/experiments/<control-at-f1> \
+  --output /tmp/data_volume.proposed.json
+```
+
+Polly freezes the accepted file. The measured curve reports relative reconstruction at every grid fraction over
+`S` subset seeds and `K` sampler seeds; `n*_d` is the smallest fraction whose paired-bootstrap CI lower bound on
+the mean clears `T_d` minus the frozen control noise width. If no fraction reaches `T_d`, `n* = 1.0` and the
+dataset is flagged. A candidate privacy failure anywhere rejects; a baseline privacy failure is inconclusive
+(`baseline_privacy`). Completeness covers both builds. The `f = 1` reconstruction regression bound is loaded by
+reference from `default.json` (`accuracy.max_dataset_regression`), with that file's hash recorded on the gate.
+
+A `data_volume` proposal is accepted when the geometric mean of `n*` decreases by at least one grid step, at least
+one declared target improves by one grid step, no dataset's `n*` increases, reconstruction at `f = 1` does not
+regress beyond the default bound, candidate privacy passes, and every expected sample is present on both builds.
+Crossing intervals are inconclusive. Control runs are never accepted.
+
+```bash
+uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi run --mode data-volume \
+  --baseline /path/to/baseline --candidate /path/to/candidate \
+  --policy profiler-bench/policies/data_volume.json --experiment-id demo-dv \
+  [--datasets retail numeric] [--fractions 0.1 0.5 1.0] [--subset-seeds 1] [--fidelity-seeds 1] [--control]
+```
+
 **Measured:** driver wall / CPU / peak RSS for `profile_tables`; profile content hash; paired reconstruction,
 structure, and privacy scores. **Not measured:** Spark JVM/executor RSS, GPU time, network/disk IO, cluster-scale
 Spark, and end-to-end dbldatagen generation from the profile (see `not_measured` in the policy and each `REPORT.md`).
