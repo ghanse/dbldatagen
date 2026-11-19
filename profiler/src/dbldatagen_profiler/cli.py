@@ -52,6 +52,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Named input table; repeat for multiple tables.",
     )
     profile.add_argument("--format", choices=("parquet", "csv", "delta"), default="parquet", help="Input format.")
+    profile.add_argument("--policy", type=Path, help="PII handling policy YAML or JSON file.")
     profile.add_argument("-o", "--output", type=Path, required=True, help="Output profile JSON file.")
     profile.set_defaults(handler=_profile)
 
@@ -79,6 +80,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_input_arguments(substitute)
     substitute.add_argument("--profile", type=Path, required=True, help="Profile JSON file.")
     substitute.add_argument("--key-file", type=Path, required=True, help="File containing the substitution key.")
+    substitute.add_argument("--policy", type=Path, help="PII handling policy YAML or JSON file.")
     substitute.add_argument(
         "--allow-insecure-key-file",
         action="store_true",
@@ -86,6 +88,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     substitute.add_argument("-o", "--output", type=Path, required=True, help="Output directory.")
     substitute.set_defaults(handler=_pii_substitute)
+    policy = pii_commands.add_parser("policy", help="Print a PII handling policy.")
+    policy.add_argument("--default", action="store_true", required=True, help="Print the default policy as YAML.")
+    policy.set_defaults(handler=_pii_policy)
     return parser
 
 
@@ -130,6 +135,7 @@ def _profile(args: argparse.Namespace) -> int:
             raise ValueError("duplicate table name")
         SparkSession = import_module("pyspark.sql").SparkSession
         profile_tables = import_module("dbldatagen_profiler.engines.spark").profile_tables
+        load_policy = import_module("dbldatagen_profiler.pii").load_policy
         spark = (
             SparkSession.builder.master("local[*]")
             .appName("dbldatagen-profiler")
@@ -137,7 +143,8 @@ def _profile(args: argparse.Namespace) -> int:
             .getOrCreate()
         )
         tables = {name: spark.read.format(args.format).load(path) for name, path in inputs.items()}
-        profile = profile_tables(tables)
+        pii_policy = load_policy(args.policy) if args.policy else None
+        profile = profile_tables(tables, pii_policy=pii_policy)
         profile.source = SourceInfo(name=", ".join(inputs), format=args.format)
         load_profile(profile.model_dump(mode="json"), strict=True)
         args.output.write_text(dump_profile(profile) + "\n", encoding="utf-8")
@@ -226,13 +233,26 @@ def _pii_substitute(args: argparse.Namespace) -> int:
         _, tables = _spark_inputs(args)
         profile = load_profile(args.profile.read_text(encoding="utf-8"), strict=True)
         substitute = import_module("dbldatagen_profiler.pii").substitute
-        result = substitute(tables, profile, key=key)
+        load_policy = import_module("dbldatagen_profiler.pii").load_policy
+        policy = load_policy(args.policy) if args.policy else None
+        result = substitute(tables, profile, key=key, policy=policy)
         args.output.mkdir(parents=True, exist_ok=True)
         for name, frame in result.tables.items():
             frame.write.mode("error").parquet(str(args.output / name))
         (args.output / "report.json").write_text(json.dumps(result.report, indent=2) + "\n", encoding="utf-8")
     except (OSError, ValueError, RuntimeError) as error:
         print(f"dbldatagen-profile pii substitute: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _pii_policy(args: argparse.Namespace) -> int:
+    """Prints the default PII handling policy as YAML."""
+    policy_module = import_module("dbldatagen_profiler.pii")
+    try:
+        sys.stdout.write(policy_module.PiiPolicy().to_yaml())
+    except ValueError as error:
+        print(f"dbldatagen-profile pii policy: {error}", file=sys.stderr)
         return 1
     return 0
 

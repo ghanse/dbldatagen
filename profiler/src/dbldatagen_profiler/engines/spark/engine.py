@@ -33,6 +33,7 @@ from dbldatagen_profiler.model import (
     canonicalize_iso_fraction,
 )
 from dbldatagen_profiler.pii.detect import analyze_table
+from dbldatagen_profiler.pii.policy import PiiAction, PiiPolicy
 
 
 # Spark session is forced to UTC; date_format emits a fixed microsecond fraction so Python
@@ -54,7 +55,11 @@ _TEMPORAL_TYPES = (T.DateType, T.TimestampType)
 
 
 def profile_tables(
-    tables: Mapping[str, DataFrame], *, privacy: PrivacyPolicy | None = None, detect_pii: bool = True
+    tables: Mapping[str, DataFrame],
+    *,
+    privacy: PrivacyPolicy | None = None,
+    detect_pii: bool = True,
+    pii_policy: PiiPolicy | None = None,
 ) -> Profile:
     """Profiles named Spark DataFrames.
 
@@ -71,6 +76,9 @@ def profile_tables(
     """
     if not tables:
         raise ValueError("at least one table is required")
+    if pii_policy is not None:
+        references = {f"{table}.{path}" for table, frame in tables.items() for path in _schema_paths(frame.schema)}
+        pii_policy.validate_columns(references)
     policy = privacy or PrivacyPolicy()
     with _utc_session_time_zones(tables.values()):
         analyses = {name: analyze_table(frame) for name, frame in tables.items()} if detect_pii else {}
@@ -79,13 +87,20 @@ def profile_tables(
             created_at=datetime.now(timezone.utc),
             engine=EngineInfo(name="pyspark", version=pyspark.__version__),
             privacy=policy,
-            tables=[_profile_table(name, frame, policy, analyses.get(name)) for name, frame in tables.items()],
+            tables=[
+                _profile_table(name, frame, policy, analyses.get(name), pii_policy) for name, frame in tables.items()
+            ],
         )
         return Profile.model_validate(result.model_dump(), context={"strict": True})
 
 
 def profile_dataframe(
-    name: str, df: DataFrame, *, privacy: PrivacyPolicy | None = None, detect_pii: bool = True
+    name: str,
+    df: DataFrame,
+    *,
+    privacy: PrivacyPolicy | None = None,
+    detect_pii: bool = True,
+    pii_policy: PiiPolicy | None = None,
 ) -> Profile:
     """Profiles one Spark DataFrame.
 
@@ -98,7 +113,7 @@ def profile_dataframe(
     Returns:
         A validated single-table profile.
     """
-    return profile_tables({name: df}, privacy=privacy, detect_pii=detect_pii)
+    return profile_tables({name: df}, privacy=privacy, detect_pii=detect_pii, pii_policy=pii_policy)
 
 
 def _profile_table(
@@ -106,6 +121,7 @@ def _profile_table(
     df: DataFrame,
     privacy: PrivacyPolicy,
     analysis: tuple[dict[str, Any], list[tuple[list[str], float, int]]] | None,
+    pii_policy: PiiPolicy | None,
 ) -> TableProfile:
     semantics, quasi_sets = analysis or ({}, [])
     expressions: list[Column] = [F.count(F.lit(1)).alias("__row_count")]
@@ -117,30 +133,83 @@ def _profile_table(
         _column_from_aggregate(field, values, index, row_count, privacy, nested=False, df=df)
         for index, field in enumerate(df.schema.fields)
     ]
-    protected = [_protect_column(column, column.name, semantics) for column in columns]
+    protected = [_protect_column(column, name, column.name, semantics, pii_policy) for column in columns]
     quasi = [
         QuasiIdentifierSet(columns=names, unique_fraction=unique, k_anonymity=k) for names, unique, k in quasi_sets
     ]
     return TableProfile(name=name, row_count=row_count, columns=protected, quasi_identifier_sets=quasi or None)
 
 
-def _protect_column(column: ColumnProfile, path: str, semantics: Mapping[str, Any]) -> ColumnProfile:
+def _protect_column(
+    column: ColumnProfile,
+    table: str,
+    path: str | Mapping[str, Any],
+    semantics: Mapping[str, Any] | None = None,
+    pii_policy: PiiPolicy | None = None,
+) -> ColumnProfile:
+    if isinstance(path, Mapping):
+        semantics, path, table = path, table, ""
+    if semantics is None:
+        raise ValueError("PII semantics mapping is required")
     updates: dict[str, Any] = {}
     semantic = semantics.get(path)
+    reference = f"{table}.{path}" if table else path
+    rule = (
+        pii_policy.resolve(reference, semantic)[0]
+        if pii_policy is not None and semantic is not None
+        else (pii_policy.columns.get(reference) if pii_policy is not None else None)
+    )
     if semantic is not None:
         updates["semantic"] = semantic
-        if semantic.sensitivity.value in {"direct_identifier", "secret"}:
-            if column.numeric is not None:
-                updates["numeric"] = column.numeric.model_copy(
-                    update={"min": None, "max": None, "quantiles": None, "histogram": None}
-                )
-            if column.temporal is not None:
-                updates["temporal"] = column.temporal.model_copy(update={"min": None, "max": None, "quantiles": None})
-            if column.string is not None:
-                updates["string"] = column.string.model_copy(update={"top_values": None})
+        low_confidence = (
+            pii_policy is not None
+            and semantic.confidence < pii_policy.min_confidence
+            and not pii_policy.has_override(reference, semantic)
+        )
+        if (
+            pii_policy is not None
+            and semantic.sensitivity.value in {"direct_identifier", "secret"}
+            and rule is not None
+            and rule.action == PiiAction.KEEP
+        ):
+            raise ValueError(f"PII policy cannot loosen the spec 0.2.0 privacy floor for {reference!r}")
+        protect = semantic.sensitivity.value in {"direct_identifier", "secret"} or (
+            rule is not None and not low_confidence and rule.action != PiiAction.KEEP
+        )
+    else:
+        protect = rule is not None and rule.action != PiiAction.KEEP
+    if protect:
+        if column.numeric is not None:
+            updates["numeric"] = column.numeric.model_copy(
+                update={"min": None, "max": None, "quantiles": None, "histogram": None}
+            )
+        if column.temporal is not None:
+            updates["temporal"] = column.temporal.model_copy(update={"min": None, "max": None, "quantiles": None})
+        if column.string is not None:
+            updates["string"] = column.string.model_copy(update={"top_values": None})
     if column.children is not None:
-        updates["children"] = [_protect_column(child, f"{path}.{child.name}", semantics) for child in column.children]
+        updates["children"] = [
+            _protect_column(child, table, f"{path}.{child.name}", semantics, pii_policy) for child in column.children
+        ]
     return column.model_copy(update=updates) if updates else column
+
+
+def _schema_paths(schema: T.StructType) -> Iterator[str]:
+    """Yields top-level and nested profile paths from a Spark schema."""
+
+    def descendants(path: str, data_type: T.DataType) -> Iterator[str]:
+        yield path
+        if isinstance(data_type, T.StructType):
+            for field in data_type.fields:
+                yield from descendants(f"{path}.{field.name}", field.dataType)
+        elif isinstance(data_type, T.ArrayType):
+            yield from descendants(f"{path}.element", data_type.elementType)
+        elif isinstance(data_type, T.MapType):
+            yield from descendants(f"{path}.key", data_type.keyType)
+            yield from descendants(f"{path}.value", data_type.valueType)
+
+    for field in schema.fields:
+        yield from descendants(field.name, field.dataType)
 
 
 @contextmanager

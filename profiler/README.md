@@ -193,12 +193,60 @@ Detection and keyed substitution can also run independently:
 ```bash
 dbldatagen-profile pii detect --table customers=customers.parquet -o semantic.json
 dbldatagen-profile pii substitute --table customers=customers.parquet \
-  --profile profile.json --key-file key.bin -o shareable
+  --profile profile.json --key-file key.bin --policy policy.yaml -o shareable
 ```
 
 Substitution uses HMAC-SHA256 domains. Relationship-linked columns share a domain, preserving equality and joins;
-nulls and empty strings are unchanged. Quasi-identifiers remain unchanged unless explicitly generalized through the
-Python API. Email domains are replaced by default because they may identify a group.
+nulls and empty strings are unchanged. Email domains are replaced by default because they may identify a group.
+
+The default PII policy substitutes every sensitivity, including quasi-identifiers. Postal codes, cities, and other
+categorical quasi-identifiers receive keyed surrogates that preserve equality, frequencies, distinct counts, and
+joins. Dates of birth use an entity-keyed date shift. This keeps those statistical properties, but discards the
+original geography and ordering semantics; choose `generalize` or `keep` when those semantics are required. Print the
+default policy with `dbldatagen-profile pii policy --default`.
+
+Date-of-birth surrogates changed from the previous release: the entity-keyed shift now excludes zero, so a substituted
+DOB is always changed when `date_shift_days` is positive.
+
+Policies are JSON or YAML mappings. A fully-qualified column rule (including nested paths) wins over a PII-class rule,
+which wins over a sensitivity rule. The default `min_confidence` is 0.25, so name-only detections are substituted.
+Direct identifiers and secrets are never skipped for low confidence. Other detections below the configured threshold
+are reported as `skipped_low_confidence` and left unchanged unless a class or column override names them. Linked FK
+columns use one action for the whole substitution domain (`drop` > `suppress` > `substitute` > `generalize` > `keep`);
+conflicting explicit rules are rejected. One explicit `keep` in an FK group is therefore overridden by a stricter
+action elsewhere in that group. Available actions are `substitute`, `generalize`, `suppress`, `drop`, and `keep`.
+Generalization parameters include `prefix_length`, `date_granularity` (`month` or `year`), and `bucket_width`. For
+example:
+
+```yaml
+min_confidence: 0.25
+sensitivity:
+  direct_identifier: {action: substitute}
+  quasi_identifier: {action: substitute}
+  secret: {action: substitute}
+  free_text: {action: substitute}
+pii_class:
+  postal_code:
+    action: generalize
+    parameters: {prefix_length: 3}
+columns:
+  customers.notes: {action: suppress}
+  customers.unclassified_contact: {action: substitute, pii_class: email}
+```
+
+A fully-qualified column rule also applies when detection found no semantic class. For `substitute`, an optional
+`pii_class` selects class-specific formatting. Without it, substitution uses a generic opaque keyed surrogate while
+preserving numeric, decimal, date, and timestamp types. This behavior also applies to nested fields. Generic boolean
+substitution is rejected because two values cannot be replaced injectively while preserving the boolean type; choose
+`suppress` instead.
+
+The same file can be passed to `dbldatagen-profile profile --policy policy.yaml`. At profile time, policy rules may
+only remove or coarsen emitted information. They cannot weaken the spec 0.2.0 floor for direct identifiers and
+secrets; a conflicting `keep` rule is rejected. Profile-time `generalize` and `drop` strip sensitive statistics just
+like `suppress`; they do not change the source schema or calculate generalized statistics.
+
+JSON policy files always work. YAML policy files and `pii policy --default` require the optional
+`dbldatagen-profiler[yaml]` extra.
 
 Format preservation also preserves value length, so length remains visible. HMAC substitution of low-entropy values
 such as SSNs and phone numbers is safe only while the key remains secret: keep the key under restricted custody and
