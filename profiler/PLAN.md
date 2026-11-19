@@ -147,6 +147,7 @@ Candidate proposal areas (they enter the log as proposals when triaged):
 - Dependence: pairwise Spearman / Cramér's V / correlation ratio; Gaussian copula; conditional distributions for categorical pairs
 - Temporal: seasonality, monotonic / sequential columns, inter-arrival distributions
 - Nested types (struct / array / map) and semi-structured strings (JSON)
+- Speed (top): nested at tier m OOMs 10/10 under the frozen 2g/local[2] speed config (dies in collectToPython); tier-m comparisons exclude nested until fixed
 - Speed: nested tier-s profiling takes 371 s for 110k rows (one Spark job per nested child + 200-col wide table + PII xxhash sample); top speed candidate
 - Speed: batch nested-child aggregates into one Spark job (baseline runs one job per nested child; found in P1.2 review)
 - Speed: sampling strategies, single-pass aggregation, approximate sketches, Rust engine parity and performance
