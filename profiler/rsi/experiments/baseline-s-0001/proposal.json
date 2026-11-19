@@ -1,0 +1,11 @@
+{
+  "targets": [
+    "retail",
+    "numeric",
+    "strings",
+    "temporal",
+    "nested",
+    "edge"
+  ],
+  "type": "accuracy"
+}
