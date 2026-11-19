@@ -71,6 +71,8 @@ Design rules:
 5. **Accept / reject** — the evaluator applies the frozen policy; a different-vendor reviewer checks the diff. Logged `disposition`.
    Rejected patches are retained in `rsi/experiments/<id>/`. The human merges accepted PRs.
 
+Phase 4 features P4.2 and P4.3 enter as RSI proposals and merge only through the accuracy gate (human decision 2026-11-18).
+
 ## Work items
 
 Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiting human merge) · `merged` · `blocked`
@@ -122,9 +124,9 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 
 | ID | Item | Depends on | Status |
 |----|------|------------|--------|
-| P4.1 | Profile subsets by criteria: random, stratified by key, temporal by date range/window, and LLM-prompted (natural-language criterion translated to a reviewed, deterministic filter/sample spec). Record the subset spec in profile source metadata | P3.2 (shares subset machinery) | queued |
+| P4.1 | Profile subsets by criteria: random, stratified by key, temporal by date range/window, and LLM-prompted (natural-language criterion translated to a reviewed, deterministic filter/sample spec; LLM is a pluggable interface, none shipped by default). Record the subset spec in profile source metadata | P3.2 (shares subset machinery) | queued |
 | P4.2 | Fit regex pattern(s) to fixed-length text columns: per-position character-class inference, multiple patterns with coverage, privacy-safe (dialect + k rules from P1.5). Enters RSI as an accuracy proposal | P1.8 | queued |
-| P4.3 | Variable-length text: privacy-safe summary in the profile (length dist, k-thresholded vocabulary/topics, PII masked) and a lightweight NLP generator in the sampler that produces like text; new fidelity metrics for text (spec 0.3) | P2.3, P1.8 | queued (design questions open) |
+| P4.3 | Variable-length text: a small local model fit to PII-masked real text, shipped in the profile, and used by the sampler to generate like text (human decision). Required guards: memorization metric (long-n-gram overlap with real text vs a holdout baseline), canary-insertion test, k-threshold on vocabulary, PII masking before fitting, model size cap; privacy guard fails the proposal if any trip. New text fidelity metrics; spec 0.3 | P2.3, P1.8 | queued |
 
 ### Phase 2 — RSI iterations (Step 2)
 
