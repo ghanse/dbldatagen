@@ -324,7 +324,12 @@ def profile_states(
 def _table_profile(name: str, state: TableState, policy: PrivacyPolicy, analysis: PiiAnalysis | None) -> TableProfile:
     semantics, quasi_sets = analysis or ({}, [])
     columns = [
-        _protect_column(_column_profile(f, column, policy, nested=False), f.name, semantics)
+        _protect_column(
+            _column_profile(f, column, policy, nested=False),
+            table="",
+            path=f.name,
+            semantics=semantics,
+        )
         for f, column in zip(state.schema.fields, state.columns, strict=True)
     ]
     quasi = [QuasiIdentifierSet(columns=cols, unique_fraction=unique, k_anonymity=k) for cols, unique, k in quasi_sets]

@@ -133,7 +133,10 @@ def _profile_table(
         _column_from_aggregate(field, values, index, row_count, privacy, nested=False, df=df)
         for index, field in enumerate(df.schema.fields)
     ]
-    protected = [_protect_column(column, name, column.name, semantics, pii_policy) for column in columns]
+    protected = [
+        _protect_column(column, table=name, path=column.name, semantics=semantics, pii_policy=pii_policy)
+        for column in columns
+    ]
     quasi = [
         QuasiIdentifierSet(columns=names, unique_fraction=unique, k_anonymity=k) for names, unique, k in quasi_sets
     ]
@@ -142,15 +145,12 @@ def _profile_table(
 
 def _protect_column(
     column: ColumnProfile,
+    *,
     table: str,
-    path: str | Mapping[str, Any],
-    semantics: Mapping[str, Any] | None = None,
+    path: str,
+    semantics: Mapping[str, Any],
     pii_policy: PiiPolicy | None = None,
 ) -> ColumnProfile:
-    if isinstance(path, Mapping):
-        semantics, path, table = path, table, ""
-    if semantics is None:
-        raise ValueError("PII semantics mapping is required")
     updates: dict[str, Any] = {}
     semantic = semantics.get(path)
     reference = f"{table}.{path}" if table else path
@@ -189,7 +189,14 @@ def _protect_column(
             updates["string"] = column.string.model_copy(update={"top_values": None})
     if column.children is not None:
         updates["children"] = [
-            _protect_column(child, table, f"{path}.{child.name}", semantics, pii_policy) for child in column.children
+            _protect_column(
+                child,
+                table=table,
+                path=f"{path}.{child.name}",
+                semantics=semantics,
+                pii_policy=pii_policy,
+            )
+            for child in column.children
         ]
     return column.model_copy(update=updates) if updates else column
 
