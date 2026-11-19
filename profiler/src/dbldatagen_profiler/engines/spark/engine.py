@@ -141,11 +141,19 @@ def _profile_table(
 
 
 def _protect_column(
-    column: ColumnProfile, table: str, path: str, semantics: Mapping[str, Any], pii_policy: PiiPolicy | None
+    column: ColumnProfile,
+    table: str,
+    path: str | Mapping[str, Any],
+    semantics: Mapping[str, Any] | None = None,
+    pii_policy: PiiPolicy | None = None,
 ) -> ColumnProfile:
+    if isinstance(path, Mapping):
+        semantics, path, table = path, table, ""
+    if semantics is None:
+        raise ValueError("PII semantics mapping is required")
     updates: dict[str, Any] = {}
     semantic = semantics.get(path)
-    reference = f"{table}.{path}"
+    reference = f"{table}.{path}" if table else path
     rule = (
         pii_policy.resolve(reference, semantic)[0]
         if pii_policy is not None and semantic is not None
