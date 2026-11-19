@@ -136,6 +136,13 @@ A profile contains:
 - `relationships`: foreign keys from child columns to parent columns, with coverage, confidence, and fan-out. Fan-out
   counts child rows for every parent key, including keys with none; child keys that match no parent are left out and
   show up in `coverage` instead.
+- `dependencies`: the Spark engine computes Pearson correlation for at most 64 top-level numeric/temporal pairs in
+  the existing per-table aggregate. Pairs are selected deterministically by increasing distance in schema order, then
+  by the left column's schema position, so adjacent columns are considered first and a 200-column table does not
+  generate every possible pair. A dependency requires at least three paired finite values and a finite correlation.
+  Numeric values are converted to doubles; dates to UTC epoch days; timestamps, timestamp-without-time-zone, and times
+  to UTC epoch seconds. The profile contains only the aggregate coefficient and column names, never source values or
+  row samples.
 - `semantic`: optional PII class, sensitivity, confidence, and value-free detection evidence. Tables may also record
   sampled pairs and triples that behave as quasi-identifiers.
 

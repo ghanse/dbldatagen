@@ -10,7 +10,7 @@ from pyspark.sql import Row, SparkSession
 from pyspark.sql import types as T
 
 from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
-from dbldatagen_profiler.engines.spark.engine import _logical_type
+from dbldatagen_profiler.engines.spark.engine import _logical_type, _pearson_pairs
 from dbldatagen_profiler.model import LogicalType, PrivacyPolicy, ValueTreatment, profile_json_schema
 
 
@@ -145,6 +145,57 @@ def test_profiles_flat_statistics(spark: SparkSession) -> None:
     assert flag.boolean.true_fraction == 0.5
     assert columns["all_null"].numeric.model_dump(exclude_none=True) == {}
     assert columns["constant"].numeric.stddev == 0.0
+
+
+def test_profiles_pearson_dependencies_for_numeric_and_temporal_pairs(spark: SparkSession) -> None:
+    rows = [
+        (
+            float(value),
+            value * 2.0,
+            date(2026, 1, value),
+            datetime(2026, 1, value, tzinfo=timezone.utc),
+        )
+        for value in range(1, 5)
+    ]
+    table = profile_dataframe(
+        "dependencies",
+        spark.createDataFrame(rows, "x double, y double, day date, moment timestamp"),
+        detect_pii=False,
+    ).tables[0]
+
+    assert table.dependencies is not None
+    actual = {(dependency.columns, dependency.method.value): dependency.value for dependency in table.dependencies}
+    assert actual[(("x", "y"), "pearson")] == pytest.approx(1.0)
+    assert actual[(("day", "moment"), "pearson")] == pytest.approx(1.0)
+
+
+def test_pearson_dependencies_require_three_finite_paired_values(spark: SparkSession) -> None:
+    frame = spark.createDataFrame(
+        [(1.0, 2.0), (2.0, 4.0), (float("inf"), 6.0), (float("nan"), 8.0), (None, 10.0)],
+        "x double, y double",
+    )
+
+    table = profile_dataframe("private", frame, detect_pii=False).tables[0]
+
+    assert table.dependencies is None
+    assert "dependencies" not in table.model_dump(mode="json", exclude_none=True)
+
+
+def test_pearson_pair_selection_is_deterministic_and_bounded_for_wide_tables(spark: SparkSession) -> None:
+    frame = spark.createDataFrame(
+        [tuple(float(value) for value in range(200))],
+        ", ".join(f"c{index:03d} double" for index in range(200)),
+    )
+
+    pairs = _pearson_pairs(frame)
+
+    assert len(pairs) == 64
+    assert [(left, right) for left, right, _, _ in pairs[:3]] == [
+        ("c000", "c001"),
+        ("c001", "c002"),
+        ("c002", "c003"),
+    ]
+    assert (pairs[-1][0], pairs[-1][1]) == ("c063", "c064")
 
 
 def test_profiles_empty_table(spark: SparkSession) -> None:
