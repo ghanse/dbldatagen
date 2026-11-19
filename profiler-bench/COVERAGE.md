@@ -43,7 +43,7 @@ sample statistics for metrics that need them.
 
 ## Real datasets
 
-`python -m profiler_bench.catalog real` exports four real datasets (27 tables) from a Databricks SQL warehouse
+`python -m profiler_bench.catalog real` exports four real datasets (26 tables) from a Databricks SQL warehouse
 into the cache, at tiers `full` (the export) and `s` (a deterministic primary-key-hash subset of at most 100,000
 rows per table, closed under the declared foreign keys). Their manifests are `ground_truth: none`: they claim the
 schema, row counts, keys, foreign keys, and privacy classes, and nothing about distributions. Data is never
