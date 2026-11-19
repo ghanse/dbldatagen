@@ -93,7 +93,7 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P1.4d | Follow-ups from P1.4c review: tests should use calibrated mu/sigma for endpoint mass and discrete moments in property test | P1.4c | todo |
 | P1.7 | RSI log tooling: append-only `log.jsonl` writer/validator + `LOG.md` renderer; `rsi/RSI.md` | P1.1 | merged (PR #4) |
 | P1.7a | Fix: `rsi_log.py append --kind` flag is dropped; add CLI-flag tests | P1.7 | merged (PR #5) |
-| P1.8 | Baseline run: freeze the harness, record the baseline + ceiling for every dataset | P1.2–P1.7 | in-progress |
+| P1.8 | Baseline run: freeze the harness, record the baseline + ceiling for every dataset | P1.2–P1.7 | in-progress (re-run) |
 | P1.2a | Fix: baseline engine overflows on `avg`/`stddev` of decimal(38,x) under ANSI mode (found by P1.5 at tier s) | P1.2 | merged (PR #11) |
 | P1.3c | Investigate retail real-vs-real ceiling 0.94 (order_items 0.86): suspected catalog Zipf parent ranking varying by sample seed | P1.3, P1.5 | todo |
 | P1.3b | Register real public datasets in the catalog (download + checksum hook exists; none registered) — needs a decision on which datasets are reachable through the proxy | P1.3 | todo |
@@ -112,7 +112,7 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P2.3 | Configurable PII handling policy: QIs substituted by default; per sensitivity / pii_class / column actions (substitute, generalize, suppress, drop, keep) (human decision 2026-11-18; contract `.polly/contracts/p2-3-pii-policy.md`) | P2.1 | merged (PR #21) |
 
 | P2.3a | PII policy follow-ups part 1: FK full-drop with undetected side, DOB shift on original entity keys, NaN/Inf error, small-space capacity pre-check, docs | P2.3 | merged (PR #23) |
-| P2.3b | PII follow-ups: hidden entity-key column names must be checked case-insensitively (substitute.py ~L376-379; silent user-column loss); replace the _protect_column argument shim by updating the streaming call site | P2.3a, P3.1 | todo |
+| P2.3b | PII follow-ups: hidden entity-key column names must be checked case-insensitively (substitute.py ~L376-379; silent user-column loss); replace the _protect_column argument shim by updating the streaming call site | P2.3a, P3.1 | merged (PR #24) |
 
 ### Phase 3 — Streaming and data volume (human request 2026-11-18)
 
@@ -120,7 +120,7 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 |----|------|------------|--------|
 | P3.1 | Incremental profiling with Spark Structured Streaming: mergeable per-batch states, restart-safe checkpoints, snapshots equal to batch on exact stats (contract `.polly/contracts/p3-1-streaming.md`) | P1.2 | merged (PR #20) |
 | P3.1a | Streaming follow-ups: wire pii_policy after P2.3; replace private imports from engines/spark and pii/detect with public helpers; cloud/DBFS checkpoint paths; avoid raw warmup rows on disk (encrypt or non-raw form) | P3.1, P2.3 | todo |
-| P3.2 | Data-volume RSI objective: least input fraction reaching a frozen accuracy target per dataset; harness-controlled FK-preserving subsets; new policy `data_volume.json` (contract `.polly/contracts/p3-2-data-volume.md`) | P1.6a, P1.8 | in-progress |
+| P3.2 | Data-volume RSI objective: least input fraction reaching a frozen accuracy target per dataset; harness-controlled FK-preserving subsets; new policy `data_volume.json` (contract `.polly/contracts/p3-2-data-volume.md`) | P1.6a, P1.8 | merged (PR #22) |
 | P3.3 | Calibrate data-volume targets T_d from the frozen baseline and run the first data-volume baseline | P1.8, P3.2 | todo |
 | P3.4 | Real public datasets via Databricks samples / Marketplace, exported with `genie exec` (Statement Execution API, ARROW_STREAM, chunked) into the gitignored cache, never committed. Shortlist: samples.tpcds_sf1, samples.wanderbricks, Marketplace 'Simulated Retail Customer Data' (nested), TPC-H regenerated locally, samples.nyctaxi.trips. Blocked: CLI login expired for fevm-gh-ws-001 | P1.3 | blocked (auth) |
 
