@@ -14,6 +14,7 @@ relative standard error of `DISTINCT_RELATIVE_ERROR`.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -64,11 +65,11 @@ PII_SAMPLE_ROWS = 10_000
 ENGINE_NAME = "pyspark-streaming"
 
 PiiAnalysis = tuple[dict[str, Semantic], list[tuple[list[str], float, int]]]
-SampleEntry = tuple[int, tuple[str, ...], Row]
+SampleKey = tuple[int | str, ...]
+SampleEntry = tuple[SampleKey, Row]
 
 _VALUE = "__profile_value"
 _ROW = "__profile_row"
-_HASH = "__profile_hash"
 
 
 @dataclass(frozen=True)
@@ -173,8 +174,9 @@ class TableState:
         schema: Spark schema of the table.
         row_count: Number of rows.
         columns: Column states in schema order.
-        sample: Bounded PII detection sample: the `sample_size` rows with the smallest `(xxhash64, values)` key,
-            which is the same sample the batch engine draws.
+        sample: Bounded PII detection sample: the first `sample_size` rows in source order, with their sort keys.
+            Source order is given by the order columns of `state_for_dataframe`, then the batch engine's
+            `(xxhash64, values)` sampling key.
         sample_size: Maximum sample size.
     """
 
@@ -202,8 +204,27 @@ def _empty_column(data_type: T.DataType) -> ColumnState:
     return ColumnState(children=tuple(_empty_column(t) for t in _child_types(data_type)))
 
 
+def require_streaming_support(version: str | None = None) -> None:
+    """Checks that PySpark has the HyperLogLog sketch functions the streaming engine needs.
+
+    Args:
+        version: PySpark version to check (default: the installed version).
+
+    Raises:
+        RuntimeError: If PySpark is older than 3.5.
+    """
+    found = version or pyspark.__version__
+    major, minor = (int(part) for part in re.findall(r"\d+", found)[:2])
+    if (major, minor) < (3, 5):
+        raise RuntimeError(f"StreamingProfiler requires pyspark >= 3.5; found {found}")
+
+
 def state_for_dataframe(
-    df: DataFrame, *, sample_size: int = PII_SAMPLE_ROWS, collect_sample: bool = True
+    df: DataFrame,
+    *,
+    sample_size: int = PII_SAMPLE_ROWS,
+    collect_sample: bool = True,
+    order_columns: Sequence[str] = (),
 ) -> TableState:
     """Computes the state of a DataFrame, profiled as one micro-batch.
 
@@ -211,14 +232,20 @@ def state_for_dataframe(
         df: Batch DataFrame to profile.
         sample_size: Maximum PII sample size.
         collect_sample: Whether to collect the PII detection sample (default true).
+        order_columns: Columns of `df` that give the source order of rows for the PII sample. They are not profiled.
 
     Returns:
-        The table state of every row in `df`.
+        The table state of every row in `df` except the order columns.
+
+    Raises:
+        RuntimeError: If PySpark is older than 3.5.
     """
+    require_streaming_support()
+    profiled = df.drop(*order_columns)
     with _utc_session_time_zones([df]):
-        row_count, columns = _aggregate(df, [(df[f.name], f.dataType) for f in df.schema.fields])
-        sample = _sample(df, sample_size) if collect_sample else ()
-    return TableState(df.schema, row_count, tuple(columns), sample, sample_size)
+        row_count, columns = _aggregate(profiled, [(profiled[f.name], f.dataType) for f in profiled.schema.fields])
+        sample = _sample(df, profiled.schema, order_columns, sample_size) if collect_sample else ()
+    return TableState(profiled.schema, row_count, tuple(columns), sample, sample_size)
 
 
 def merge_states(left: TableState, right: TableState, *, spark: SparkSession | None = None) -> TableState:
@@ -242,12 +269,12 @@ def merge_states(left: TableState, right: TableState, *, spark: SparkSession | N
     pairs = [pair for a, b in zip(left.columns, right.columns, strict=True) for pair in _sketch_pairs(a, b)]
     unions = iter(_union_sketches(pairs, spark or SparkSession.active()))
     columns = tuple(_merge_column(a, b, unions) for a, b in zip(left.columns, right.columns, strict=True))
-    sample = tuple(sorted((*left.sample, *right.sample), key=_sample_key)[: left.sample_size])
+    sample = tuple(sorted((*left.sample, *right.sample), key=lambda entry: entry[0])[: left.sample_size])
     return TableState(left.schema, left.row_count + right.row_count, columns, sample, left.sample_size)
 
 
 def analyze_sample(state: TableState, spark: SparkSession | None = None) -> PiiAnalysis:
-    """Detects semantics and quasi-identifiers from a state's PII sample, as the batch engine does from its sample.
+    """Detects semantics and quasi-identifiers from a state's PII sample with the batch engine's rules.
 
     Args:
         state: Table state.
@@ -257,7 +284,7 @@ def analyze_sample(state: TableState, spark: SparkSession | None = None) -> PiiA
         Semantics keyed by column path, and quasi-identifier sets.
     """
     frame = (spark or SparkSession.active()).createDataFrame([], state.schema)
-    rows = [row for _, _, row in state.sample]
+    rows = [row for _, row in state.sample]
     semantics = _detect_rows(frame, rows)
     return semantics, _find_quasi_identifier_sets(frame, semantics, rows)
 
@@ -558,28 +585,44 @@ def _extreme(left: _Ordered | None, right: _Ordered | None, *, largest: bool) ->
     return choose(left, right)
 
 
-def _sample(df: DataFrame, sample_size: int) -> tuple[SampleEntry, ...]:
-    """Returns the rows of `df` with the smallest batch-engine sampling key, with their keys."""
-    if not df.schema.fields:
+def _sample(
+    df: DataFrame, schema: T.StructType, order_columns: Sequence[str], sample_size: int
+) -> tuple[SampleEntry, ...]:
+    """Returns the first rows of `df` in source order, with their keys.
+
+    Values of types the checkpoint cannot store (intervals other than day-time, variant, spatial, null) are sampled
+    as null.
+    """
+    if not schema.fields:
         return ()
-    texts = [F.coalesce(F.col(f.name).cast("string"), F.lit("\u0000")) for f in df.schema.fields]
-    names = [f"__profile_key{index}" for index in range(len(texts))]
-    order = F.xxhash64(F.lit(0), *texts)
+    texts = [F.coalesce(F.col(f.name).cast("string"), F.lit("\u0000")) for f in schema.fields]
+    keys = [F.col(name) for name in order_columns] + [F.xxhash64(F.lit(0), *texts), *texts]
+    names = [f"__profile_key{index}" for index in range(len(keys))]
+    values = [F.col(f.name) if sampleable(f.dataType) else F.lit(None).cast(f.dataType) for f in schema.fields]
     rows = (
         df.select(
-            F.struct(*(F.col(f.name) for f in df.schema.fields)).alias(_ROW),
-            order.alias(_HASH),
-            *(t.alias(n) for t, n in zip(texts, names, strict=True)),
+            F.struct(*(v.alias(f.name) for v, f in zip(values, schema.fields, strict=True))).alias(_ROW),
+            *(k.alias(n) for k, n in zip(keys, names, strict=True)),
         )
-        .orderBy(_HASH, *names)
+        .orderBy(*names)
         .limit(sample_size)
         .collect()
     )
-    return tuple((row[_HASH], tuple(row[n] for n in names), row[_ROW]) for row in rows)
+    return tuple((tuple(row[n] for n in names), row[_ROW]) for row in rows)
 
 
-def _sample_key(entry: SampleEntry) -> tuple[int, tuple[str, ...]]:
-    return entry[0], entry[1]
+def sampleable(data_type: T.DataType) -> bool:
+    """Returns whether values of a type can be held in the PII sample of a checkpoint."""
+    if isinstance(data_type, T.StructType):
+        return all(sampleable(f.dataType) for f in data_type.fields)
+    if isinstance(data_type, T.ArrayType):
+        return sampleable(data_type.elementType)
+    if isinstance(data_type, T.MapType):
+        return sampleable(data_type.keyType) and sampleable(data_type.valueType)
+    return isinstance(
+        data_type,
+        (T.BooleanType, *_NUMERIC_TYPES, *_string_types(), T.BinaryType, *_temporal_types(), T.DayTimeIntervalType),
+    )
 
 
 def _child_types(data_type: T.DataType) -> list[T.DataType]:

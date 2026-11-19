@@ -74,23 +74,37 @@ uv run --package dbldatagen-profiler --all-extras dbldatagen-profile stream \
 
 With an interval trigger the command runs until interrupted and rewrites `profile.json` every 10 seconds.
 
+The streaming engine requires pyspark 3.5 or later (for Spark's `hll_sketch_agg`); `StreamingProfiler` and
+`dbldatagen-profile stream` fail with a clear error on older versions. The batch engine still supports pyspark 3.4.1.
+
 A snapshot equals the batch profile of the same rows on these statistics: row count, null fraction, nested
 `value_count`, numeric and temporal min/max (lossless for decimal and int64), string and collection length
-min/max/mean, boolean true fraction, PII semantics, and quasi-identifier sets (before the PII warmup freezes them).
-Numeric mean/stddev and collection length stddev are merged in floating point (Chan et al.) and match to rounding
-error. Distinct counts come from Spark's built-in HyperLogLog sketch (`hll_sketch_agg`, lgConfigK 12) and are marked
-`exact: false`; the relative standard error is 1.04/√4096 ≈ 1.6%, so about 99.7% of estimates are within 4.9%.
-`hll_sketch_agg` needs Spark 3.5 or later.
+min/max/mean, and boolean true fraction. Numeric mean/stddev and collection length stddev are merged in floating
+point (Chan et al.) and match to rounding error. Distinct counts come from Spark's built-in HyperLogLog sketch
+(Apache DataSketches HLL, lgConfigK 12) and are marked `exact: false`. Merging sketches is order-independent, so
+the estimate does not depend on how rows are split into batches. DataSketches documents the relative standard error
+of a merged HLL sketch as about 1.04/√K with K = 2^lgConfigK, which is 1.63% at lgConfigK 12 (`DISTINCT_RELATIVE_ERROR`).
+The tests check estimates over 200,000 distinct values against three times that error.
 
-State is written atomically to `<checkpoint>/<table>/state.pkl` after every batch, keyed by batch id; Spark's own
-checkpoint is `<checkpoint>/<table>/spark`. A batch that Spark replays after a crash is skipped if its id is already
-in the state, so restarts neither double-count nor lose batches. The checkpoint must be on a local filesystem.
+State is written atomically, as versioned JSON, to `<checkpoint>/<table>/state.json` after every batch, with the set
+of merged batch ids; the file and its directory are fsynced. Spark's own checkpoint is `<checkpoint>/<table>/spark`.
+A batch whose id is already merged (a replay after a crash) is skipped, so restarts neither double-count nor lose
+batches, in whatever order batches arrive. Loading a checkpoint never executes code; a tampered file or an unknown
+version fails with a clear error. In the file, sketches are base64, int64, decimal, and exact length totals are
+decimal strings, and floats are `float.hex` strings. The checkpoint must be on a local filesystem.
 
-PII detection uses the batch engine's deterministic sample (the 10,000 rows with the smallest xxhash64 key), kept
-across batches. Once a table has seen `pii_warmup_rows` rows (default 10,000) the detection result is frozen, so later
-batches do not change semantic labels, and the sample is dropped from the checkpoint. Until then the checkpoint
-holds those raw sample rows; keep the checkpoint directory as private as the source data. Snapshots follow the same
-privacy rules as batch profiles. A PII handling policy (`pii_policy`) is not supported yet.
+PII detection runs on the first `pii_warmup_rows` rows (default 10,000) in source order. Once a table has seen that
+many rows the detection result is frozen, so later batches do not change semantic labels, and the raw rows are
+dropped from the checkpoint. For file sources, source order is (file modification time, file path, row position in
+the file). That is the order in which Spark's file source takes files, so the frozen labels do not depend on how
+files are split into micro-batches. Row position is the Parquet row index; for JSON, rows within a file are ordered
+by the batch engine's xxhash64 sampling key. For other sources rows are ordered by that sampling key alone, which is
+deterministic for a given set of rows, but which rows have arrived by the time the warmup is reached depends on the
+source. When a table has no more rows than the warmup, the sample is every row, as in the batch engine, so semantics
+and quasi-identifier sets equal the batch profile's. Until the warmup ends the checkpoint holds those raw rows as
+JSON; keep the checkpoint directory as private as the source data. Values of interval (other than day-time),
+variant, and spatial types are not kept in the sample. Snapshots follow the same privacy rules as batch profiles. A
+PII handling policy (`pii_policy`) is not supported yet.
 
 ## The profile spec
 

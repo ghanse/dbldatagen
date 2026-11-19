@@ -3,12 +3,14 @@
 import json
 import math
 import os
-from datetime import date, datetime, timezone
+import stat
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import jsonschema
+import pyspark
 import pytest
 from pyspark.errors import StreamingQueryException
 from pyspark.sql import DataFrame, SparkSession
@@ -26,9 +28,17 @@ from dbldatagen_profiler.engines.streaming import (
     profile_states,
     state_for_dataframe,
 )
+from dbldatagen_profiler.engines.streaming import checkpoint as checkpoint_module
 from dbldatagen_profiler.engines.streaming import profiler as profiler_module
-from dbldatagen_profiler.engines.streaming.profiler import PII_WARMUP_ROWS
-from dbldatagen_profiler.engines.streaming.state import analyze_sample
+from dbldatagen_profiler.engines.streaming.checkpoint import (
+    Checkpoint,
+    add_batch,
+    decode_checkpoint,
+    encode_checkpoint,
+    read_checkpoint,
+)
+from dbldatagen_profiler.engines.streaming.profiler import PII_WARMUP_ROWS, STATE_FILE
+from dbldatagen_profiler.engines.streaming.state import ColumnState, analyze_sample
 from dbldatagen_profiler.model import (
     PiiClass,
     PrivacyPolicy,
@@ -70,17 +80,24 @@ def _rows(count: int = 150) -> list[tuple[Any, ...]]:
     ]
 
 
-def _write_splits(df: DataFrame, path: Path, splits: int) -> None:
-    """Writes `df` as `splits` parquet files whose modification times follow the split order."""
-    for split in range(splits):
+def _write_files(frames: list[DataFrame], path: Path) -> None:
+    """Writes each frame as one parquet file, with modification times in list order after any existing files."""
+    offset = len(list(path.glob("*.parquet"))) if path.exists() else 0
+    for index, frame in enumerate(frames):
         before = set(path.glob("*.parquet")) if path.exists() else set()
-        df.where(F.col("id") % splits == split).coalesce(1).write.mode("append").parquet(str(path))
+        frame.coalesce(1).write.mode("append").parquet(str(path))
+        moment = 1_700_000_000 + offset + index
         for file in set(path.glob("*.parquet")) - before:
-            os.utime(file, (1_700_000_000 + split, 1_700_000_000 + split))
+            os.utime(file, (moment, moment))
 
 
-def _stream(spark: SparkSession, path: Path, schema: T.StructType) -> DataFrame:
-    return spark.readStream.schema(schema).option("maxFilesPerTrigger", 1).parquet(str(path))
+def _write_splits(df: DataFrame, path: Path, splits: int) -> None:
+    """Writes `df` as `splits` parquet files, interleaving rows by id."""
+    _write_files([df.where(F.col("id") % splits == split) for split in range(splits)], path)
+
+
+def _stream(spark: SparkSession, path: Path, schema: T.StructType, max_files: int = 1) -> DataFrame:
+    return spark.readStream.schema(schema).option("maxFilesPerTrigger", max_files).parquet(str(path))
 
 
 def _run(
@@ -90,9 +107,10 @@ def _run(
     *,
     privacy: PrivacyPolicy | None = None,
     pii_warmup_rows: int = PII_WARMUP_ROWS,
+    max_files: int = 1,
 ) -> Profile:
     profiler = StreamingProfiler(
-        {"t": _stream(spark, path, spark.read.parquet(str(path)).schema)},
+        {"t": _stream(spark, path, spark.read.parquet(str(path)).schema, max_files)},
         checkpoint_dir=checkpoint,
         privacy=privacy,
         pii_warmup_rows=pii_warmup_rows,
@@ -136,12 +154,25 @@ def _assert_equivalent(batch: object, stream: object, path: str = "") -> None:
         assert batch == stream, path
 
 
-@pytest.mark.parametrize("splits", [1, 3, 10])
-def test_stream_matches_batch_profile(spark: SparkSession, tmp_path: Path, splits: int) -> None:
+def _distinct_counts(data: object) -> list[object]:
+    if isinstance(data, dict):
+        own = [data["distinct_count"]] if "distinct_count" in data else []
+        return own + [
+            count for key, value in data.items() if key != "distinct_count" for count in _distinct_counts(value)
+        ]
+    if isinstance(data, list):
+        return [count for item in data for count in _distinct_counts(item)]
+    return []
+
+
+@pytest.mark.parametrize("max_files", [10, 4, 1])
+def test_stream_matches_batch_profile(spark: SparkSession, tmp_path: Path, max_files: int) -> None:
     source = tmp_path / "source"
-    _write_splits(spark.createDataFrame(_rows(), SCHEMA), source, splits)
+    _write_splits(spark.createDataFrame(_rows(), SCHEMA), source, 10)
     batch = profile_dataframe("t", spark.read.parquet(str(source)))
-    stream = _run(spark, source, tmp_path / "checkpoint")
+    stream = _run(spark, source, tmp_path / "checkpoint", max_files=max_files)
+    checkpoint = read_checkpoint(tmp_path / "checkpoint" / "t" / STATE_FILE)
+    assert checkpoint.batches == ((0, math.ceil(10 / max_files) - 1),)
     _assert_equivalent(_comparable(batch), _comparable(stream))
     columns = {column.name: column for column in stream.tables[0].columns}
     assert stream.tables[0].row_count == 150
@@ -165,9 +196,30 @@ def test_merge_is_associative_and_commutative(spark: SparkSession) -> None:
         merge_states(c, merge_states(b, a)),
         merge_states(empty_state(df.schema), merge_states(b, merge_states(c, a))),
     ):
-        _assert_equivalent(reference, snapshot(state))
-        assert snapshot(state)["tables"][0]["columns"][4]["distinct_count"] == {"value": 150, "exact": False}
-    assert [entry[:2] for entry in merge_states(a, b).sample] == [entry[:2] for entry in merge_states(b, a).sample]
+        candidate = snapshot(state)
+        _assert_equivalent(reference, candidate)
+        assert _distinct_counts(candidate) == _distinct_counts(reference)
+    assert [key for key, _ in merge_states(a, b).sample] == [key for key, _ in merge_states(b, a).sample]
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_distinct_estimates_are_within_the_sketch_bound(spark: SparkSession, seed: int) -> None:
+    values = spark.range(200_000).select(
+        F.xxhash64(F.col("id"), F.lit(seed)).alias("hashed"),
+        F.concat(F.lit("v"), F.col("id").cast("string"), F.lit(seed)).alias("text"),
+    )
+    parts = [
+        state_for_dataframe(values.where(F.pmod(F.col("hashed"), F.lit(3)) == k), collect_sample=False)
+        for k in range(3)
+    ]
+    merged = merge_states(merge_states(parts[0], parts[1]), parts[2])
+    exact = values.agg(F.countDistinct("hashed"), F.countDistinct("text")).first()
+    assert exact is not None
+    for column, truth in zip(merged.columns, exact, strict=True):
+        assert truth > 199_000
+        assert abs(column.distinct - truth) <= 3 * DISTINCT_RELATIVE_ERROR * truth
+    other_order = merge_states(parts[2], merge_states(parts[1], parts[0]))
+    assert [column.distinct for column in other_order.columns] == [column.distinct for column in merged.columns]
 
 
 @pytest.mark.parametrize("persisted", [False, True])
@@ -177,17 +229,17 @@ def test_restart_after_crash_gives_same_profile(
     source = tmp_path / "source"
     _write_splits(spark.createDataFrame(_rows(60), SCHEMA), source, 3)
     expected = _run(spark, source, tmp_path / "reference")
-    write = profiler_module._write_checkpoint
+    write = profiler_module.write_checkpoint
 
-    def crash(directory: Path, checkpoint: profiler_module.Checkpoint) -> None:
+    def crash(path: Path, checkpoint: Checkpoint) -> None:
         if persisted:
-            write(directory, checkpoint)
-        if checkpoint.batch_id == 1:
+            write(path, checkpoint)
+        if checkpoint.batches[-1][1] == 1:
             raise RuntimeError("simulated crash")
         if not persisted:
-            write(directory, checkpoint)
+            write(path, checkpoint)
 
-    monkeypatch.setattr(profiler_module, "_write_checkpoint", crash)
+    monkeypatch.setattr(profiler_module, "write_checkpoint", crash)
     with pytest.raises(StreamingQueryException):
         _run(spark, source, tmp_path / "checkpoint")
     monkeypatch.undo()
@@ -210,19 +262,196 @@ def test_mid_stream_snapshots_validate_against_json_schema(spark: SparkSession, 
     assert [snapshot.tables[0].row_count for snapshot in (empty, first, final)] == [0, 50, 150]
 
 
+def _contacts(spark: SparkSession, path: Path) -> None:
+    """Writes 10 files of 20 rows: 100 email rows, then 100 rows of words."""
+    rows = [(i, f"person{i}@example.com" if i < 100 else f"hello world {i % 5}") for i in range(200)]
+    df = spark.createDataFrame(rows, "id int, contact string")
+    _write_files([df.where((F.col("id") >= start) & (F.col("id") < start + 20)) for start in range(0, 200, 20)], path)
+
+
 def test_pii_labels_freeze_after_warmup(spark: SparkSession, tmp_path: Path) -> None:
     source = tmp_path / "source"
-    emails = [(i, f"person{i}@example.com") for i in range(30)]
-    words = [(i, f"hello world {i % 5}") for i in range(30, 130)]
-    df = spark.createDataFrame(emails + words, "id int, contact string")
-    _write_splits(df.withColumn("id", F.when(F.col("id") < 30, 0).otherwise(1)), source, 2)
-    frozen = _run(spark, source, tmp_path / "frozen", pii_warmup_rows=20)
+    _contacts(spark, source)
+    frozen = _run(spark, source, tmp_path / "frozen", pii_warmup_rows=100)
     unfrozen = _run(spark, source, tmp_path / "unfrozen")
     frozen_label, unfrozen_label = (profile.tables[0].columns[1].semantic for profile in (frozen, unfrozen))
     assert frozen_label is not None and frozen_label.pii_class == PiiClass.EMAIL
     assert unfrozen_label is None
-    assert frozen.tables[0].row_count == unfrozen.tables[0].row_count == 130
-    assert not (tmp_path / "frozen" / "t" / "state.pkl").read_bytes().count(b"person0@example.com")
+    assert frozen.tables[0].row_count == unfrozen.tables[0].row_count == 200
+    text = (tmp_path / "frozen" / "t" / STATE_FILE).read_text(encoding="utf-8")
+    assert "person0@example.com" not in text
+    assert json.loads(text)["sample"] == []
+
+
+def test_frozen_pii_labels_do_not_depend_on_batch_boundaries(spark: SparkSession, tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _contacts(spark, source)
+    frozen = []
+    for max_files in (10, 4, 1):
+        directory = tmp_path / f"checkpoint{max_files}"
+        _run(spark, source, directory, pii_warmup_rows=110, max_files=max_files)
+        frozen.append(json.loads((directory / "t" / STATE_FILE).read_text(encoding="utf-8"))["pii"])
+    assert frozen[0] is not None
+    assert frozen[0]["semantics"]["contact"]["pii_class"] == "email"
+    assert frozen[0]["semantics"]["contact"]["evidence"][-1]["match_rate"] == pytest.approx(100 / 110)
+    assert frozen[1] == frozen[0]
+    assert frozen[2] == frozen[0]
+
+
+def test_batch_ids_are_merged_once_in_any_order(spark: SparkSession, tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_splits(spark.createDataFrame(_rows(30), SCHEMA), source, 1)
+    schema = spark.read.parquet(str(source)).schema
+    df = spark.createDataFrame(_rows(30), SCHEMA)
+    profiler = StreamingProfiler({"t": _stream(spark, source, schema)}, checkpoint_dir=tmp_path / "c")
+    for batch_id, part in ((2, "id < 10"), (0, "id >= 10 and id < 20"), (5, "id >= 20"), (2, "id < 10")):
+        profiler._process("t", df.where(part), batch_id)
+    assert profiler.profile().tables[0].row_count == 30
+    assert read_checkpoint(tmp_path / "c" / "t" / STATE_FILE).batches == ((0, 0), (2, 2), (5, 5))
+    profiler._process("t", df.where("id < 0"), 1)
+    restarted = StreamingProfiler({"t": _stream(spark, source, schema)}, checkpoint_dir=tmp_path / "c")
+    restarted._process("t", df.where("id >= 20"), 5)
+    restarted._process("t", df.where("id < 10"), 1)
+    assert restarted.profile().tables[0].row_count == 30
+    assert read_checkpoint(tmp_path / "c" / "t" / STATE_FILE).batches == ((0, 2), (5, 5))
+
+
+def test_add_batch_joins_ranges() -> None:
+    assert add_batch((), 3) == ((3, 3),)
+    assert add_batch(((0, 1), (3, 3)), 2) == ((0, 3),)
+    assert add_batch(((0, 1),), 5) == ((0, 1), (5, 5))
+    assert add_batch(((0, 4),), 2) == ((0, 4),)
+
+
+def test_streaming_requires_pyspark_3_5(spark: SparkSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "source"
+    _write_splits(spark.createDataFrame([(1, "a")], "id int, label string"), source, 1)
+    stream = _stream(spark, source, spark.read.parquet(str(source)).schema)
+    monkeypatch.setattr(pyspark, "__version__", "3.4.1")
+    with pytest.raises(RuntimeError, match=r"StreamingProfiler requires pyspark >= 3.5; found 3.4.1"):
+        StreamingProfiler({"t": stream}, checkpoint_dir=tmp_path / "c")
+    with pytest.raises(RuntimeError, match=r"found 3\.4\.1"):
+        state_for_dataframe(spark.read.parquet(str(source)))
+    assert profile_dataframe("t", spark.read.parquet(str(source))).tables[0].row_count == 1
+
+
+def test_checkpoint_write_syncs_directory(spark: SparkSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    synced: list[bool] = []
+    real_fsync = os.fsync
+
+    def record(descriptor: int) -> None:
+        synced.append(stat.S_ISDIR(os.fstat(descriptor).st_mode))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(checkpoint_module.os, "fsync", record)
+    state = empty_state(spark.createDataFrame([], "id int").schema)
+    checkpoint_module.write_checkpoint(tmp_path / "t" / STATE_FILE, Checkpoint(((0, 0),), state))
+    assert synced == [False, True]
+    assert not (tmp_path / "t" / f"{STATE_FILE}.tmp").exists()
+
+
+def test_checkpoint_json_round_trips(spark: SparkSession) -> None:
+    schema = SCHEMA + ", bin binary, ntz timestamp_ntz, span interval day to second, f float"
+    rows = [
+        (*row, bytes([i % 7, 0]), datetime(2022, 2, 2, 1, 2, 3, i), timedelta(days=i, microseconds=7), float("nan"))
+        for i, row in enumerate(_rows(25))
+    ]
+    state = state_for_dataframe(spark.createDataFrame(rows, schema))
+    analysis = analyze_sample(state)
+    data = json.loads(json.dumps(encode_checkpoint(Checkpoint(((0, 4),), state, analysis))))
+    decoded = decode_checkpoint(data)
+    assert decoded.batches == ((0, 4),) and decoded.pii == analysis
+    assert decoded.state.schema == state.schema and len(decoded.state.sample) == 25
+    assert [key for key, _ in decoded.state.sample] == [key for key, _ in state.sample]
+    assert [row[:-1] for _, row in decoded.state.sample] == [row[:-1] for _, row in state.sample]
+    assert encode_checkpoint(decoded) == data
+    float_column = decoded.state.columns[-1]
+    assert isinstance(float_column, ColumnState) and math.isnan(float_column.max)
+    assert decoded.state.columns[:-1] == state.columns[:-1]
+    assert data["columns"][1]["min"] == str(-(2**63)) and data["columns"][2]["max"] == str(DECIMAL38_MAX)
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("{not json", "not valid JSON"),
+        ('{"version": 99}', "unsupported version 99"),
+        ("[1, 2]", "unsupported version None"),
+        ('{"version": 1, "batches": []}', "is invalid"),
+        ("__import__('os').system('touch pwned')", "not valid JSON"),
+    ],
+)
+def test_tampered_checkpoint_fails_cleanly(tmp_path: Path, content: str, message: str) -> None:
+    path = tmp_path / STATE_FILE
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        read_checkpoint(path)
+
+
+def test_tampered_checkpoint_values_fail_cleanly(spark: SparkSession, tmp_path: Path) -> None:
+    state = state_for_dataframe(spark.createDataFrame(_rows(5), SCHEMA))
+    data = encode_checkpoint(Checkpoint(((0, 0),), state))
+    for tamper in (
+        lambda d: d["columns"][0].update(count="5"),
+        lambda d: d["columns"][4].update(sketch="!!!"),
+        lambda d: d["columns"][1].update(min=12),
+        lambda d: d["columns"].pop(),
+        lambda d: d["sample"][0]["row"].update(dt="not a date"),
+        lambda d: d.update(schema={"type": "struct"}),
+    ):
+        copy = json.loads(json.dumps(data))
+        tamper(copy)
+        path = tmp_path / STATE_FILE
+        path.write_text(json.dumps(copy), encoding="utf-8")
+        with pytest.raises(ValueError, match="is invalid"):
+            read_checkpoint(path)
+
+
+def test_snapshot_below_min_value_count_has_no_protected_literals(spark: SparkSession) -> None:
+    df = spark.createDataFrame([("gold", 1), ("gold", 2), ("silver", 3)], "tier string, n int")
+    profile = profile_states({"t": state_for_dataframe(df)}, pii={})
+    table = profile.tables[0]
+    assert table.row_count < profile.privacy.min_value_count
+    assert table.check_constraints is None
+    for column in table.columns:
+        assert column.string is None or (column.string.top_values is None and column.string.patterns is None)
+    load_profile(profile.model_dump(mode="json"), strict=True)
+
+
+def test_empty_batches_and_all_null_columns_match_batch(spark: SparkSession, tmp_path: Path) -> None:
+    schema = "id int, n long, d double, s string, b boolean, ts timestamp, arr array<int>, st struct<x:int>"
+    df = spark.createDataFrame([(i, None, None, None, None, None, None, None) for i in range(12)], schema)
+    states = [state_for_dataframe(df.where("id < 0")), state_for_dataframe(df), state_for_dataframe(df.where("id < 0"))]
+    merged = merge_states(merge_states(states[0], states[1]), states[2])
+    stream = profile_states({"t": merged}, pii={"t": analyze_sample(merged)})
+    _assert_equivalent(_comparable(profile_dataframe("t", df)), _comparable(stream))
+    empty = profile_states({"t": states[0]}, pii={"t": analyze_sample(states[0])})
+    _assert_equivalent(_comparable(profile_dataframe("t", df.where("id < 0"))), _comparable(empty))
+    source = tmp_path / "source"
+    _write_splits(df, source, 1)
+    profiler = StreamingProfiler(
+        {"t": _stream(spark, source, spark.read.parquet(str(source)).schema)}, checkpoint_dir=tmp_path / "c"
+    )
+    profiler._process("t", spark.read.parquet(str(source)).where("id < 0"), 0)
+    assert profiler.profile().tables[0].row_count == 0
+    profiler._process("t", spark.read.parquet(str(source)), 1)
+    assert profiler.profile().tables[0].columns[1].null_fraction == 1.0
+
+
+def test_stream_matches_batch_in_non_utc_session(spark: SparkSession, tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_splits(spark.createDataFrame(_rows(40), SCHEMA), source, 2)
+    previous = spark.conf.get("spark.sql.session.timeZone")
+    spark.conf.set("spark.sql.session.timeZone", "America/Los_Angeles")
+    try:
+        stream = _run(spark, source, tmp_path / "checkpoint")
+        batch = profile_dataframe("t", spark.read.parquet(str(source)))
+        assert spark.conf.get("spark.sql.session.timeZone") == "America/Los_Angeles"
+    finally:
+        spark.conf.set("spark.sql.session.timeZone", previous or "UTC")
+    _assert_equivalent(_comparable(batch), _comparable(stream))
+    ts = next(column for column in stream.tables[0].columns if column.name == "ts")
+    assert ts.temporal is not None and ts.temporal.min == "2021-01-01T00:00:00Z"
 
 
 def test_snapshot_follows_suppressed_extremes(spark: SparkSession, tmp_path: Path) -> None:

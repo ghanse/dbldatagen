@@ -55,7 +55,9 @@ def _build_parser() -> argparse.ArgumentParser:
     profile.add_argument("-o", "--output", type=Path, required=True, help="Output profile JSON file.")
     profile.set_defaults(handler=_profile)
 
-    stream = commands.add_parser("stream", help="Profile file sources incrementally with Spark Structured Streaming.")
+    stream = commands.add_parser(
+        "stream", help="Profile file sources incrementally with Spark Structured Streaming (requires pyspark >= 3.5)."
+    )
     stream.add_argument("--table", action="append", required=True, metavar="NAME=PATH", help="Named input table.")
     stream.add_argument("--format", choices=("parquet", "delta", "json"), default="parquet", help="Input format.")
     stream.add_argument("--checkpoint", type=Path, required=True, help="Checkpoint directory.")
@@ -166,7 +168,7 @@ def _stream(args: argparse.Namespace) -> int:
         except KeyboardInterrupt:
             profiler.stop()
         _write_snapshot(profiler.profile(), args)
-    except (OSError, ValueError, spark_errors.PySparkException, py4j_errors.Py4JError) as error:
+    except (OSError, ValueError, RuntimeError, spark_errors.PySparkException, py4j_errors.Py4JError) as error:
         print(f"dbldatagen-profile stream: {error}", file=sys.stderr)
         return 1
     finally:
