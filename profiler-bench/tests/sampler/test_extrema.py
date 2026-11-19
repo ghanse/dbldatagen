@@ -16,6 +16,7 @@ from scipy import stats
 from dbldatagen_profiler.engines.spark import profile_tables
 from dbldatagen_profiler.model import (
     ColumnProfile,
+    DistinctCount,
     Histogram,
     LogicalType,
     NumericStats,
@@ -33,6 +34,7 @@ from profiler_bench.sampler.core import (
     _exact_number,
     _exact_truncated_normal,
     _standard_normal_cdf,
+    _standardized_bounds,
     _truncated_moments,
     _truncated_moments_exact,
     _truncated_normal,
@@ -56,7 +58,7 @@ def test_truncated_normal_continuous_avoids_exact_extrema(spark: SparkSession) -
 
 
 def test_truncated_normal_integer_endpoint_mass_matches_model(spark: SparkSession) -> None:
-    """Integer endpoints stay reachable, but only at truncated-normal rounded tail mass."""
+    """Integer endpoints stay reachable, but only at half-bin truncated-normal tail mass."""
     stats = NumericStats(min=0, max=12, mean=4.0, stddev=2.0)
     rows = (
         sample(
@@ -70,14 +72,78 @@ def test_truncated_normal_integer_endpoint_mass_matches_model(spark: SparkSessio
     values = np.asarray([row.x for row in rows], dtype=int)
     mean = float(stats.mean)
     stddev = float(stats.stddev)
-    fa = _standard_normal_cdf((0.0 - mean) / stddev)
-    fb = _standard_normal_cdf((12.0 - mean) / stddev)
+    # Continuous model on [min - 0.5, max + 0.5]; k gets P(k - 0.5 <= X < k + 0.5).
+    fa = _standard_normal_cdf((-0.5 - mean) / stddev)
+    fb = _standard_normal_cdf((12.5 - mean) / stddev)
     expected_min = (_standard_normal_cdf((0.5 - mean) / stddev) - fa) / (fb - fa)
     expected_max = (fb - _standard_normal_cdf((11.5 - mean) / stddev)) / (fb - fa)
 
     assert float(np.mean(values == 0)) == pytest.approx(expected_min, abs=0.01)
     assert float(np.mean(values == 12)) == pytest.approx(expected_max, abs=0.005)
     assert float(np.mean(values == 0)) < 0.05
+
+
+def test_poisson_like_integer_max_mass_matches_half_bin_tail(spark: SparkSession) -> None:
+    """Poisson-like ints (λ=4, observed max=14) keep exact-max share near modeled half-bin mass."""
+    stats = NumericStats(min=0, max=14, mean=4.0, stddev=2.0)
+    rows = (
+        sample(
+            profile(TableProfile(name="t", row_count=80_000, columns=[column("x", LogicalType.INT32, numeric=stats)])),
+            spark,
+            seed=19,
+        )
+        .tables["t"]
+        .collect()
+    )
+    values = np.asarray([row.x for row in rows], dtype=int)
+    mean = float(stats.mean)
+    stddev = float(stats.stddev)
+    fa = _standard_normal_cdf((-0.5 - mean) / stddev)
+    fb = _standard_normal_cdf((14.5 - mean) / stddev)
+    modeled_max = (fb - _standard_normal_cdf((13.5 - mean) / stddev)) / (fb - fa)
+    observed_max = float(np.mean(values == 14))
+
+    assert modeled_max < 0.001
+    assert observed_max < 0.001
+    assert observed_max == pytest.approx(modeled_max, rel=1.0, abs=1e-6)
+
+
+def test_integer_distinct_count_does_not_inflate_endpoint_mass(spark: SparkSession) -> None:
+    """Cardinality pooling must not promote a rare integer max to ~1/distinct_count mass."""
+    stats = NumericStats(min=1, max=20, mean=8.6059, stddev=2.9086476605325218)
+    rows = (
+        sample(
+            profile(
+                TableProfile(
+                    name="t",
+                    row_count=20_000,
+                    columns=[
+                        column(
+                            "x",
+                            LogicalType.INT32,
+                            numeric=stats,
+                            distinct_count=DistinctCount(value=20, exact=True),
+                        )
+                    ],
+                )
+            ),
+            spark,
+            seed=2,
+        )
+        .tables["t"]
+        .collect()
+    )
+    values = np.asarray([row.x for row in rows], dtype=int)
+    mean = float(stats.mean)
+    stddev = float(stats.stddev)
+    fa = _standard_normal_cdf((-0.5 - mean) / stddev)
+    fb = _standard_normal_cdf((20.5 - mean) / stddev)
+    modeled_max = (fb - _standard_normal_cdf((19.5 - mean) / stddev)) / (fb - fa)
+    observed_max = float(np.mean(values == 20))
+
+    assert observed_max < 0.001
+    assert observed_max == pytest.approx(modeled_max, rel=1.0, abs=1e-4)
+    assert observed_max < 0.01  # well below the 1/20 ≈ 0.05 pool-slot inflation
 
 
 @pytest.mark.parametrize(("low", "high"), [(8.0, 9.0), (-40.0, -39.0)])
@@ -200,18 +266,29 @@ def test_exact_truncated_normal_property_across_magnitudes_and_asymmetry(
     )
     with localcontext() as ctx:
         ctx.prec = 50
-        mu, sigma = _calibrate_truncated_parameters_exact(mean, stddev, low, high)
-        expected_mean, expected_std = _truncated_moments_exact(mu, sigma, low, high)
+        quantum = Decimal(1) if kind != LogicalType.DECIMAL else Decimal("0.0000000001")
+        half = quantum / Decimal(2)
+        cont_low, cont_high = low - half, high + half
+        mu, sigma = _calibrate_truncated_parameters_exact(mean, stddev, cont_low, cont_high)
+        expected_mean, expected_std = _truncated_moments_exact(mu, sigma, cont_low, cont_high)
         offsets = [value - expected_mean for value in values]
         se = expected_std / Decimal(str(math.sqrt(count)))
         mean_error = abs(sum(offsets, Decimal(0)) / Decimal(count))
+        alpha, beta = _standardized_bounds(cont_low, cont_high, mu, sigma)
+        low_z, high_z = _standardized_bounds(low + half, high - half, mu, sigma)
+        span = _standard_normal_cdf(beta) - _standard_normal_cdf(alpha)
+        modeled_low = (_standard_normal_cdf(low_z) - _standard_normal_cdf(alpha)) / span
+        modeled_high = (_standard_normal_cdf(beta) - _standard_normal_cdf(high_z)) / span
 
     assert all(low <= value <= high for value in values)
     if kind == LogicalType.DECIMAL:
         assert all(isinstance(value, Decimal) and value.as_tuple().exponent == -10 for value in values)
     else:
         assert all(isinstance(value, int) for value in values)
-    assert sum(value in (low, high) for value in values) / count < 0.005
+    observed_low = sum(value == low for value in values) / count
+    observed_high = sum(value == high for value in values) / count
+    assert observed_low == pytest.approx(modeled_low, rel=0.2, abs=0.002)
+    assert observed_high == pytest.approx(modeled_high, rel=0.2, abs=0.002)
     assert mean_error <= Decimal(3) * se
     sampled_std = float(np.std([float(offset) for offset in offsets], ddof=1))
     assert sampled_std == pytest.approx(float(expected_std), rel=0.15)
@@ -255,6 +332,7 @@ def test_exact_truncated_path_source_has_no_float_exact_quantities() -> None:
         "_calibrate_truncated_parameters_exact",
         "_standardized_bounds",
         "_truncated_moments_exact",
+        "_discrete_truncated_ppf",
     ):
         source = inspect.getsource(getattr(sampler_core, name))
         tree = ast.parse(source)
@@ -433,3 +511,28 @@ def test_numeric_xs_privacy_via_real_scorer(spark: SparkSession, tmp_path: Path,
     assert scores.privacy_passed is True
     assert partial["passed"] is True
     assert partial["value"] == 0.0
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("sampler_seed", [0, 1, 2, 3, 4])
+def test_nested_s_wide_privacy_via_real_scorer(spark: SparkSession, tmp_path: Path, sampler_seed: int) -> None:
+    """End-to-end via try_real_scorer: nested@s wide.partial_copy_rate_excess passes for seeds 0-4."""
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    scorer = try_real_scorer(cache_dir=tmp_path, harness_hash="p1-4c", metrics_config_hash="p1-4c")
+    assert scorer is not None
+    real = load("nested", "s", seed=0, spark=spark, sample_seed=0)
+    loaded = profile_tables(real, detect_pii=False)
+    scores = scorer.score(
+        loaded.model_dump(mode="json"),
+        dataset="nested",
+        tier="s",
+        seed=sampler_seed,
+        structure_seed=0,
+        sample_seed=0,
+    )
+    checks = {check["name"]: check for check in scores.detail["privacy"]["checks"]}
+    partial = checks["wide.partial_copy_rate_excess"]
+
+    assert scores.privacy_passed is True
+    assert partial["passed"] is True
+    assert float(partial["value"]) < 0.015

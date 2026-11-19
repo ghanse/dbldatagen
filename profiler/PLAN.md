@@ -89,7 +89,7 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P1.6 | Runner + evaluator: fresh-process samples, wall/CPU/RSS, paired bootstrap gate, policy JSON, results layout, noise control (same build vs itself) | P1.3–P1.5 | merged (PR #12); real Scorer wiring after P1.5 (P1.6a) |
 | P1.6a | Wire the runner to the real sampler + fidelity Scorer; end-to-end control run on tier xs | P1.5, P1.6 | merged (PR #14) |
 | P1.4b | Fix sampler privacy leak: clipped-normal draws land on exact observed min/max, recreating real-unique pairs (numeric fails partial_copy_rate_excess) | P1.4, P1.6a | merged (PR #15) |
-| P1.4c | Fix sampler leak: integer discretization over-weights exact profiled extrema (nested/wide privacy fail) | P1.4b | review approved (PR #19), gates running |
+| P1.4c | Fix sampler leak: integer discretization over-weights exact profiled extrema (nested/wide privacy fail) | P1.4b | merged (PR #19) |
 | P1.4d | Follow-ups from P1.4c review: tests should use calibrated mu/sigma for endpoint mass and discrete moments in property test | P1.4c | todo |
 | P1.7 | RSI log tooling: append-only `log.jsonl` writer/validator + `LOG.md` renderer; `rsi/RSI.md` | P1.1 | merged (PR #4) |
 | P1.7a | Fix: `rsi_log.py append --kind` flag is dropped; add CLI-flag tests | P1.7 | merged (PR #5) |
