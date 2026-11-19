@@ -3,7 +3,8 @@ import json
 import re
 from collections import Counter
 from collections.abc import Callable, Mapping
-from datetime import date
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import jsonschema
@@ -336,6 +337,73 @@ def test_column_rules_handle_undetected_top_level_and_nested_fields(spark: Spark
     assert row.payload.hide is None and "remove" not in row.payload.asDict()
     assert {f"{item['table']}.{item['column']}" for item in result.report["columns"]} == set(policy.columns)
     assert all(item["rule_source"] == "column" for item in result.report["columns"])
+
+
+@pytest.mark.parametrize("ansi", [False, True])
+def test_generic_substitution_preserves_spark_types_without_fallback(spark: SparkSession, ansi: bool) -> None:
+    key = "spark.sql.ansi.enabled"
+    previous = spark.conf.get(key, None)
+    spark.conf.set(key, str(ansi).lower())
+    try:
+        rows = [
+            (
+                datetime(2024, 1, 2, 3, 4, 5),
+                datetime(2024, 2, 3, 4, 5, 6),
+                1.2e10,
+                2**63 - 2,
+                Decimal("9999999999999999999999999999.1234567890"),
+                "00123",
+            ),
+            (
+                datetime(2025, 6, 7, 8, 9, 10),
+                datetime(2025, 7, 8, 9, 10, 11),
+                -8.4e10,
+                -(2**63) + 1,
+                Decimal("-8999999999999999999999999999.1234567890"),
+                "00001",
+            ),
+        ]
+        schema = (
+            "ts timestamp, ts_ntz timestamp_ntz, magnitude double, near_limit long, "
+            "amount decimal(38,10), leading_zero string"
+        )
+        frame = spark.createDataFrame(rows, schema)
+        profile = profile_dataframe("t", frame, detect_pii=False)
+        policy = PiiPolicy(columns={f"t.{name}": PiiRule(action=PiiAction.SUBSTITUTE) for name in frame.columns})
+        output = substitute({"t": frame}, profile, key=b"typed-generic-key", policy=policy).tables["t"]
+        assert output.schema == frame.schema
+        source_rows, output_rows = frame.collect(), output.collect()
+        for name in frame.columns:
+            original = {row[name] for row in source_rows}
+            replaced = {row[name] for row in output_rows}
+            assert len(replaced) == len(original) == 2
+            assert original.isdisjoint(replaced)
+        for source_row, output_row in zip(source_rows, output_rows, strict=True):
+            ratio = abs(output_row.magnitude / source_row.magnitude)
+            assert 0.5 <= ratio <= 1.5
+    finally:
+        if previous is None:
+            spark.conf.unset(key)
+        else:
+            spark.conf.set(key, previous)
+
+
+@pytest.mark.parametrize("ansi", [False, True])
+def test_generic_boolean_substitution_is_rejected(spark: SparkSession, ansi: bool) -> None:
+    key = "spark.sql.ansi.enabled"
+    previous = spark.conf.get(key, None)
+    spark.conf.set(key, str(ansi).lower())
+    try:
+        frame = spark.createDataFrame([(True,), (False,)], "flag boolean")
+        profile = profile_dataframe("t", frame, detect_pii=False)
+        policy = PiiPolicy(columns={"t.flag": PiiRule(action=PiiAction.SUBSTITUTE)})
+        with pytest.raises(ValueError, match=r"boolean column 't\.flag'; use suppress"):
+            substitute({"t": frame}, profile, key=b"boolean-generic-key", policy=policy)
+    finally:
+        if previous is None:
+            spark.conf.unset(key)
+        else:
+            spark.conf.set(key, previous)
 
 
 def test_nested_and_top_level_values_use_same_resolved_mapping_after_rehash(spark: SparkSession) -> None:

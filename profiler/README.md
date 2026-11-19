@@ -213,9 +213,10 @@ which wins over a sensitivity rule. The default `min_confidence` is 0.25, so nam
 Direct identifiers and secrets are never skipped for low confidence. Other detections below the configured threshold
 are reported as `skipped_low_confidence` and left unchanged unless a class or column override names them. Linked FK
 columns use one action for the whole substitution domain (`drop` > `suppress` > `substitute` > `generalize` > `keep`);
-conflicting explicit rules are rejected. Available actions are `substitute`, `generalize`, `suppress`, `drop`, and
-`keep`. Generalization parameters include `prefix_length`, `date_granularity` (`month` or `year`), and `bucket_width`.
-For example:
+conflicting explicit rules are rejected. One explicit `keep` in an FK group is therefore overridden by a stricter
+action elsewhere in that group. Available actions are `substitute`, `generalize`, `suppress`, `drop`, and `keep`.
+Generalization parameters include `prefix_length`, `date_granularity` (`month` or `year`), and `bucket_width`. For
+example:
 
 ```yaml
 min_confidence: 0.25
@@ -235,7 +236,9 @@ columns:
 
 A fully-qualified column rule also applies when detection found no semantic class. For `substitute`, an optional
 `pii_class` selects class-specific formatting. Without it, substitution uses a generic opaque keyed surrogate while
-preserving numeric and date types. This behavior also applies to nested fields.
+preserving numeric, decimal, date, and timestamp types. This behavior also applies to nested fields. Generic boolean
+substitution is rejected because two values cannot be replaced injectively while preserving the boolean type; choose
+`suppress` instead.
 
 The same file can be passed to `dbldatagen-profile profile --policy policy.yaml`. At profile time, policy rules may
 only remove or coarsen emitted information. They cannot weaken the spec 0.2.0 floor for direct identifiers and

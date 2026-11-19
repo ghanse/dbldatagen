@@ -9,7 +9,8 @@ import math
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from pyspark.broadcast import Broadcast
@@ -75,7 +76,7 @@ def substitute(  # noqa: PLR0912, PLR0915
         if semantic is not None and decision is not None and decision[0].action == PiiAction.SUBSTITUTE:
             domain_semantics.setdefault(domains[f"{table_name}.{path}"], semantic)
     mappings: dict[str, DataFrame] = {}
-    nested_mappings: dict[str, Broadcast[dict[str, str]]] = {}
+    nested_mappings: dict[str, Broadcast[dict[str, object]]] = {}
     collision_counts: dict[str, int] = {}
     nested_domains = {
         domains[f"{table}.{path}"]
@@ -97,9 +98,7 @@ def substitute(  # noqa: PLR0912, PLR0915
             if len(rows) > MAX_NESTED_BROADCAST_VALUES:
                 raise ValueError(f"nested substitution domain {domain!r} exceeds the broadcast limit")
             session = next(iter(tables.values())).sparkSession
-            nested_mappings[domain] = session.sparkContext.broadcast(
-                {str(row.original): str(row.surrogate) for row in rows}
-            )
+            nested_mappings[domain] = session.sparkContext.broadcast({str(row.original): row.surrogate for row in rows})
     output: dict[str, DataFrame] = {}
     reports: list[dict[str, Any]] = []
     for table_name, frame in tables.items():
@@ -204,12 +203,19 @@ def substitute(  # noqa: PLR0912, PLR0915
                     mapping = mappings[domains[reference]]
                     original = f"__pii_original_{len(reports)}"
                     surrogate = f"__pii_surrogate_{len(reports)}"
+                    generic = _is_generic_semantic(effective_semantic)
                     mapping = mapping.select(F.col("original").alias(original), F.col("surrogate").alias(surrogate))
-                    result = (
-                        result.join(mapping, F.col(name).cast("string") == F.col(original), "left")
-                        .withColumn(name, F.coalesce(F.col(surrogate).cast(frame.schema[name].dataType), F.col(name)))
-                        .drop(original, surrogate)
-                    )
+                    source = F.col(name)
+                    converted = F.col(surrogate) if generic else F.col(surrogate).cast(frame.schema[name].dataType)
+                    join_source = source if generic else source.cast("string")
+                    joined = result.join(mapping, join_source == F.col(original), "left")
+                    invalid = source.isNotNull() & (source.cast("string") != "") & converted.isNull()
+                    if joined.where(invalid).limit(1).count() != 0:
+                        raise ValueError(f"surrogate could not be represented for column {reference!r}")
+                    result = joined.withColumn(
+                        name,
+                        F.when(source.isNull() | (source.cast("string") == ""), source).otherwise(converted),
+                    ).drop(original, surrogate)
                 count = frame.where(F.col(name).isNotNull() & (F.col(name).cast("string") != "")).count()
                 report = _report(
                     table_name,
@@ -364,20 +370,29 @@ def _build_mapping(
     key: bytes,
     options: SubstitutionOptions,
 ) -> tuple[DataFrame, int]:
+    generic = _is_generic_semantic(semantic)
+    data_types = [
+        _leaf_data_type(tables[reference.split(".", maxsplit=1)[0]], reference.split(".", maxsplit=1)[1])
+        for reference in members
+    ]
+    data_type = data_types[0]
+    if generic and any(kind != data_type for kind in data_types[1:]):
+        raise ValueError(f"generic substitution domain {domain!r} has incompatible Spark types")
+    if generic:
+        _validate_generic_type(data_type, members[0])
     values: DataFrame | None = None
     for reference in members:
         table, column = reference.split(".", maxsplit=1)
-        selected = _leaf_values(tables[table], column)
+        selected = _leaf_values(tables[table], column, cast_string=not generic)
         values = selected if values is None else values.union(selected)
     if values is None:
         raise ValueError(f"domain {domain!r} has no columns")
     mapping = values.distinct().withColumn("counter", F.lit(0))
-    _check_surrogate_capacity(mapping, semantic, members)
+    if not generic:
+        _check_surrogate_capacity(mapping, semantic, members)
     make = F.udf(
-        lambda value, counter: _mapping_surrogate(
-            semantic.pii_class, value, domain, key, options, counter, _is_generic_semantic(semantic)
-        ),
-        T.StringType(),
+        lambda value, counter: _mapping_value(semantic, value, data_type, domain, key, options, counter),
+        data_type if generic else T.StringType(),
     )
     candidate = mapping.withColumn("surrogate", make("original", "counter"))
     duplicates = candidate.groupBy("surrogate").count().where(F.col("count") > 1).select("surrogate")
@@ -385,23 +400,23 @@ def _build_mapping(
     survivors = candidate.join(originals, F.col("surrogate") == F.col("existing_original"), "inner").select("surrogate")
     if duplicates.union(survivors).limit(1).count() == 0:
         return candidate.select("original", "surrogate"), 0
-    return _resolve_collisions(values, semantic, domain, key, options, members[0])
+    return _resolve_collisions(values, semantic, data_type, domain, key, options, members[0])
 
 
 def _resolve_collisions(
     values: DataFrame,
     semantic: Semantic,
+    data_type: T.DataType,
     domain: str,
     key: bytes,
     options: SubstitutionOptions,
     column: str,
 ) -> tuple[DataFrame, int]:
     originals = values.distinct().localCheckpoint(eager=True)
+    generic = _is_generic_semantic(semantic)
     make = F.udf(
-        lambda value, counter: _mapping_surrogate(
-            semantic.pii_class, value, domain, key, options, counter, _is_generic_semantic(semantic)
-        ),
-        T.StringType(),
+        lambda value, counter: _mapping_value(semantic, value, data_type, domain, key, options, counter),
+        data_type if generic else T.StringType(),
     )
     initial = originals.withColumn("counter", F.lit(0)).withColumn("surrogate", make("original", "counter"))
     duplicate_surrogates = initial.groupBy("surrogate").count().where(F.col("count") > 1).select("surrogate")
@@ -441,7 +456,7 @@ def _resolve_collisions(
     raise ValueError(f"surrogate space is too small to preserve distinct values for column {column!r}")
 
 
-def _leaf_values(frame: DataFrame, path: str) -> DataFrame:
+def _leaf_values(frame: DataFrame, path: str, *, cast_string: bool = True) -> DataFrame:
     parts = path.split(".")
     data_type = frame.schema[parts[0]].dataType
     values = frame.select(F.col(parts[0]).alias("__value"))
@@ -459,9 +474,48 @@ def _leaf_values(frame: DataFrame, path: str) -> DataFrame:
             )
         else:
             raise ValueError(f"invalid nested column path {path!r}")
-    return values.select(F.col("__value").cast("string").alias("original")).where(
-        F.col("original").isNotNull() & (F.col("original") != "")
+    original = F.col("__value").cast("string") if cast_string else F.col("__value")
+    selected = values.select(original.alias("original")).where(F.col("original").isNotNull())
+    if cast_string or isinstance(data_type, (T.StringType, T.BinaryType)):
+        selected = selected.where(F.length("original") > 0)
+    return selected
+
+
+def _leaf_data_type(frame: DataFrame, path: str) -> T.DataType:
+    data_type = frame.schema[path.split(".")[0]].dataType
+    for part in path.split(".")[1:]:
+        if isinstance(data_type, T.StructType):
+            data_type = data_type[part].dataType
+        elif isinstance(data_type, T.ArrayType) and part == "element":
+            data_type = data_type.elementType
+        elif isinstance(data_type, T.MapType) and part in {"key", "value"}:
+            data_type = data_type.keyType if part == "key" else data_type.valueType
+        else:
+            raise ValueError(f"invalid nested column path {path!r}")
+    return data_type
+
+
+def _validate_generic_type(data_type: T.DataType, reference: str) -> None:
+    if isinstance(data_type, T.BooleanType):
+        raise ValueError(f"generic substitute is not supported for boolean column {reference!r}; use suppress instead")
+    supported = (
+        T.ByteType,
+        T.ShortType,
+        T.IntegerType,
+        T.LongType,
+        T.FloatType,
+        T.DoubleType,
+        T.DecimalType,
+        T.DateType,
+        T.TimestampType,
+        T.StringType,
+        T.BinaryType,
     )
+    timestamp_ntz = getattr(T, "TimestampNTZType", None)
+    if not isinstance(data_type, supported) and (timestamp_ntz is None or not isinstance(data_type, timestamp_ntz)):
+        raise ValueError(
+            f"generic substitute is not supported for Spark type {data_type.simpleString()!r} on {reference!r}"
+        )
 
 
 def _check_surrogate_capacity(mapping: DataFrame, semantic: Semantic, members: list[str]) -> None:
@@ -488,11 +542,8 @@ def _mapping_surrogate(
     key: bytes,
     options: SubstitutionOptions,
     counter: int,
-    generic: bool = False,
 ) -> str:
     digest = _digest(key, domain, value, options.surrogate_bits, counter)
-    if generic:
-        return _generic_surrogate(value, digest, options.date_shift_days)
     if kind == PiiClass.DATE_OF_BIRTH:
         original = date.fromisoformat(value)
         return (original + timedelta(days=_date_offset(digest, options.date_shift_days))).isoformat()
@@ -503,17 +554,58 @@ def _is_generic_semantic(semantic: Semantic) -> bool:
     return any(item.method == "policy_column_generic" for item in semantic.evidence)
 
 
-def _generic_surrogate(value: str, digest: bytes, date_shift_days: int) -> str:
-    """Returns a parseable opaque surrogate without assuming a PII class."""
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-        return (date.fromisoformat(value) + timedelta(days=_date_offset(digest, date_shift_days))).isoformat()
-    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", value):
-        digits = re.sub(r"\D", "", value)
-        generated = str(int.from_bytes(digest, "big")).zfill(len(digits))[-len(digits) :]
-        return _apply_digit_format(value, generated)
-    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+def _mapping_value(  # noqa: PLR0911, PLR0912
+    semantic: Semantic,
+    value: object,
+    data_type: T.DataType,
+    domain: str,
+    key: bytes,
+    options: SubstitutionOptions,
+    counter: int,
+) -> object:
+    text = str(value)
+    if not _is_generic_semantic(semantic):
+        return _mapping_surrogate(semantic.pii_class, text, domain, key, options, counter)
+    digest = _digest(key, domain, text, options.surrogate_bits, counter)
     number = int.from_bytes(digest, "big")
-    return "".join(alphabet[(number >> (index * 6)) % len(alphabet)] for index in range(max(1, len(value))))
+    integer_ranges: tuple[tuple[type[T.DataType], int, int], ...] = (
+        (T.ByteType, -(2**7), 2**7 - 1),
+        (T.ShortType, -(2**15), 2**15 - 1),
+        (T.IntegerType, -(2**31), 2**31 - 1),
+        (T.LongType, -(2**63), 2**63 - 1),
+    )
+    for kind, minimum, maximum in integer_ranges:
+        if isinstance(data_type, kind):
+            return minimum + number % (maximum - minimum + 1)
+    if isinstance(data_type, (T.FloatType, T.DoubleType)):
+        if not isinstance(value, (int, float)):
+            raise ValueError(f"expected numeric value for {data_type.simpleString()}")
+        original = float(value)
+        magnitude = max(abs(original), 1.0)
+        factor = 0.5 + (number % 1_000_003) / 1_000_003
+        return math.copysign(magnitude * factor, original or 1.0)
+    if isinstance(data_type, T.DecimalType):
+        limit = 10**data_type.precision
+        unscaled = number % (limit * 2 - 1) - (limit - 1)
+        return Decimal(unscaled).scaleb(-data_type.scale)
+    if isinstance(data_type, T.DateType):
+        if not isinstance(value, date):
+            raise ValueError("expected date value")
+        return value + timedelta(days=_date_offset(digest, options.date_shift_days))
+    timestamp_ntz = getattr(T, "TimestampNTZType", None)
+    if isinstance(data_type, T.TimestampType) or (timestamp_ntz is not None and isinstance(data_type, timestamp_ntz)):
+        if not isinstance(value, datetime):
+            raise ValueError("expected timestamp value")
+        maximum = max(1, options.date_shift_days * 24 * 60 * 60)
+        return value + timedelta(seconds=_date_offset(digest, maximum))
+    if isinstance(data_type, T.StringType):
+        return _surrogate(PiiClass.OTHER, text, domain, key, options, counter)
+    if isinstance(data_type, T.BinaryType):
+        if not isinstance(value, (bytes, bytearray)):
+            raise ValueError("expected binary value")
+        raw = bytes(value)
+        return (digest * ((len(raw) + len(digest) - 1) // len(digest)))[: len(raw)]
+    raise ValueError(f"generic substitute is not supported for Spark type {data_type.simpleString()!r}")
 
 
 def _domains(profile: Profile, options: SubstitutionOptions) -> dict[str, str]:
@@ -624,7 +716,7 @@ def _nested_policy_udf(
     data_type: T.DataType,
     output_type: T.DataType,
     specifications: list[tuple[str, Semantic | None, str, tuple[PiiRule, str]]],
-    mappings: dict[str, Broadcast[dict[str, str]]],
+    mappings: dict[str, Broadcast[dict[str, object]]],
     key: bytes,
     options: SubstitutionOptions,
 ) -> Callable[..., Column]:
@@ -656,9 +748,7 @@ def _nested_policy_udf(
                 if surrogate is None:
                     raise ValueError(f"nested value is absent from resolved domain {domain!r}")
                 return _coerce_nested_value(surrogate, kind)
-            surrogate = _mapping_surrogate(
-                semantic.pii_class, str(value), domain, key, options, 0, _is_generic_semantic(semantic)
-            )
+            surrogate = _mapping_value(semantic, value, kind, domain, key, options, 0)
             return _coerce_nested_value(surrogate, kind)
         if isinstance(kind, T.StructType):
             source = value.asDict(recursive=False) if hasattr(value, "asDict") else value
@@ -711,7 +801,9 @@ def _generalize_nested(value: object, parameters: dict[str, str | int | float | 
     raise ValueError(f"unknown nested generalization parameters {parameters!r}")
 
 
-def _coerce_nested_value(value: str, data_type: T.DataType) -> object:
+def _coerce_nested_value(value: object, data_type: T.DataType) -> object:
+    if not isinstance(value, str):
+        return value
     if isinstance(data_type, (T.ByteType, T.ShortType, T.IntegerType, T.LongType)):
         return int(value)
     if isinstance(data_type, (T.FloatType, T.DoubleType)):
