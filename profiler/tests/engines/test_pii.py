@@ -866,6 +866,113 @@ def test_full_fk_drop_is_allowed(spark: SparkSession) -> None:
     assert output["parent"].columns == [] and output["child"].columns == []
 
 
+@pytest.mark.parametrize("rule_source", ["column", "sensitivity"])
+def test_fk_drop_propagates_to_undetected_member(spark: SparkSession, rule_source: str) -> None:
+    parent = spark.createDataFrame([("a",)], "id string")
+    child = spark.createDataFrame([("a",)], "id string")
+    profile = _profile(
+        [
+            ("parent", 1, [_column("id", _semantic("account_id", "direct_identifier"))]),
+            ("child", 1, [_column("id", None)]),
+        ],
+        relationships=[
+            Relationship(
+                child_table="child",
+                child_columns=["id"],
+                parent_table="parent",
+                parent_columns=["id"],
+                coverage=1.0,
+            )
+        ],
+    )
+    drop = PiiRule(action=PiiAction.DROP)
+    policy = (
+        PiiPolicy(columns={"parent.id": drop})
+        if rule_source == "column"
+        else PiiPolicy(sensitivity=dict.fromkeys(Sensitivity, drop))
+    )
+
+    output = substitute({"parent": parent, "child": child}, profile, key=b"undetected-drop-key", policy=policy).tables
+
+    assert output["parent"].columns == [] and output["child"].columns == []
+
+
+def test_dob_shift_reads_entity_key_before_policy_drop(spark: SparkSession) -> None:
+    frame = spark.createDataFrame([("person-a", date(1980, 1, 2))], "entity_id string, dob date")
+    profile = _profile(
+        [
+            (
+                "people",
+                1,
+                [
+                    _column("entity_id", _semantic("account_id", "direct_identifier")),
+                    _typed_column("dob", "date", _semantic("date_of_birth", "quasi_identifier")),
+                ],
+            )
+        ]
+    )
+    profile.tables[0].primary_key = KeyCandidate(columns=["entity_id"], confidence=1.0)
+    policy = PiiPolicy(
+        sensitivity={
+            Sensitivity.DIRECT_IDENTIFIER: PiiRule(action=PiiAction.DROP),
+            Sensitivity.QUASI_IDENTIFIER: PiiRule(action=PiiAction.SUBSTITUTE),
+            Sensitivity.SECRET: PiiRule(action=PiiAction.SUBSTITUTE),
+            Sensitivity.FREE_TEXT: PiiRule(action=PiiAction.SUBSTITUTE),
+        }
+    )
+
+    row = substitute({"people": frame}, profile, key=b"drop-entity-key", policy=policy).tables["people"].first()
+
+    assert row is not None
+    assert row.asDict().keys() == {"dob"}
+    assert row.dob != date(1980, 1, 2)
+
+
+@pytest.mark.parametrize("pk_action", [PiiAction.SUBSTITUTE, PiiAction.SUPPRESS])
+def test_dob_shift_uses_original_entity_key_in_both_column_orders(spark: SparkSession, pk_action: PiiAction) -> None:
+    source = spark.createDataFrame(
+        [("person-a", date(1980, 1, 2)), ("person-b", date(1980, 1, 2))],
+        "entity_id string, dob date",
+    )
+    policy = PiiPolicy(
+        sensitivity={
+            Sensitivity.DIRECT_IDENTIFIER: PiiRule(action=pk_action),
+            Sensitivity.QUASI_IDENTIFIER: PiiRule(action=PiiAction.SUBSTITUTE),
+            Sensitivity.SECRET: PiiRule(action=PiiAction.SUBSTITUTE),
+            Sensitivity.FREE_TEXT: PiiRule(action=PiiAction.SUBSTITUTE),
+        }
+    )
+    outputs: list[list[date]] = []
+    for order in [("entity_id", "dob"), ("dob", "entity_id")]:
+        frame = source.select(*order)
+        profile = _profile(
+            [
+                (
+                    "people",
+                    2,
+                    [
+                        (
+                            _column("entity_id", _semantic("account_id", "direct_identifier"))
+                            if name == "entity_id"
+                            else _typed_column("dob", "date", _semantic("date_of_birth", "quasi_identifier"))
+                        )
+                        for name in order
+                    ],
+                )
+            ]
+        )
+        profile.tables[0].primary_key = KeyCandidate(columns=["entity_id"], confidence=1.0)
+
+        result = substitute({"people": frame}, profile, key=b"original-entity-key", policy=policy)
+
+        outputs.append(sorted(row.dob for row in result.tables["people"].collect()))
+        dob_report = next(item for item in result.report["columns"] if item["column"] == "dob")
+        assert dob_report["date_shift_key"] == "entity"
+
+    assert outputs[0] == outputs[1]
+    assert len(set(outputs[0])) == 2
+
+
 def test_unknown_column_rule_is_rejected(spark: SparkSession) -> None:
     frame = spark.createDataFrame([("Boston",)], "city string")
     profile = _profile([("t", 1, [_column("city", _semantic("city", "quasi_identifier"))])])
@@ -934,6 +1041,35 @@ def test_too_small_surrogate_space_names_the_column(spark: SparkSession) -> None
     profile = _profile([("t", len(values), [_column("account_id", _semantic("account_id", "direct_identifier"))])])
     with pytest.raises(ValueError, match=r"space is too small.*t\.account_id"):
         substitute({"t": frame}, profile, key=b"capacity-key")
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_generic_float_substitution_rejects_non_finite_values(spark: SparkSession, value: float) -> None:
+    frame = spark.createDataFrame([(value,)], "amount double")
+    profile = profile_dataframe("t", frame, detect_pii=False)
+    policy = PiiPolicy(columns={"t.amount": PiiRule(action=PiiAction.SUBSTITUTE)})
+
+    with pytest.raises(ValueError, match=r"finite.*t\.amount"):
+        substitute({"t": frame}, profile, key=b"non-finite-key", policy=policy)
+
+
+def test_generic_decimal_capacity_is_checked_before_collision_retries(spark: SparkSession) -> None:
+    values = [(Decimal(value),) for value in range(-9, 1)]
+    frame = spark.createDataFrame(values, "amount decimal(1,0)")
+    profile = profile_dataframe("t", frame, detect_pii=False)
+    policy = PiiPolicy(columns={"t.amount": PiiRule(action=PiiAction.SUBSTITUTE)})
+
+    with pytest.raises(ValueError, match=r"space is too small.*t\.amount"):
+        substitute({"t": frame}, profile, key=b"decimal-capacity-key", policy=policy)
+
+
+def test_generic_byte_capacity_is_checked_before_collision_retries(spark: SparkSession) -> None:
+    frame = spark.createDataFrame([(value,) for value in range(-128, 1)], "amount byte")
+    profile = profile_dataframe("t", frame, detect_pii=False)
+    policy = PiiPolicy(columns={"t.amount": PiiRule(action=PiiAction.SUBSTITUTE)})
+
+    with pytest.raises(ValueError, match=r"space is too small.*t\.amount"):
+        substitute({"t": frame}, profile, key=b"byte-capacity-key", policy=policy)
 
 
 @pytest.mark.parametrize(

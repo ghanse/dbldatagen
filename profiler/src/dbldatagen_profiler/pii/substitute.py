@@ -104,7 +104,15 @@ def substitute(  # noqa: PLR0912, PLR0915
     for table_name, frame in tables.items():
         result = frame
         columns = {column.name: column for column in profiles[table_name].columns}
-        for name in frame.columns:
+        entity_columns = _entity_columns(profile, table_name)
+        entity_keys = _capture_entity_keys(result, entity_columns)
+        for entity_column, hidden in entity_keys.items():
+            result = result.withColumn(hidden, F.col(entity_column))
+        ordered_names = sorted(
+            frame.columns,
+            key=lambda name: _is_drop(decisions.get(f"{table_name}.{name}")),
+        )
+        for name in ordered_names:
             reference = f"{table_name}.{name}"
             current_column = columns.get(name)
             current_semantic = current_column.semantic if current_column is not None else None
@@ -185,10 +193,12 @@ def substitute(  # noqa: PLR0912, PLR0915
             elif effective_semantic is not None and rule.action == PiiAction.SUBSTITUTE:
                 date_shift_key: str | None = None
                 if effective_semantic.pii_class == PiiClass.DATE_OF_BIRTH:
-                    entity_columns = _entity_columns(profile, table_name)
                     date_shift_key = "entity" if entity_columns else "value"
                     transform = _date_shift_udf(domains[reference], key, opts.date_shift_days)
-                    result = result.withColumn(name, transform(F.col(name), *(F.col(item) for item in entity_columns)))
+                    result = result.withColumn(
+                        name,
+                        transform(F.col(name), *(F.col(entity_keys[item]) for item in entity_columns)),
+                    )
                 elif effective_semantic.pii_class == PiiClass.FREE_TEXT_PII:
                     transform = _substitution_udf(
                         effective_semantic, domains[reference], key, opts, frame.schema[name].dataType
@@ -242,7 +252,7 @@ def substitute(  # noqa: PLR0912, PLR0915
                         ),
                     }
                 )
-        output[table_name] = result
+        output[table_name] = result.drop(*entity_keys.values())
     return SubstitutionResult(tables=output, report={"columns": reports})
 
 
@@ -331,8 +341,8 @@ def _domain_decisions(
         domain = domains[members[0]]
         domain_members = [reference for reference, member_domain in domains.items() if member_domain == domain]
         dropped = [reference for reference, (rule, _) in rules.items() if rule.action == PiiAction.DROP]
-        if dropped and (len(dropped) != len(domain_members)):
-            missing = sorted(set(domain_members) - set(dropped))
+        if dropped and len(dropped) != len(members):
+            missing = sorted(set(members) - set(dropped))
             raise ValueError(f"cannot drop only part of an FK-linked column set; also drop {missing}")
         if len(explicit) >= 2 and len({rules[reference][0].model_dump_json() for reference in explicit}) > 1:
             descriptions = ", ".join(f"{reference}={rules[reference][0].action.value}" for reference in sorted(rules))
@@ -362,6 +372,22 @@ def _entity_columns(profile: Profile, table_name: str) -> list[str]:
     return []
 
 
+def _capture_entity_keys(frame: DataFrame, entity_columns: list[str]) -> dict[str, str]:
+    used = set(frame.columns)
+    captured: dict[str, str] = {}
+    for index, column in enumerate(entity_columns):
+        hidden = f"__pii_entity_{index}"
+        while hidden in used:
+            hidden = f"_{hidden}"
+        captured[column] = hidden
+        used.add(hidden)
+    return captured
+
+
+def _is_drop(decision: tuple[PiiRule, str] | None) -> bool:
+    return decision is not None and decision[0].action == PiiAction.DROP
+
+
 def _build_mapping(
     tables: dict[str, DataFrame],
     members: list[str],
@@ -388,7 +414,9 @@ def _build_mapping(
     if values is None:
         raise ValueError(f"domain {domain!r} has no columns")
     mapping = values.distinct().withColumn("counter", F.lit(0))
-    if not generic:
+    if generic:
+        _validate_generic_values(mapping, data_type, members[0])
+    else:
         _check_surrogate_capacity(mapping, semantic, members)
     make = F.udf(
         lambda value, counter: _mapping_value(semantic, value, data_type, domain, key, options, counter),
@@ -516,6 +544,26 @@ def _validate_generic_type(data_type: T.DataType, reference: str) -> None:
         raise ValueError(
             f"generic substitute is not supported for Spark type {data_type.simpleString()!r} on {reference!r}"
         )
+
+
+def _validate_generic_values(mapping: DataFrame, data_type: T.DataType, reference: str) -> None:
+    if isinstance(data_type, (T.FloatType, T.DoubleType)):
+        non_finite = F.isnan("original") | (F.abs("original") == F.lit(float("inf")))
+        if mapping.where(non_finite).limit(1).count() != 0:
+            raise ValueError(f"generic float substitution requires finite values for column {reference!r}")
+    space: int | None = None
+    if isinstance(data_type, T.ByteType):
+        space = 2**8
+    elif isinstance(data_type, T.ShortType):
+        space = 2**16
+    elif isinstance(data_type, T.IntegerType):
+        space = 2**32
+    elif isinstance(data_type, T.DecimalType) and data_type.precision <= 9:
+        space = 2 * 10**data_type.precision - 1
+    if space is not None:
+        count = mapping.count()
+        if count > space - count:
+            raise ValueError(f"surrogate space is too small to preserve distinct values for column {reference!r}")
 
 
 def _check_surrogate_capacity(mapping: DataFrame, semantic: Semantic, members: list[str]) -> None:
