@@ -61,8 +61,25 @@ process, not Spark JVM/executor memory.
 
 ## Noise floor
 
-The paired tier-s control has an accuracy-mean 95% CI of [0, 0], width 0. Every per-dataset reconstruction-difference
-CI is also [0, 0], width 0. The policy's +0.005 accuracy threshold is therefore above the observed accuracy noise.
+The paired tier-s control reports an accuracy-mean 95% CI of [0, 0], width 0, and every per-dataset
+reconstruction-difference CI is also [0, 0]. This is not measured noise. Both control roles run the same profiler, so
+they emit byte-identical profiles, and the sampler seeds are paired, so every difference is exactly 0 by construction.
+The control shows only that the pipeline is deterministic. It says nothing about whether +0.005 sits above noise.
+
+The real variability of an accuracy score is its seed-to-seed spread for a fixed profile (the min-max in the
+reconstruction table above):
+
+| Dataset | Seed-to-seed spread |
+|---|---:|
+| retail | 0.0030 |
+| numeric | 0.0033 |
+| strings | 0.0014 |
+| temporal | 0.0064 |
+| nested | 0.0006 |
+| edge | 0.0016 |
+
+Because candidate and baseline are scored on the same seeds, the paired gate cancels much of this spread. Even so,
+temporal's spread exceeds the +0.005 threshold, so small accuracy gains on temporal will often come out inconclusive.
 
 Wall-time intervals are paired-bootstrap 95% CIs for fractional improvement, `(baseline - candidate) / baseline`,
 using 2,000 draws. Percentage-point width is the policy-relevant noise measure; raw-seconds width is included for scale.
@@ -77,8 +94,9 @@ using 2,000 draws. Percentage-point width is the policy-relevant noise measure; 
 | edge | [-2.10%, +1.94%] | 4.05 pp | 0.320 s |
 
 The 5% speed threshold exceeds the observed CI width only for temporal and edge. It is below the measured width for
-retail, numeric, strings, and nested, so it is not uniformly above the observed speed noise floor. The policy is
-unchanged.
+retail, numeric, strings, and nested. In practice, at N=5 speed samples per build most speed proposals will come out
+inconclusive on those four datasets even when the speedup is real, unless it is well above 5%. Raising N is a policy
+change: it would be a separate, logged benchmark change, not part of a profiler proposal. The policy is unchanged here.
 
 ## Known baseline failures
 
