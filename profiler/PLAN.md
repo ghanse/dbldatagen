@@ -107,6 +107,17 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P2.1 | PII detection (spec 0.2.0 `semantic` + quasi-identifier sets) and keyed, format-preserving, join-consistent substitution of real data (contract: `.polly/contracts/p2-1-pii.md`) | P1.2 | merged (PR #13) |
 | P2.2 | Benchmark side: catalog PII ground truth for every PII class, detection precision/recall metric, substitution fidelity (stats + relational integrity preserved) and leakage metrics, sampler consumes `semantic.pii_class` | P1.5, P2.1 | todo |
 
+| P2.3 | Configurable PII handling policy: QIs substituted by default; per sensitivity / pii_class / column actions (substitute, generalize, suppress, drop, keep) (human decision 2026-11-18; contract `.polly/contracts/p2-3-pii-policy.md`) | P2.1 | in-progress |
+
+### Phase 3 — Streaming and data volume (human request 2026-11-18)
+
+| ID | Item | Depends on | Status |
+|----|------|------------|--------|
+| P3.1 | Incremental profiling with Spark Structured Streaming: mergeable per-batch states, restart-safe checkpoints, snapshots equal to batch on exact stats (contract `.polly/contracts/p3-1-streaming.md`) | P1.2 | in-progress |
+| P3.2 | Data-volume RSI objective: least input fraction reaching a frozen accuracy target per dataset; harness-controlled FK-preserving subsets; new policy `data_volume.json` (contract `.polly/contracts/p3-2-data-volume.md`) | P1.6a, P1.8 | in-progress |
+| P3.3 | Calibrate data-volume targets T_d from the frozen baseline and run the first data-volume baseline | P1.8, P3.2 | todo |
+| P3.4 | Real public datasets via Databricks Marketplace / samples, exported with `genie exec` (replaces P1.3b) | P1.3 | exploring |
+
 ### Phase 2 — RSI iterations (Step 2)
 
 Candidate proposal areas (they enter the log as proposals when triaged):
