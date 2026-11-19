@@ -928,6 +928,32 @@ def test_dob_shift_reads_entity_key_before_policy_drop(spark: SparkSession) -> N
     assert row.dob != date(1980, 1, 2)
 
 
+def test_entity_key_capture_preserves_case_insensitive_hidden_name_collision(spark: SparkSession) -> None:
+    frame = spark.createDataFrame(
+        [("user-value", "person-a", date(1980, 1, 2))],
+        "__PII_ENTITY_0 string, entity_id string, dob date",
+    )
+    profile = _profile(
+        [
+            (
+                "people",
+                1,
+                [
+                    _column("__PII_ENTITY_0", None),
+                    _column("entity_id", _semantic("account_id", "direct_identifier")),
+                    _typed_column("dob", "date", _semantic("date_of_birth", "quasi_identifier")),
+                ],
+            )
+        ]
+    )
+    profile.tables[0].primary_key = KeyCandidate(columns=["entity_id"], confidence=1.0)
+
+    row = substitute({"people": frame}, profile, key=b"hidden-name-key").tables["people"].first()
+
+    assert row is not None
+    assert row["__PII_ENTITY_0"] == "user-value"
+
+
 @pytest.mark.parametrize("pk_action", [PiiAction.SUBSTITUTE, PiiAction.SUPPRESS])
 def test_dob_shift_uses_original_entity_key_in_both_column_orders(spark: SparkSession, pk_action: PiiAction) -> None:
     source = spark.createDataFrame(

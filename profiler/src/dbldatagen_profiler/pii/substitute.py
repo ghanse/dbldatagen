@@ -373,14 +373,14 @@ def _entity_columns(profile: Profile, table_name: str) -> list[str]:
 
 
 def _capture_entity_keys(frame: DataFrame, entity_columns: list[str]) -> dict[str, str]:
-    used = set(frame.columns)
+    used = {name.lower() for name in frame.columns}
     captured: dict[str, str] = {}
     for index, column in enumerate(entity_columns):
         hidden = f"__pii_entity_{index}"
-        while hidden in used:
+        while hidden.lower() in used:
             hidden = f"_{hidden}"
         captured[column] = hidden
-        used.add(hidden)
+        used.add(hidden.lower())
     return captured
 
 
