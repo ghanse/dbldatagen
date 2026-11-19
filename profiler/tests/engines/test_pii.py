@@ -23,7 +23,7 @@ from dbldatagen_profiler.model import (
     dump_profile,
     profile_json_schema,
 )
-from dbldatagen_profiler.pii import SubstitutionOptions, detect, substitute
+from dbldatagen_profiler.pii import PiiAction, PiiPolicy, PiiRule, SubstitutionOptions, detect, substitute
 from dbldatagen_profiler.pii.detect import analyze_table
 from dbldatagen_profiler.pii.substitute import _mapping_surrogate
 
@@ -247,6 +247,47 @@ def test_nested_map_phone_value_is_detected_and_substituted(spark: SparkSession)
     assert row.phones["mobile"].startswith("+1415")
 
 
+def test_nested_policy_generalizes_suppresses_and_drops_struct_fields(spark: SparkSession) -> None:
+    frame = spark.createDataFrame(
+        [(Row(zip="02110", city="Boston", token="secret-value"),)],
+        "address struct<zip:string,city:string,token:string>",
+    )
+    quasi = _semantic("other", "quasi_identifier")
+    profile = _profile(
+        [
+            (
+                "t",
+                1,
+                [
+                    {
+                        "name": "address",
+                        "logical_type": "struct",
+                        "source_type": "struct<zip:string,city:string,token:string>",
+                        "nullable": True,
+                        "null_fraction": 0.0,
+                        "children": [
+                            _column("zip", {**quasi, "pii_class": "postal_code"}),
+                            _column("city", {**quasi, "pii_class": "city"}),
+                            _column("token", _semantic("secret_token", "secret")),
+                        ],
+                    }
+                ],
+            )
+        ]
+    )
+    policy = PiiPolicy(
+        columns={
+            "t.address.zip": PiiRule(action=PiiAction.GENERALIZE, parameters={"prefix_length": 3}),
+            "t.address.city": PiiRule(action=PiiAction.SUPPRESS),
+            "t.address.token": PiiRule(action=PiiAction.DROP),
+        }
+    )
+    result = substitute({"t": frame}, profile, key=b"nested-actions-key", policy=policy)
+    row = result.tables["t"].first()
+    assert row is not None and row.address.asDict() == {"zip": "021", "city": None}
+    assert [item["action"] for item in result.report["columns"]] == ["generalize", "suppress", "drop"]
+
+
 def test_nested_and_top_level_values_use_same_resolved_mapping_after_rehash(spark: SparkSession) -> None:
     options = SubstitutionOptions(
         domains={"shared-email": ["t.contacts.element.email", "t.primary_email"]}, surrogate_bits=2
@@ -360,13 +401,124 @@ def test_generalization_and_collision_hook(spark: SparkSession) -> None:
     assert {row.postal_code for row in result.tables["t"].collect()} == {"123**"}
 
 
-def test_unchanged_quasi_identifier_is_reported_as_skipped(spark: SparkSession) -> None:
+def test_quasi_identifier_is_substituted_by_default(spark: SparkSession) -> None:
     frame = spark.createDataFrame([("12345",), ("12346",)], "postal_code string")
     semantic = _semantic("postal_code", "quasi_identifier")
     profile = _profile([("t", 2, [_column("postal_code", semantic)])])
     result = substitute({"t": frame}, profile, key=b"quasi-key")
-    assert {row.postal_code for row in result.tables["t"].collect()} == {"12345", "12346"}
-    assert result.report["columns"][0]["skipped_reason"] == "quasi_identifier_unchanged"
+    assert {row.postal_code for row in result.tables["t"].collect()}.isdisjoint({"12345", "12346"})
+    assert result.report["columns"][0]["action"] == "substitute"
+
+
+def test_default_policy_substitutes_zip_dob_and_gender_without_changing_statistics(spark: SparkSession) -> None:
+    rows = [
+        ("person-a", "02110", date(1980, 1, 2), "F"),
+        ("person-b", "02110", date(1981, 2, 3), "F"),
+        ("person-c", "10001", date(1990, 3, 4), "M"),
+        ("person-d", None, None, None),
+    ]
+    frame = spark.createDataFrame(rows, "entity_id string, zip string, dob date, gender string")
+    quasi = _semantic("other", "quasi_identifier")
+    profile = _profile(
+        [
+            (
+                "people",
+                len(rows),
+                [
+                    _column("entity_id", None),
+                    _column("zip", {**quasi, "pii_class": "postal_code"}),
+                    _typed_column("dob", "date", {**quasi, "pii_class": "date_of_birth"}),
+                    _column("gender", quasi),
+                ],
+            )
+        ]
+    )
+    profile.tables[0].primary_key = KeyCandidate(columns=["entity_id"], confidence=1.0)
+    output = substitute({"people": frame}, profile, key=b"default-qi-key").tables["people"]
+    for name in ("zip", "dob", "gender"):
+        original = [row[name] for row in frame.select(name).collect()]
+        replaced = [row[name] for row in output.select(name).collect()]
+        assert {value for value in original if value is not None}.isdisjoint(
+            value for value in replaced if value is not None
+        )
+        assert sorted(Counter(original).values()) == sorted(Counter(replaced).values())
+        assert len(set(original)) == len(set(replaced))
+        assert sum(value is None for value in original) == sum(value is None for value in replaced)
+
+
+def test_low_confidence_is_skipped_until_a_class_override_names_it(spark: SparkSession) -> None:
+    frame = spark.createDataFrame([("Boston",)], "city string")
+    weak = {**_semantic("city", "quasi_identifier"), "confidence": 0.3}
+    profile = _profile([("t", 1, [_column("city", weak)])])
+    skipped = substitute({"t": frame}, profile, key=b"weak-key")
+    skipped_row = skipped.tables["t"].first()
+    assert skipped_row is not None and skipped_row.city == "Boston"
+    assert skipped.report["columns"][0]["skipped_reason"] == "skipped_low_confidence"
+    policy = PiiPolicy(pii_class={PiiClass.CITY: PiiRule(action=PiiAction.SUPPRESS)})
+    overridden = substitute({"t": frame}, profile, key=b"weak-key", policy=policy)
+    overridden_row = overridden.tables["t"].first()
+    assert overridden_row is not None and overridden_row.city is None
+    assert overridden.report["columns"][0]["rule_source"] == "pii_class"
+
+
+def test_policy_actions_and_generalization_parameters(spark: SparkSession) -> None:
+    frame = spark.createDataFrame(
+        [("02110", 27.0, "Boston", "F")], "zip string, age double, city string, gender string"
+    )
+    quasi = _semantic("other", "quasi_identifier")
+    profile = _profile(
+        [
+            (
+                "t",
+                1,
+                [
+                    _column("zip", {**quasi, "pii_class": "postal_code"}),
+                    _typed_column("age", "float64", quasi),
+                    _column("city", {**quasi, "pii_class": "city"}),
+                    _column("gender", quasi),
+                ],
+            )
+        ]
+    )
+    policy = PiiPolicy(
+        columns={
+            "t.zip": PiiRule(action=PiiAction.GENERALIZE, parameters={"prefix_length": 3}),
+            "t.age": PiiRule(action=PiiAction.GENERALIZE, parameters={"bucket_width": 10}),
+            "t.city": PiiRule(action=PiiAction.SUPPRESS),
+            "t.gender": PiiRule(action=PiiAction.KEEP),
+        }
+    )
+    row = substitute({"t": frame}, profile, key=b"actions-key", policy=policy).tables["t"].first()
+    assert row is not None
+    assert (row.zip, row.age, row.city, row.gender) == ("021", 20.0, None, "F")
+
+
+def test_partial_fk_drop_is_rejected(spark: SparkSession) -> None:
+    parent = spark.createDataFrame([("a",)], "id string")
+    child = spark.createDataFrame([("a",)], "id string")
+    semantic = _semantic("account_id", "direct_identifier")
+    profile = _profile(
+        [("parent", 1, [_column("id", semantic)]), ("child", 1, [_column("id", semantic)])],
+        relationships=[
+            Relationship(
+                child_table="child",
+                child_columns=["id"],
+                parent_table="parent",
+                parent_columns=["id"],
+                coverage=1.0,
+            )
+        ],
+    )
+    policy = PiiPolicy(columns={"child.id": PiiRule(action=PiiAction.DROP)})
+    with pytest.raises(ValueError, match="cannot drop only part"):
+        substitute({"parent": parent, "child": child}, profile, key=b"drop-key", policy=policy)
+
+
+def test_profile_policy_cannot_loosen_direct_identifier_floor(spark: SparkSession) -> None:
+    frame = spark.createDataFrame([("a@example.com",)] * 10, "email string")
+    policy = PiiPolicy(pii_class={PiiClass.EMAIL: PiiRule(action=PiiAction.KEEP)})
+    with pytest.raises(ValueError, match="cannot loosen"):
+        profile_dataframe("t", frame, pii_policy=policy)
 
 
 def test_date_generalization_truncates_to_month_and_is_reported(spark: SparkSession) -> None:
@@ -655,6 +807,7 @@ def test_cli_detect_and_substitute_end_to_end(spark: SparkSession, tmp_path: Pat
     semantic_path = tmp_path / "semantic.json"
     profile_path = tmp_path / "profile.json"
     key_path = tmp_path / "key.bin"
+    policy_path = tmp_path / "policy.yaml"
     output = tmp_path / "output"
     frame = spark.createDataFrame([("a@example.com",), ("b@example.com",)], "email string")
     frame.write.parquet(str(source))
@@ -663,6 +816,7 @@ def test_cli_detect_and_substitute_end_to_end(spark: SparkSession, tmp_path: Pat
     profile_path.write_text(dump_profile(profile_dataframe("customers", frame)), encoding="utf-8")
     key_path.write_bytes(b"cli-test-key".ljust(32, b"!"))
     key_path.chmod(0o600)
+    policy_path.write_text(PiiPolicy(pii_class={PiiClass.EMAIL: PiiRule(action=PiiAction.SUPPRESS)}).to_yaml())
     assert (
         main(
             [
@@ -674,6 +828,8 @@ def test_cli_detect_and_substitute_end_to_end(spark: SparkSession, tmp_path: Pat
                 str(profile_path),
                 "--key-file",
                 str(key_path),
+                "--policy",
+                str(policy_path),
                 "-o",
                 str(output),
             ]
@@ -681,8 +837,9 @@ def test_cli_detect_and_substitute_end_to_end(spark: SparkSession, tmp_path: Pat
         == 0
     )
     values = {row.email for row in spark.read.parquet(str(output / "customers")).collect()}
-    assert values.isdisjoint({"a@example.com", "b@example.com"})
-    assert json.loads((output / "report.json").read_text())["columns"][0]["values_substituted"] == 2
+    assert values == {None}
+    report = json.loads((output / "report.json").read_text())["columns"][0]
+    assert report["action"] == "suppress" and report["rule_source"] == "pii_class"
 
 
 def _column(name: str, semantic: object) -> dict[str, object]:
