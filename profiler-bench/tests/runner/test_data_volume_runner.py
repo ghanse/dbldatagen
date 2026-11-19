@@ -51,35 +51,64 @@ def test_run_fails_up_front_without_frozen_targets(tmp_path: Path) -> None:
         )
 
 
-def test_calibrate_targets_freezes_noise_width(tmp_path: Path) -> None:
-    experiment = tmp_path / "exp"
-    samples = experiment / "samples"
+def _write_calibrate_experiment(
+    root: Path,
+    *,
+    control: bool = True,
+    baseline_hash: str = "prof",
+    candidate_hash: str = "prof",
+    ok: bool = True,
+    privacy_passed: bool = True,
+    fidelity_seeds: int = 4,
+    write_samples: bool = True,
+) -> Path:
+    samples = root / "samples"
     samples.mkdir(parents=True)
-    (experiment / "run.json").write_text(
+    (root / "run.json").write_text(
         json.dumps(
             {
                 "experiment_id": "dv-control-f1",
-                "control": True,
-                "baseline": {"commit": "abc123", "profiler_src_hash": "prof"},
+                "control": control,
+                "datasets": ["numeric"],
+                "fractions": [1.0],
+                "subset_seeds": 1,
+                "fidelity_seeds": fidelity_seeds,
+                "fidelity_tier": "xs",
+                "baseline": {"commit": "abc123", "profiler_src_hash": baseline_hash},
+                "candidate": {"commit": "abc123", "profiler_src_hash": candidate_hash},
                 "harness": {"commit": "harness1", "harness_hash": "hh"},
-                "policy": {"bootstrap": {"samples": 200, "seed": 0, "confidence": 0.95}},
+                "policy": {
+                    "bootstrap": {"samples": 200, "seed": 0, "confidence": 0.95},
+                    "subset_seeds": 1,
+                    "fidelity_seeds": fidelity_seeds,
+                    "fidelity_tier": "xs",
+                },
             }
         )
     )
-    for seed in range(4):
-        record = {
-            "kind": "fidelity",
-            "role": "baseline",
-            "dataset": "numeric",
-            "tier": "xs",
-            "fraction": 1.0,
-            "subset_seed": 0,
-            "seed": seed,
-            "ok": True,
-            "relative_reconstruction": 0.9 + 0.01 * (seed % 2),
-            "privacy_passed": True,
-        }
-        (samples / f"fidelity-baseline-numeric-xs-f-1-subset-0-seed-{seed}.json").write_text(json.dumps(record) + "\n")
+    if write_samples:
+        for seed in range(fidelity_seeds):
+            record = {
+                "kind": "fidelity",
+                "role": "baseline",
+                "dataset": "numeric",
+                "tier": "xs",
+                "fraction": 1.0,
+                "subset_seed": 0,
+                "seed": seed,
+                "ok": ok,
+                "relative_reconstruction": 0.9 + 0.01 * (seed % 2),
+                "privacy_passed": privacy_passed,
+                "subset": {"fraction": 1.0, "overall_actual_fraction": 1.0},
+            }
+            (samples / f"fidelity-baseline-numeric-xs-f-1-subset-0-seed-{seed}.json").write_text(
+                json.dumps(record) + "\n"
+            )
+    return root
+
+
+def test_calibrate_targets_freezes_noise_width(tmp_path: Path) -> None:
+    experiment = _write_calibrate_experiment(tmp_path / "exp")
     out = tmp_path / "proposed.json"
     policy = calibrate_targets(baseline_experiment=experiment, output_policy=out, margin=0.01)
     assert policy["targets"]["numeric"]["T_d"] is not None
@@ -87,7 +116,54 @@ def test_calibrate_targets_freezes_noise_width(tmp_path: Path) -> None:
     assert policy["data_volume"]["control_noise_width_provenance"]["run_id"] == "dv-control-f1"
     assert policy["data_volume"]["control_noise_width_provenance"]["harness_hash"] == "hh"
     assert policy["data_volume"]["f1_regression_bound"]["source"] == "default.json"
+    assert policy["data_volume"]["max_closure_iterations"] == 64
     assert "accuracy" not in policy
+
+
+def test_calibrate_targets_refuses_non_control(tmp_path: Path) -> None:
+    experiment = _write_calibrate_experiment(tmp_path / "exp", control=False)
+    out = tmp_path / "proposed.json"
+    with pytest.raises(ValueError, match=r"run\.control must be true"):
+        calibrate_targets(baseline_experiment=experiment, output_policy=out)
+    assert not out.exists()
+
+
+def test_calibrate_targets_refuses_mismatched_profiler_hashes(tmp_path: Path) -> None:
+    experiment = _write_calibrate_experiment(
+        tmp_path / "exp",
+        baseline_hash="aaa",
+        candidate_hash="bbb",
+    )
+    out = tmp_path / "proposed.json"
+    with pytest.raises(ValueError, match="profiler_src_hash must be identical"):
+        calibrate_targets(baseline_experiment=experiment, output_policy=out)
+    assert not out.exists()
+
+
+def test_calibrate_targets_refuses_incomplete_f1_matrix(tmp_path: Path) -> None:
+    experiment = _write_calibrate_experiment(tmp_path / "exp", fidelity_seeds=4, write_samples=True)
+    # Drop one of four expected baseline cells.
+    (experiment / "samples" / "fidelity-baseline-numeric-xs-f-1-subset-0-seed-3.json").unlink()
+    out = tmp_path / "proposed.json"
+    with pytest.raises(ValueError, match="incomplete f=1 baseline matrix"):
+        calibrate_targets(baseline_experiment=experiment, output_policy=out)
+    assert not out.exists()
+
+
+def test_calibrate_targets_refuses_failed_record(tmp_path: Path) -> None:
+    experiment = _write_calibrate_experiment(tmp_path / "exp", ok=False)
+    out = tmp_path / "proposed.json"
+    with pytest.raises(ValueError, match="f=1 records must all be ok"):
+        calibrate_targets(baseline_experiment=experiment, output_policy=out)
+    assert not out.exists()
+
+
+def test_calibrate_targets_refuses_privacy_failure(tmp_path: Path) -> None:
+    experiment = _write_calibrate_experiment(tmp_path / "exp", privacy_passed=False)
+    out = tmp_path / "proposed.json"
+    with pytest.raises(ValueError, match="privacy must pass"):
+        calibrate_targets(baseline_experiment=experiment, output_policy=out)
+    assert not out.exists()
 
 
 def test_nstar_on_fake_scorer_curve(tmp_path: Path) -> None:
@@ -137,11 +213,21 @@ def test_nstar_on_fake_scorer_curve(tmp_path: Path) -> None:
     assert verdict["verdict"] != "accepted"
     assert "control" in verdict["reasons"]
     assert verdict["n_star"]["baseline"]["numeric"]["n_star"] == 0.5
+    assert "n_star_overall_actual_fraction" in verdict["n_star"]["baseline"]["numeric"]
     samples = list((out / "samples").glob("fidelity-*.json"))
     assert len(samples) == 12  # 2 roles * 3 fractions * 1 subset * 2 seeds
     run = json.loads((out / "run.json").read_text())
     assert run["mode"] == "data-volume"
     assert run["subset_method"] == "fk_preserving_uniform"
+    assert run["max_closure_iterations"] == 64
+    entry = json.loads((out / "benchmark_entry.json").read_text())
+    nstar_entry = entry["summary_metrics"]["n_star"]["baseline"]["numeric"]
+    assert nstar_entry["n_star"] == 0.5
+    assert "n_star_overall_actual_fraction" in nstar_entry
+    assert any(point.get("overall_actual_fraction") is not None for point in nstar_entry["curve"])
+    report = (out / "REPORT.md").read_text()
+    assert "overall_actual" in report
+    assert "n*" in report
 
 
 def test_apply_table_scales_matches_sampler_contract() -> None:

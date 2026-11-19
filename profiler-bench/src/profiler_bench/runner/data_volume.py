@@ -19,7 +19,7 @@ from profiler_bench.runner.identity import BuildIdentity, identify_build, identi
 from profiler_bench.runner.policy import load_policy
 from profiler_bench.runner.scorer import FakeScorer, Scorer, try_real_scorer
 from profiler_bench.runner.spark_conf import DEFAULT_FIDELITY_DRIVER_MEMORY, fidelity_spark_config
-from profiler_bench.runner.subset import DEFAULT_FRACTIONS
+from profiler_bench.runner.subset import DEFAULT_FRACTIONS, DEFAULT_MAX_CLOSURE_ITERATIONS
 
 
 @dataclass(frozen=True)
@@ -93,6 +93,9 @@ def run_data_volume_experiment(config: DataVolumeConfig) -> Path:
     (out / "proposal.json").write_text(json.dumps(proposal, indent=2, sort_keys=True) + "\n")
 
     fidelity_spark = fidelity_spark_config(driver_memory=config.fidelity_driver_memory)
+    max_closure_iterations = int(
+        (policy.get("data_volume") or {}).get("max_closure_iterations", DEFAULT_MAX_CLOSURE_ITERATIONS)
+    )
     run_meta = {
         "experiment_id": config.experiment_id,
         "mode": "data-volume",
@@ -106,6 +109,7 @@ def run_data_volume_experiment(config: DataVolumeConfig) -> Path:
         "fidelity_cell_timeout_s": float(config.fidelity_cell_timeout_s),
         "fidelity_model_source": "harness",
         "subset_method": "fk_preserving_uniform",
+        "max_closure_iterations": max_closure_iterations,
         "baseline": _recorded_identity(baseline.to_dict(), recording_root),
         "candidate": _recorded_identity(candidate.to_dict(), recording_root),
         "harness": _recorded_identity(harness.to_dict(), recording_root),
@@ -575,6 +579,10 @@ def calibrate_targets(
     over K sampler seeds x S subset seeds. Both ``T_d`` and the per-dataset noise
     width (half the f=1 mean CI width) are written with provenance (commit, harness
     hash, run id).
+
+    Refuses (writes nothing) unless: ``run.control`` is true, baseline and candidate
+    ``profiler_src_hash`` match, the f=1 K x S matrix is complete for every selected
+    dataset with every record ``ok``, and privacy passed on every f=1 record.
     """
     from profiler_bench.evaluate.data_volume import calibrate_targets_from_records  # noqa: PLC0415
     from profiler_bench.evaluate.evaluate import load_samples  # noqa: PLC0415
@@ -583,6 +591,7 @@ def calibrate_targets(
     root = Path(baseline_experiment)
     run = json.loads((root / "run.json").read_text())
     _speed, fidelity = load_samples(root / "samples")
+    _require_calibrate_provenance(run, fidelity)
     boot = (run.get("policy") or {}).get("bootstrap") or {}
     targets, noise = calibrate_targets_from_records(
         fidelity,
@@ -593,6 +602,11 @@ def calibrate_targets(
         bootstrap_seed=int(boot.get("seed", 0)),
         confidence=float(boot.get("confidence", 0.95)),
     )
+    if not targets:
+        raise ValueError(
+            "calibrate-targets found no ok baseline f=1 relative_reconstruction scores "
+            f"for datasets={list(run.get('datasets') or [])}"
+        )
     policy_path = base_policy or Path(__file__).resolve().parents[3] / "policies" / "data_volume.json"
     if policy_path.is_file():
         policy = json.loads(policy_path.read_text())
@@ -616,6 +630,7 @@ def calibrate_targets(
     data_volume = dict(policy.get("data_volume") or {})
     data_volume["control_noise_width"] = noise
     data_volume["control_noise_width_provenance"] = provenance
+    data_volume.setdefault("max_closure_iterations", DEFAULT_MAX_CLOSURE_ITERATIONS)
     data_volume["f1_regression_bound"] = {
         "source": "default.json",
         "path": "accuracy.max_dataset_regression",
@@ -627,3 +642,76 @@ def calibrate_targets(
     output_policy.parent.mkdir(parents=True, exist_ok=True)
     output_policy.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n")
     return cast(dict[str, Any], policy)
+
+
+def _require_calibrate_provenance(run: Mapping[str, Any], fidelity: Sequence[dict[str, Any]]) -> None:
+    """Raises ``ValueError`` with a clear reason when calibration provenance is unsafe."""
+    import math  # noqa: PLC0415
+
+    from profiler_bench.evaluate.data_volume import data_volume_sample_key, fraction_token  # noqa: PLC0415
+
+    if not bool(run.get("control")):
+        raise ValueError(
+            "calibrate-targets refuses to freeze targets: run.control must be true "
+            "(same-build control at f=1 required)"
+        )
+    baseline = run.get("baseline") or {}
+    candidate = run.get("candidate") or {}
+    base_hash = baseline.get("profiler_src_hash")
+    cand_hash = candidate.get("profiler_src_hash")
+    if not base_hash or base_hash != cand_hash:
+        raise ValueError(
+            "calibrate-targets refuses to freeze targets: baseline and candidate "
+            f"profiler_src_hash must be identical; got baseline={base_hash!r} candidate={cand_hash!r}"
+        )
+
+    policy = run.get("policy") or {}
+    datasets = [str(name) for name in run.get("datasets") or []]
+    if not datasets:
+        raise ValueError("calibrate-targets refuses to freeze targets: run.datasets is empty")
+    tier = str(run.get("fidelity_tier") or policy.get("fidelity_tier") or "s")
+    subset_seeds = int(run.get("subset_seeds") or policy.get("subset_seeds") or 1)
+    fidelity_seeds = int(run.get("fidelity_seeds") or policy.get("fidelity_seeds") or 1)
+    token = fraction_token(1.0)
+    expected: set[str] = set()
+    for dataset in datasets:
+        for subset_seed in range(subset_seeds):
+            for seed in range(fidelity_seeds):
+                expected.add(f"fidelity/baseline/{dataset}/{tier}/f-{token}/subset-{subset_seed}/seed-{seed}")
+
+    by_key = {data_volume_sample_key(record): record for record in fidelity}
+    missing = sorted(expected - set(by_key))
+    if missing:
+        raise ValueError(
+            "calibrate-targets refuses to freeze targets: incomplete f=1 baseline matrix "
+            f"(need K={fidelity_seeds} x S={subset_seeds} per dataset); missing={missing[:8]}"
+            + ("..." if len(missing) > 8 else "")
+        )
+
+    f1_records = [
+        record
+        for record in fidelity
+        if record.get("kind") == "fidelity" and math.isclose(float(record.get("fraction", 1.0)), 1.0, abs_tol=1e-12)
+    ]
+    not_ok = [data_volume_sample_key(record) for record in f1_records if not record.get("ok")]
+    if not_ok:
+        raise ValueError(
+            "calibrate-targets refuses to freeze targets: f=1 records must all be ok; "
+            f"failed={not_ok[:8]}" + ("..." if len(not_ok) > 8 else "")
+        )
+    privacy_failed = [
+        data_volume_sample_key(record) for record in f1_records if record.get("privacy_passed") is not True
+    ]
+    if privacy_failed:
+        raise ValueError(
+            "calibrate-targets refuses to freeze targets: privacy must pass on every f=1 record; "
+            f"failed={privacy_failed[:8]}" + ("..." if len(privacy_failed) > 8 else "")
+        )
+    # Also require every expected baseline cell itself is ok + privacy-passed (defensive).
+    for key in sorted(expected):
+        record = by_key[key]
+        if not record.get("ok") or record.get("privacy_passed") is not True:
+            raise ValueError(
+                "calibrate-targets refuses to freeze targets: expected baseline f=1 cell "
+                f"{key} is not ok with privacy_passed=true"
+            )

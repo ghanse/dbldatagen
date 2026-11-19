@@ -63,7 +63,7 @@ def build_summary(
             "privacy_all_passed": all(bool(row["privacy_passed"]) for row in rows),
         }
 
-    return {
+    summary: dict[str, Any] = {
         "experiment_id": run.get("experiment_id"),
         "control": run.get("control"),
         "speed": speed,
@@ -73,6 +73,33 @@ def build_summary(
         "profile_determinism": determinism or {},
         "not_measured": run.get("not_measured", []),
     }
+    if str(run.get("mode") or "") == "data-volume" or any(
+        record.get("subset") is not None for record in fidelity_records
+    ):
+        summary["input_fractions"] = _input_fraction_summary(fidelity_records)
+    return summary
+
+
+def _input_fraction_summary(fidelity_records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Mean realized overall input fraction next to each nominal grid ``f``."""
+    by_key: dict[tuple[str, str, float], list[float]] = defaultdict(list)
+    for record in fidelity_records:
+        if not record.get("ok"):
+            continue
+        subset = record.get("subset") or {}
+        raw = subset.get("overall_actual_fraction")
+        if raw is None:
+            continue
+        key = (str(record["role"]), str(record["dataset"]), float(record.get("fraction", 1.0)))
+        by_key[key].append(float(raw))
+    out: dict[str, Any] = {}
+    for (role, dataset, fraction), values in sorted(by_key.items()):
+        out[f"{role}/{dataset}@f={fraction:g}"] = {
+            "fraction": fraction,
+            "overall_actual_fraction_mean": sum(values) / len(values),
+            "n": len(values),
+        }
+    return out
 
 
 def build_benchmark_entry(
@@ -127,8 +154,39 @@ def build_benchmark_entry(
                 }
                 for key, value in summary.get("speed", {}).items()
             },
+            "n_star": _nstar_both(verdict.get("n_star")),
+            "input_fractions": summary.get("input_fractions"),
         },
     }
+
+
+def _nstar_both(n_star: object) -> dict[str, Any] | None:
+    """Returns n* as both grid ``f`` and realized overall input fraction."""
+    if not isinstance(n_star, dict):
+        return None
+    out: dict[str, Any] = {}
+    for role, datasets in n_star.items():
+        if not isinstance(datasets, dict):
+            continue
+        out[str(role)] = {}
+        for dataset, payload in datasets.items():
+            if not isinstance(payload, dict):
+                continue
+            out[str(role)][str(dataset)] = {
+                "n_star": payload.get("n_star"),
+                "n_star_overall_actual_fraction": payload.get("n_star_overall_actual_fraction"),
+                "curve": [
+                    {
+                        "fraction": point.get("fraction"),
+                        "overall_actual_fraction": point.get("overall_actual_fraction"),
+                        "status": point.get("status"),
+                        "mean": point.get("mean"),
+                    }
+                    for point in (payload.get("curve") or [])
+                    if isinstance(point, dict)
+                ],
+            }
+    return out or None
 
 
 def render_report(
@@ -164,6 +222,26 @@ def render_report(
     lines.extend(["", "## Gates", ""])
     for gate in verdict.get("gates", []):
         lines.append(f"- `{gate['name']}`: {gate['status']} ({gate['reason']})")
+    n_star = verdict.get("n_star")
+    if isinstance(n_star, dict) and n_star:
+        lines.extend(["", "## n* (grid f and realized overall input fraction)", ""])
+        for role, datasets in sorted(n_star.items()):
+            if not isinstance(datasets, dict):
+                continue
+            for dataset, payload in sorted(datasets.items()):
+                if not isinstance(payload, dict):
+                    continue
+                lines.append(
+                    f"- `{role}/{dataset}`: n* grid `f={payload.get('n_star')}` "
+                    f"(overall_actual={payload.get('n_star_overall_actual_fraction')})"
+                )
+                for point in payload.get("curve") or []:
+                    if not isinstance(point, dict):
+                        continue
+                    lines.append(
+                        f"  - f={point.get('fraction')} overall_actual={point.get('overall_actual_fraction')} "
+                        f"status={point.get('status')} mean={point.get('mean')}"
+                    )
     lines.extend(["", "## Summary", "", "```json", json.dumps(summary, indent=2, sort_keys=True), "```", ""])
     if determinism is not None:
         lines.extend(

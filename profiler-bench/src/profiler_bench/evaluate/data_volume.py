@@ -41,6 +41,7 @@ def search_nstar(
     n_bootstrap: int = 2000,
     seed: int = 0,
     confidence: float = 0.95,
+    actual_fractions: Mapping[float, Sequence[float]] | None = None,
 ) -> dict[str, Any]:
     """Finds ``n*`` on ``fractions`` for one dataset from per-fraction scores.
 
@@ -48,18 +49,25 @@ def search_nstar(
     relative reconstruction is ``>= target - noise_width``. When the interval
     straddles that threshold the fraction is inconclusive. If no fraction
     reaches the target, ``n_star`` is ``1.0`` and ``flagged`` is true.
+
+    Gates stay on the nominal grid ``f``. Each curve point and ``n_star`` also
+    record the mean realized overall input fraction (closure may pull extra rows).
     """
     grid = list(fractions) if fractions is not None else list(DEFAULT_FRACTIONS)
+    actuals = actual_fractions or {}
     points: list[dict[str, Any]] = []
     n_star = 1.0
+    n_star_actual: float | None = None
     flagged = True
     first_reached: float | None = None
     for index, fraction in enumerate(grid):
         scores = list(curve.get(fraction, []))
+        overall_actual = _mean_or_none(actuals.get(fraction, []))
         if not scores:
             points.append(
                 {
                     "fraction": fraction,
+                    "overall_actual_fraction": overall_actual,
                     "status": "not_reached",
                     "reason": "missing_scores",
                     "mean": None,
@@ -87,6 +95,7 @@ def search_nstar(
         points.append(
             {
                 "fraction": fraction,
+                "overall_actual_fraction": overall_actual,
                 "status": status,
                 "reason": reason,
                 "mean": ci.point,
@@ -97,9 +106,19 @@ def search_nstar(
         if status == "reached" and first_reached is None:
             first_reached = fraction
             n_star = fraction
+            n_star_actual = overall_actual
             flagged = False
+    if n_star_actual is None:
+        n_star_actual = _mean_or_none(actuals.get(n_star, []))
+        if n_star_actual is None:
+            # Fall back to the curve point recorded for the grid n*.
+            for point in points:
+                if math.isclose(float(point["fraction"]), float(n_star), abs_tol=1e-12):
+                    n_star_actual = point.get("overall_actual_fraction")
+                    break
     return {
         "n_star": n_star,
+        "n_star_overall_actual_fraction": n_star_actual,
         "flagged": flagged,
         "curve": points,
         "target": float(target),
@@ -148,6 +167,7 @@ def evaluate_data_volume_gates(
     gates.append(_control_guard(run))
 
     curves = _curves_by_role(fidelity_records)
+    actuals = _actual_fractions_by_role(fidelity_records)
     boot = policy.get("bootstrap") or {}
     fractions = [float(value) for value in (run.get("fractions") or policy.get("fractions") or DEFAULT_FRACTIONS)]
     targets = _targets_from_policy(policy)
@@ -177,6 +197,7 @@ def evaluate_data_volume_gates(
                 n_bootstrap=int(boot.get("samples", 2000)),
                 seed=int(boot.get("seed", 0)),
                 confidence=float(boot.get("confidence", 0.95)),
+                actual_fractions=(actuals.get(role) or {}).get(dataset),
             )
 
     gates.append(_nstar_improvement_gate(per_role_nstar, proposal, fractions))
@@ -358,6 +379,36 @@ def _curves_by_role(
     }
 
 
+def _actual_fractions_by_role(
+    fidelity_records: Sequence[dict[str, Any]],
+) -> dict[str, dict[str, dict[float, list[float]]]]:
+    """Collects realized overall input fractions keyed by role/dataset/grid ``f``."""
+    out: dict[str, dict[str, dict[float, list[float]]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for record in fidelity_records:
+        if record.get("kind") != "fidelity" or not record.get("ok"):
+            continue
+        subset = record.get("subset") or {}
+        raw = subset.get("overall_actual_fraction")
+        if raw is None:
+            raw = record.get("overall_actual_fraction")
+        if raw is None:
+            continue
+        role = str(record["role"])
+        dataset = str(record["dataset"])
+        fraction = float(record.get("fraction", 1.0))
+        out[role][dataset][fraction].append(float(raw))
+    return {
+        role: {dataset: {frac: list(values) for frac, values in curve.items()} for dataset, curve in datasets.items()}
+        for role, datasets in out.items()
+    }
+
+
+def _mean_or_none(values: Sequence[float]) -> float | None:
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
 def _nstar_improvement_gate(
     per_role_nstar: Mapping[str, Mapping[str, Any]],
     proposal: Mapping[str, Any],
@@ -407,6 +458,8 @@ def _compare_nstar_roles(
         detail["datasets"][dataset] = {
             "baseline_n_star": base,
             "candidate_n_star": cand,
+            "baseline_n_star_overall_actual_fraction": baseline[dataset].get("n_star_overall_actual_fraction"),
+            "candidate_n_star_overall_actual_fraction": candidate[dataset].get("n_star_overall_actual_fraction"),
             "baseline_flagged": baseline[dataset].get("flagged"),
             "candidate_flagged": candidate[dataset].get("flagged"),
             "baseline_curve": baseline[dataset].get("curve"),

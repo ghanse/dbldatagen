@@ -331,16 +331,20 @@ reaches a per-dataset accuracy target `T_d`. The harness, not the profiler, choo
 builds a deterministic **FK-preserving uniform** subset: sample **every** table independently at `f` with a seeded
 hash of the primary key (or full row content when there is no PK), then take the **upward closure** under foreign
 keys (add every parent row referenced by a selected child, including composite keys, self-references, and cycles)
-until a fixpoint; method name `fk_preserving_uniform`. Realized per-table and overall input fractions are recorded
-alongside the grid `f` that indexes `n*`. Every non-empty table keeps at least one row. The profiler sees only that
-subset and is not told the full row counts. Reconstruction is scored against the **full** real tables; before
-sampling, each profiled `row_count` is scaled by `full_rows / profile_rows` for that table (equivalent to calling
-the reference sampler with a per-table scale) so synthetic row counts match. Distinct counts, cardinality, FK
-fan-out, and extrema remain the profiler's job to extrapolate.
+until a fixpoint; method name `fk_preserving_uniform`. Closure truncates Spark lineage each iteration and is capped
+by policy `data_volume.max_closure_iterations` (default 64, recorded in `run.json`); exceeding the cap fails
+loudly. Realized per-table and overall input fractions are recorded alongside the grid `f` that indexes `n*`
+(gates stay on nominal `f`; `REPORT.md` / `benchmark_entry.json` show both). Every non-empty table keeps at least
+one row. The profiler sees only that subset and is not told the full row counts. Reconstruction is scored against
+the **full** real tables; before sampling, each profiled `row_count` is scaled by `full_rows / profile_rows` for
+that table (equivalent to calling the reference sampler with a per-table scale) so synthetic row counts match.
+Distinct counts, cardinality, FK fan-out, and extrema remain the profiler's job to extrapolate.
 
 `T_d` and the control noise width are frozen per dataset by `calibrate-targets` from a same-build control at
-`f = 1` (K × S seeds), with provenance (commit, harness hash, run id). `run --mode data-volume` refuses to start
-unless every selected dataset has both. Compute a proposed policy with:
+`f = 1` (K × S seeds), with provenance (commit, harness hash, run id). Calibration refuses to write unless
+`run.control` is true, baseline/candidate `profiler_src_hash` match, the f=1 matrix is complete (every cell ok),
+and privacy passed on every f=1 record. `run --mode data-volume` refuses to start unless every selected dataset
+has both. Compute a proposed policy with:
 
 ```bash
 uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi calibrate-targets \

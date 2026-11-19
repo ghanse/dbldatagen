@@ -5,10 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
 
 from profiler_bench.catalog import load, materialize
 from profiler_bench.catalog.manifest import Column, ForeignKey, Manifest, Table
+from profiler_bench.runner import subset as subset_mod
 from profiler_bench.runner.subset import apply_table_scales, subset_tables
 
 
@@ -270,3 +271,89 @@ def test_apply_table_scales_sets_full_row_counts() -> None:
     assert scaled["tables"][0]["row_count"] == 1000
     assert scaled["tables"][1]["row_count"] == 100
     assert profile["tables"][0]["row_count"] == 100
+
+
+def _self_ref_chain(spark: SparkSession, depth: int) -> tuple[DataFrame, Manifest]:
+    """Builds a depth-long manager chain ending at a root with manager_id=None."""
+    rows: list[tuple[int, int | None]] = [(1, None)]
+    for emp_id in range(2, depth + 1):
+        rows.append((emp_id, emp_id - 1))
+    employees = spark.createDataFrame(rows, ["id", "manager_id"])
+    manifest = Manifest(
+        dataset="self_ref_chain",
+        tier="xs",
+        structure_seed=0,
+        description="long self-ref chain",
+        tables=(Table(name="employees", columns=(Column(name="id"), Column(name="manager_id")), primary_key=("id",)),),
+        foreign_keys=(
+            ForeignKey(
+                child_table="employees",
+                child_columns=("manager_id",),
+                parent_table="employees",
+                parent_columns=("id",),
+            ),
+        ),
+    )
+    return employees, manifest
+
+
+def test_deep_self_ref_chain_converges_within_cap(spark: SparkSession) -> None:
+    employees, manifest = _self_ref_chain(spark, depth=200)
+    # Seeded hash sample of only the leaf; upward closure must walk the full chain.
+    leaf = employees.where("id = 200")
+    full = {"employees": employees}
+    selected = {"employees": leaf}
+    closed = subset_mod._upward_closure(
+        full,
+        selected,
+        manifest.foreign_keys,
+        max_closure_iterations=200,
+    )
+    ids = {row.id for row in closed["employees"].collect()}
+    assert ids == set(range(1, 201))
+
+
+def test_closure_exceeding_small_cap_fails_loudly(spark: SparkSession) -> None:
+    employees, manifest = _self_ref_chain(spark, depth=20)
+    leaf = employees.where("id = 20")
+    with pytest.raises(RuntimeError, match="max_closure_iterations=5"):
+        subset_mod._upward_closure(
+            {"employees": employees},
+            {"employees": leaf},
+            manifest.foreign_keys,
+            max_closure_iterations=5,
+        )
+
+
+def test_closure_job_count_per_iteration_constant(spark: SparkSession) -> None:
+    """Lineage truncation keeps Spark job count flat across closure iterations."""
+    employees, manifest = _self_ref_chain(spark, depth=24)
+    leaf = employees.where("id = 24")
+    sc = spark.sparkContext
+    group = "dv-closure-job-const"
+    sc.setJobGroup(group, "closure constancy", interruptOnCancel=False)
+    before = len(sc.statusTracker().getJobIdsForGroup(group))
+    snapshots: list[int] = []
+
+    def on_iteration_abs(_depth: int, changed: bool) -> None:
+        if changed:
+            snapshots.append(len(sc.statusTracker().getJobIdsForGroup(group)))
+
+    try:
+        closed = subset_mod._upward_closure(
+            {"employees": employees},
+            {"employees": leaf},
+            manifest.foreign_keys,
+            max_closure_iterations=64,
+            _on_iteration=on_iteration_abs,
+        )
+    finally:
+        sc.setLocalProperty("spark.jobGroup.id", "")
+        sc.setLocalProperty("spark.job.description", "")
+    assert {row.id for row in closed["employees"].collect()} == set(range(1, 25))
+    assert len(snapshots) >= 10
+    per_iter = [snapshots[0] - before] + [snapshots[i] - snapshots[i - 1] for i in range(1, len(snapshots))]
+    # After the first materialization-heavy iteration, each subsequent iteration should stay
+    # within a small constant band (no lineage-driven growth with depth).
+    steady = per_iter[1:]
+    assert max(steady) <= min(steady) + 2, f"job counts grew with depth: {per_iter}"

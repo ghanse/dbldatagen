@@ -31,10 +31,21 @@ def test_nstar_search_known_curve() -> None:
         0.5: [0.95, 0.95, 0.95, 0.95],
         1.0: [0.96, 0.96, 0.96, 0.96],
     }
-    result = search_nstar(curve, target=0.80, noise_width=0.0, fractions=FRACTIONS, n_bootstrap=200, seed=0)
+    actual = {0.05: [0.08], 0.1: [0.14], 0.2: [0.27, 0.29], 0.5: [0.55], 1.0: [1.0]}
+    result = search_nstar(
+        curve,
+        target=0.80,
+        noise_width=0.0,
+        fractions=FRACTIONS,
+        n_bootstrap=200,
+        seed=0,
+        actual_fractions=actual,
+    )
     assert result["n_star"] == 0.2
+    assert result["n_star_overall_actual_fraction"] == pytest.approx(0.28)
     assert result["flagged"] is False
     assert result["curve"][2]["status"] == "reached"
+    assert result["curve"][2]["overall_actual_fraction"] == pytest.approx(0.28)
 
 
 def test_nstar_flagged_when_never_reached() -> None:

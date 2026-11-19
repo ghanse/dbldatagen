@@ -12,7 +12,7 @@ recorded on every sample is ``fk_preserving_uniform``.
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +26,7 @@ from profiler_bench.fidelity.frames import HASH_RANGE, identifier
 
 METHOD = "fk_preserving_uniform"
 DEFAULT_FRACTIONS: tuple[float, ...] = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0)
+DEFAULT_MAX_CLOSURE_ITERATIONS = 64
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,7 @@ def subset_tables(
     *,
     fraction: float,
     subset_seed: int,
+    max_closure_iterations: int = DEFAULT_MAX_CLOSURE_ITERATIONS,
 ) -> SubsetResult:
     """Returns a deterministic FK-preserving subset of ``frames`` at ``fraction``.
 
@@ -82,15 +84,19 @@ def subset_tables(
         manifest: Ground-truth manifest providing foreign keys.
         fraction: Target row fraction in ``(0, 1]``. ``1.0`` returns the inputs unchanged.
         subset_seed: Seed mixed into the per-row content/key hash.
+        max_closure_iterations: Cap on upward-closure iterations (policy default 64).
 
     Returns:
         Subset frames plus per-table scales and realized input fractions.
 
     Raises:
         ValueError: If ``fraction`` is outside ``(0, 1]`` or a frame is missing.
+        RuntimeError: If upward closure does not converge within ``max_closure_iterations``.
     """
     if not 0.0 < fraction <= 1.0:
         raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+    if int(max_closure_iterations) < 1:
+        raise ValueError(f"max_closure_iterations must be >= 1, got {max_closure_iterations}")
     missing = [table.name for table in manifest.tables if table.name not in frames]
     if missing:
         raise ValueError(f"missing frames for tables: {missing}")
@@ -117,7 +123,12 @@ def subset_tables(
             key_columns=key_columns,
         )
 
-    selected = _upward_closure(frames, selected, manifest.foreign_keys)
+    selected = _upward_closure(
+        frames,
+        selected,
+        manifest.foreign_keys,
+        max_closure_iterations=int(max_closure_iterations),
+    )
     subset_counts = {name: int(frame.count()) for name, frame in selected.items()}
     return _result(
         tables=selected,
@@ -215,13 +226,20 @@ def _upward_closure(
     full: Mapping[str, DataFrame],
     selected: Mapping[str, DataFrame],
     foreign_keys: Sequence[ForeignKey],
+    *,
+    max_closure_iterations: int = DEFAULT_MAX_CLOSURE_ITERATIONS,
+    _on_iteration: Callable[[int, bool], None] | None = None,
 ) -> dict[str, DataFrame]:
-    """Adds every parent row referenced by a selected child until a fixpoint (bounded by sizes)."""
-    current = dict(selected)
+    """Adds every parent row referenced by a selected child until a fixpoint.
+
+    Each iteration truncates Spark lineage (``localCheckpoint`` / cached materialization)
+    so a long self-reference chain cannot grow plans or explode job counts. The loop is
+    capped by ``max_closure_iterations``; exceeding the cap fails loudly.
+    """
+    current = _materialize_frames(dict(selected))
     if not foreign_keys:
         return current
-    max_rows = sum(int(frame.count()) for frame in full.values())
-    for _ in range(max(1, max_rows)):
+    for depth in range(1, int(max_closure_iterations) + 1):
         changed = False
         for fk in foreign_keys:
             if fk.child_table not in current or fk.parent_table not in full:
@@ -246,9 +264,32 @@ def _upward_closure(
                 continue
             current[fk.parent_table] = parent_selected.unionByName(new_rows)
             changed = True
+        if changed:
+            # Truncate lineage every iteration so plan size stays O(1) in chain depth.
+            current = _materialize_frames(current)
+        if _on_iteration is not None:
+            _on_iteration(depth, changed)
         if not changed:
             return current
-    raise RuntimeError("upward FK closure exceeded table-size bound")
+    tables = ", ".join(sorted(current))
+    raise RuntimeError(
+        "upward FK closure did not converge within "
+        f"max_closure_iterations={int(max_closure_iterations)} "
+        f"(chain depth > {int(max_closure_iterations)}); tables=[{tables}]"
+    )
+
+
+def _materialize_frames(frames: Mapping[str, DataFrame]) -> dict[str, DataFrame]:
+    """Truncates lineage for every frame via localCheckpoint, falling back to cache+count."""
+    out: dict[str, DataFrame] = {}
+    for name, frame in frames.items():
+        try:
+            out[name] = frame.localCheckpoint(eager=True)
+        except Exception:
+            cached = frame.cache()
+            cached.count()
+            out[name] = cached
+    return out
 
 
 def _semi_join(

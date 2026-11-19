@@ -40,8 +40,9 @@
   },
   "data_volume": {
     "min_nstar_improvement_steps": 1,
+    "max_closure_iterations": 64,
     "reached_rule": "ci_lower >= T_d - control_noise_width",
-    "reached_rule_note": "Paired bootstrap over (subset seed, sampler seed) for the per-fraction mean relative reconstruction. A fraction is reached only if the CI lower bound clears T_d minus the frozen control noise width written by calibrate-targets. A crossing interval is inconclusive.",
+    "reached_rule_note": "Paired bootstrap over (subset seed, sampler seed) for the per-fraction mean relative reconstruction. A fraction is reached only if the CI lower bound clears T_d minus the frozen control noise width written by calibrate-targets. A crossing interval is inconclusive. Gates stay on the nominal grid f; reports also show the realized overall input fraction after upward FK closure.",
     "control_noise_width": {},
     "f1_regression_bound": {
       "source": "default.json",

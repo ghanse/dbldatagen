@@ -79,14 +79,21 @@ def _profile_once(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str,
     )
     subset_meta = None
     if args.fraction is not None:
-        from profiler_bench.runner.subset import subset_tables  # noqa: PLC0415
+        from profiler_bench.runner.subset import (  # noqa: PLC0415
+            DEFAULT_MAX_CLOSURE_ITERATIONS,
+            subset_tables,
+        )
 
         manifest = materialize(args.dataset, args.tier, seed=args.seed, sample_seed=sample_seed).manifest
+        max_closure = int(
+            (policy.get("data_volume") or {}).get("max_closure_iterations", DEFAULT_MAX_CLOSURE_ITERATIONS)
+        )
         subset = subset_tables(
             tables,
             manifest,
             fraction=float(args.fraction),
             subset_seed=int(args.subset_seed),
+            max_closure_iterations=max_closure,
         )
         tables = subset.tables
         subset_meta = subset.to_meta()
