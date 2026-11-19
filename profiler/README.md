@@ -168,7 +168,12 @@ pii_class:
     parameters: {prefix_length: 3}
 columns:
   customers.notes: {action: suppress}
+  customers.unclassified_contact: {action: substitute, pii_class: email}
 ```
+
+A fully-qualified column rule also applies when detection found no semantic class. For `substitute`, an optional
+`pii_class` selects class-specific formatting. Without it, substitution uses a generic opaque keyed surrogate while
+preserving numeric and date types. This behavior also applies to nested fields.
 
 The same file can be passed to `dbldatagen-profile profile --policy policy.yaml`. At profile time, policy rules may
 only remove or coarsen emitted information. They cannot weaken the spec 0.2.0 floor for direct identifiers and

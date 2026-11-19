@@ -76,6 +76,9 @@ def profile_tables(
     """
     if not tables:
         raise ValueError("at least one table is required")
+    if pii_policy is not None:
+        references = {f"{table}.{path}" for table, frame in tables.items() for path in _schema_paths(frame.schema)}
+        pii_policy.validate_columns(references)
     policy = privacy or PrivacyPolicy()
     with _utc_session_time_zones(tables.values()):
         analyses = {name: analyze_table(frame) for name, frame in tables.items()} if detect_pii else {}
@@ -142,10 +145,14 @@ def _protect_column(
 ) -> ColumnProfile:
     updates: dict[str, Any] = {}
     semantic = semantics.get(path)
+    reference = f"{table}.{path}"
+    rule = (
+        pii_policy.resolve(reference, semantic)[0]
+        if pii_policy is not None and semantic is not None
+        else (pii_policy.columns.get(reference) if pii_policy is not None else None)
+    )
     if semantic is not None:
         updates["semantic"] = semantic
-        reference = f"{table}.{path}"
-        rule = pii_policy.resolve(reference, semantic)[0] if pii_policy is not None else None
         low_confidence = (
             pii_policy is not None
             and semantic.confidence < pii_policy.min_confidence
@@ -158,22 +165,43 @@ def _protect_column(
             and rule.action == PiiAction.KEEP
         ):
             raise ValueError(f"PII policy cannot loosen the spec 0.2.0 privacy floor for {reference!r}")
-        if semantic.sensitivity.value in {"direct_identifier", "secret"} or (
+        protect = semantic.sensitivity.value in {"direct_identifier", "secret"} or (
             rule is not None and not low_confidence and rule.action != PiiAction.KEEP
-        ):
-            if column.numeric is not None:
-                updates["numeric"] = column.numeric.model_copy(
-                    update={"min": None, "max": None, "quantiles": None, "histogram": None}
-                )
-            if column.temporal is not None:
-                updates["temporal"] = column.temporal.model_copy(update={"min": None, "max": None, "quantiles": None})
-            if column.string is not None:
-                updates["string"] = column.string.model_copy(update={"top_values": None})
+        )
+    else:
+        protect = rule is not None and rule.action != PiiAction.KEEP
+    if protect:
+        if column.numeric is not None:
+            updates["numeric"] = column.numeric.model_copy(
+                update={"min": None, "max": None, "quantiles": None, "histogram": None}
+            )
+        if column.temporal is not None:
+            updates["temporal"] = column.temporal.model_copy(update={"min": None, "max": None, "quantiles": None})
+        if column.string is not None:
+            updates["string"] = column.string.model_copy(update={"top_values": None})
     if column.children is not None:
         updates["children"] = [
             _protect_column(child, table, f"{path}.{child.name}", semantics, pii_policy) for child in column.children
         ]
     return column.model_copy(update=updates) if updates else column
+
+
+def _schema_paths(schema: T.StructType) -> Iterator[str]:
+    """Yields top-level and nested profile paths from a Spark schema."""
+
+    def descendants(path: str, data_type: T.DataType) -> Iterator[str]:
+        yield path
+        if isinstance(data_type, T.StructType):
+            for field in data_type.fields:
+                yield from descendants(f"{path}.{field.name}", field.dataType)
+        elif isinstance(data_type, T.ArrayType):
+            yield from descendants(f"{path}.element", data_type.elementType)
+        elif isinstance(data_type, T.MapType):
+            yield from descendants(f"{path}.key", data_type.keyType)
+            yield from descendants(f"{path}.value", data_type.valueType)
+
+    for field in schema.fields:
+        yield from descendants(field.name, field.dataType)
 
 
 @contextmanager

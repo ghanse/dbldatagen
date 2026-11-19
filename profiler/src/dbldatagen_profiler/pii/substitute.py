@@ -67,12 +67,13 @@ def substitute(  # noqa: PLR0912, PLR0915
         raise ValueError(f"tables are absent from profile: {missing}")
     domains = _domains(profile, opts)
     decisions = _decisions(profile, handling, opts)
-    decisions = _domain_decisions(profile, domains, decisions, handling)
+    decisions = _domain_decisions(domains, decisions)
     domain_semantics: dict[str, Semantic] = {}
     for table_name, path, column in _profile_columns(profile):
         decision = decisions.get(f"{table_name}.{path}")
-        if column.semantic is not None and decision is not None and decision[0].action == PiiAction.SUBSTITUTE:
-            domain_semantics.setdefault(domains[f"{table_name}.{path}"], column.semantic)
+        semantic = column.semantic or (_rule_semantic(decision[0]) if decision is not None else None)
+        if semantic is not None and decision is not None and decision[0].action == PiiAction.SUBSTITUTE:
+            domain_semantics.setdefault(domains[f"{table_name}.{path}"], semantic)
     mappings: dict[str, DataFrame] = {}
     nested_mappings: dict[str, Broadcast[dict[str, str]]] = {}
     collision_counts: dict[str, int] = {}
@@ -80,10 +81,10 @@ def substitute(  # noqa: PLR0912, PLR0915
         domains[f"{table}.{path}"]
         for table, path, column in _profile_columns(profile)
         if "." in path
-        and column.semantic is not None
         and decisions.get(f"{table}.{path}", (PiiRule(action=PiiAction.KEEP), "default"))[0].action
         == PiiAction.SUBSTITUTE
-        and column.semantic.pii_class not in {PiiClass.FREE_TEXT_PII, PiiClass.DATE_OF_BIRTH}
+        and _decision_pii_class(column, decisions[f"{table}.{path}"][0])
+        not in {PiiClass.FREE_TEXT_PII, PiiClass.DATE_OF_BIRTH}
     }
     for domain, semantic in domain_semantics.items():
         if semantic.pii_class in {PiiClass.FREE_TEXT_PII, PiiClass.DATE_OF_BIRTH}:
@@ -116,15 +117,12 @@ def substitute(  # noqa: PLR0912, PLR0915
             nested_all = [
                 (
                     path.removeprefix(f"{name}."),
-                    column.semantic,
+                    column.semantic or _rule_semantic(decisions[f"{table_name}.{path}"][0]),
                     domains[f"{table_name}.{path}"],
                     decisions[f"{table_name}.{path}"],
                 )
                 for nested_table, path, column in _profile_columns(profile)
-                if nested_table == table_name
-                and path.startswith(f"{name}.")
-                and column.semantic is not None
-                and f"{table_name}.{path}" in decisions
+                if nested_table == table_name and path.startswith(f"{name}.") and f"{table_name}.{path}" in decisions
             ]
             nested_active = [item for item in nested_all if item[3][0].action != PiiAction.KEEP]
             if rule.action == PiiAction.DROP:
@@ -168,7 +166,8 @@ def substitute(  # noqa: PLR0912, PLR0915
                     if nested_rule.action == PiiAction.KEEP:
                         report["skipped_reason"] = (
                             "skipped_low_confidence"
-                            if semantic.confidence < handling.min_confidence
+                            if semantic is not None
+                            and semantic.confidence < handling.min_confidence
                             and not handling.has_override(f"{table_name}.{name}.{path}", semantic)
                             else "kept_by_policy"
                         )
@@ -178,7 +177,8 @@ def substitute(  # noqa: PLR0912, PLR0915
                     report = _report(table_name, f"{name}.{path}", semantic, domain, 0, 0, nested_rule, nested_source)
                     report["skipped_reason"] = (
                         "skipped_low_confidence"
-                        if semantic.confidence < handling.min_confidence
+                        if semantic is not None
+                        and semantic.confidence < handling.min_confidence
                         and not handling.has_override(f"{table_name}.{name}.{path}", semantic)
                         else "kept_by_policy"
                     )
@@ -243,9 +243,7 @@ def substitute(  # noqa: PLR0912, PLR0915
 def _decisions(profile: Profile, policy: PiiPolicy, options: SubstitutionOptions) -> dict[str, tuple[PiiRule, str]]:
     decisions: dict[str, tuple[PiiRule, str]] = {}
     references = {f"{table}.{path}" for table, path, _ in _profile_columns(profile)}
-    unknown = sorted(set(policy.columns) - references)
-    if unknown:
-        raise ValueError(f"PII policy column rules match no profile column: {unknown}")
+    policy.validate_columns(references)
     for table, path, column in _profile_columns(profile):
         reference = f"{table}.{path}"
         if reference in options.generalize or path.rsplit(".", maxsplit=1)[-1] in options.generalize:
@@ -266,6 +264,33 @@ def _decisions(profile: Profile, policy: PiiPolicy, options: SubstitutionOptions
     return decisions
 
 
+def _rule_semantic(rule: PiiRule) -> Semantic | None:
+    """Creates value-free semantics for an explicitly substituted undetected column."""
+    if rule.action != PiiAction.SUBSTITUTE:
+        return None
+    pii_class = rule.pii_class or PiiClass.OTHER
+    if pii_class == PiiClass.SECRET_TOKEN:
+        sensitivity = Sensitivity.SECRET
+    elif pii_class == PiiClass.FREE_TEXT_PII:
+        sensitivity = Sensitivity.FREE_TEXT
+    elif pii_class in {PiiClass.CITY, PiiClass.POSTAL_CODE, PiiClass.DATE_OF_BIRTH}:
+        sensitivity = Sensitivity.QUASI_IDENTIFIER
+    else:
+        sensitivity = Sensitivity.DIRECT_IDENTIFIER
+    method = "policy_column" if rule.pii_class is not None else "policy_column_generic"
+    return Semantic(
+        pii_class=pii_class,
+        sensitivity=sensitivity,
+        confidence=1.0,
+        evidence=[{"method": method, "match_rate": 1.0}],
+    )
+
+
+def _decision_pii_class(column: ColumnProfile, rule: PiiRule) -> PiiClass | None:
+    semantic = column.semantic or _rule_semantic(rule)
+    return semantic.pii_class if semantic is not None else None
+
+
 def _profile_columns(profile: Profile) -> Iterator[tuple[str, str, ColumnProfile]]:
     def descendants(table_name: str, path: str, column: ColumnProfile) -> Iterator[tuple[str, str, ColumnProfile]]:
         yield table_name, path, column
@@ -278,10 +303,8 @@ def _profile_columns(profile: Profile) -> Iterator[tuple[str, str, ColumnProfile
 
 
 def _domain_decisions(
-    profile: Profile,
     domains: dict[str, str],
     decisions: dict[str, tuple[PiiRule, str]],
-    policy: PiiPolicy,
 ) -> dict[str, tuple[PiiRule, str]]:
     """Makes one join-safe decision per substitution domain."""
     by_domain: dict[str, list[str]] = {}
@@ -298,18 +321,19 @@ def _domain_decisions(
     resolved = dict(decisions)
     for members in by_domain.values():
         rules = {reference: decisions[reference] for reference in members}
-        explicit = [
-            reference
-            for reference, (_, source) in rules.items()
-            if source in {"column", "pii_class"}
-            or (source == "sensitivity" and "sensitivity" in policy.model_fields_set)
-        ]
-        if explicit and len({rule.model_dump_json() for rule, _ in rules.values()}) > 1:
+        explicit = [reference for reference, (_, source) in rules.items() if source in {"column", "pii_class"}]
+        domain = domains[members[0]]
+        domain_members = [reference for reference, member_domain in domains.items() if member_domain == domain]
+        dropped = [reference for reference, (rule, _) in rules.items() if rule.action == PiiAction.DROP]
+        if dropped and (len(dropped) != len(domain_members)):
+            missing = sorted(set(domain_members) - set(dropped))
+            raise ValueError(f"cannot drop only part of an FK-linked column set; also drop {missing}")
+        if len(explicit) >= 2 and len({rules[reference][0].model_dump_json() for reference in explicit}) > 1:
             descriptions = ", ".join(f"{reference}={rules[reference][0].action.value}" for reference in sorted(rules))
             raise ValueError(f"conflicting explicit PII rules for linked columns: {descriptions}")
         winner_reference = max(members, key=lambda reference: rank[rules[reference][0].action])
-        winner = rules[winner_reference]
-        domain = domains[winner_reference]
+        winner_rule = rules[winner_reference][0]
+        winner = (winner_rule, f"fk_group:{winner_reference}") if len(domain_members) > 1 else rules[winner_reference]
         for reference, member_domain in domains.items():
             if member_domain == domain:
                 resolved[reference] = winner
@@ -350,7 +374,9 @@ def _build_mapping(
     mapping = values.distinct().withColumn("counter", F.lit(0))
     _check_surrogate_capacity(mapping, semantic, members)
     make = F.udf(
-        lambda value, counter: _mapping_surrogate(semantic.pii_class, value, domain, key, options, counter),
+        lambda value, counter: _mapping_surrogate(
+            semantic.pii_class, value, domain, key, options, counter, _is_generic_semantic(semantic)
+        ),
         T.StringType(),
     )
     candidate = mapping.withColumn("surrogate", make("original", "counter"))
@@ -372,7 +398,9 @@ def _resolve_collisions(
 ) -> tuple[DataFrame, int]:
     originals = values.distinct().localCheckpoint(eager=True)
     make = F.udf(
-        lambda value, counter: _mapping_surrogate(semantic.pii_class, value, domain, key, options, counter),
+        lambda value, counter: _mapping_surrogate(
+            semantic.pii_class, value, domain, key, options, counter, _is_generic_semantic(semantic)
+        ),
         T.StringType(),
     )
     initial = originals.withColumn("counter", F.lit(0)).withColumn("surrogate", make("original", "counter"))
@@ -460,12 +488,32 @@ def _mapping_surrogate(
     key: bytes,
     options: SubstitutionOptions,
     counter: int,
+    generic: bool = False,
 ) -> str:
+    digest = _digest(key, domain, value, options.surrogate_bits, counter)
+    if generic:
+        return _generic_surrogate(value, digest, options.date_shift_days)
     if kind == PiiClass.DATE_OF_BIRTH:
         original = date.fromisoformat(value)
-        digest = _digest(key, domain, value, options.surrogate_bits, counter)
         return (original + timedelta(days=_date_offset(digest, options.date_shift_days))).isoformat()
     return _surrogate(kind, value, domain, key, options, counter)
+
+
+def _is_generic_semantic(semantic: Semantic) -> bool:
+    return any(item.method == "policy_column_generic" for item in semantic.evidence)
+
+
+def _generic_surrogate(value: str, digest: bytes, date_shift_days: int) -> str:
+    """Returns a parseable opaque surrogate without assuming a PII class."""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return (date.fromisoformat(value) + timedelta(days=_date_offset(digest, date_shift_days))).isoformat()
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", value):
+        digits = re.sub(r"\D", "", value)
+        generated = str(int.from_bytes(digest, "big")).zfill(len(digits))[-len(digits) :]
+        return _apply_digit_format(value, generated)
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    number = int.from_bytes(digest, "big")
+    return "".join(alphabet[(number >> (index * 6)) % len(alphabet)] for index in range(max(1, len(value))))
 
 
 def _domains(profile: Profile, options: SubstitutionOptions) -> dict[str, str]:
@@ -539,7 +587,7 @@ def _date_shift_udf(domain: str, key: bytes, date_shift_days: int) -> Callable[.
 
 def _nested_output_type(
     data_type: T.DataType,
-    specifications: list[tuple[str, Semantic, str, tuple[PiiRule, str]]],
+    specifications: list[tuple[str, Semantic | None, str, tuple[PiiRule, str]]],
 ) -> T.DataType:
     rules = {tuple(path.split(".")): decision[0] for path, _, _, decision in specifications}
 
@@ -575,7 +623,7 @@ def _nested_output_type(
 def _nested_policy_udf(
     data_type: T.DataType,
     output_type: T.DataType,
-    specifications: list[tuple[str, Semantic, str, tuple[PiiRule, str]]],
+    specifications: list[tuple[str, Semantic | None, str, tuple[PiiRule, str]]],
     mappings: dict[str, Broadcast[dict[str, str]]],
     key: bytes,
     options: SubstitutionOptions,
@@ -596,6 +644,8 @@ def _nested_policy_udf(
                 return None
             if rule.action == PiiAction.GENERALIZE:
                 return _generalize_nested(value, rule.parameters)
+            if semantic is None:
+                raise ValueError(f"substitute rule for nested path {'.'.join(path)!r} has no PII class")
             if str(value) == "":
                 return value
             if semantic.pii_class == PiiClass.FREE_TEXT_PII:
@@ -606,7 +656,9 @@ def _nested_policy_udf(
                 if surrogate is None:
                     raise ValueError(f"nested value is absent from resolved domain {domain!r}")
                 return _coerce_nested_value(surrogate, kind)
-            surrogate = _mapping_surrogate(semantic.pii_class, str(value), domain, key, options, 0)
+            surrogate = _mapping_surrogate(
+                semantic.pii_class, str(value), domain, key, options, 0, _is_generic_semantic(semantic)
+            )
             return _coerce_nested_value(surrogate, kind)
         if isinstance(kind, T.StructType):
             source = value.asDict(recursive=False) if hasattr(value, "asDict") else value
@@ -849,12 +901,13 @@ def _report(
     rule: PiiRule,
     rule_source: str,
 ) -> dict[str, Any]:
-    return {
+    source, separator, winner = rule_source.partition(":")
+    report: dict[str, Any] = {
         "table": table,
         "column": column,
         "class": semantic.pii_class.value if semantic else None,
         "domain": domain,
-        "rule_source": rule_source,
+        "rule_source": source,
         "action": rule.action.value,
         "parameters": rule.parameters,
         "values_affected": count,
@@ -866,3 +919,6 @@ def _report(
             else ([rule.parameters] if rule.action == PiiAction.GENERALIZE else [])
         ),
     }
+    if separator:
+        report["winning_column"] = winner
+    return report

@@ -68,3 +68,30 @@ def test_profile_reports_spark_read_error(tmp_path: Path, capsys: pytest.Capture
     assert result == 1
     assert "dbldatagen-profile profile:" in capsys.readouterr().err
     assert not output.exists()
+
+
+def test_profile_policy_rejects_unknown_column_rule(
+    spark: SparkSession, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "input.parquet"
+    output = tmp_path / "profile.json"
+    policy_path = tmp_path / "policy.json"
+    spark.createDataFrame([("Boston",)], "city string").write.parquet(str(source))
+    policy_path.write_text(
+        dump_policy_json(PiiPolicy(columns={"items.ctiy": PiiRule(action=PiiAction.SUPPRESS)})),
+        encoding="utf-8",
+    )
+    result = main(
+        [
+            "profile",
+            "--table",
+            f"items={source}",
+            "--policy",
+            str(policy_path),
+            "-o",
+            str(output),
+        ]
+    )
+    assert result == 1
+    assert "match no input column" in capsys.readouterr().err
+    assert not output.exists()

@@ -30,10 +30,13 @@ class PiiRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: PiiAction
+    pii_class: PiiClass | None = None
     parameters: dict[str, str | int | float | bool] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _check_parameters(self) -> PiiRule:
+        if self.pii_class is not None and self.action != PiiAction.SUBSTITUTE:
+            raise ValueError("pii_class is only valid for substitute rules")
         if self.action == PiiAction.GENERALIZE and not self.parameters:
             raise ValueError("generalize requires parameters")
         if self.action != PiiAction.GENERALIZE and self.parameters:
@@ -58,7 +61,15 @@ class PiiPolicy(BaseModel):
         missing = sorted(kind.value for kind in Sensitivity if kind not in self.sensitivity)
         if missing:
             raise ValueError(f"sensitivity rules are missing {missing}")
+        if any(rule.pii_class is not None for rule in [*self.sensitivity.values(), *self.pii_class.values()]):
+            raise ValueError("pii_class may only appear on a column rule")
         return self
+
+    def validate_columns(self, references: set[str]) -> None:
+        """Rejects fully-qualified column rules that match no input column."""
+        unknown = sorted(set(self.columns) - references)
+        if unknown:
+            raise ValueError(f"PII policy column rules match no input column: {unknown}")
 
     def resolve(self, reference: str, semantic: Semantic) -> tuple[PiiRule, str]:
         """Returns the most specific matching rule and its source."""
@@ -77,7 +88,7 @@ class PiiPolicy(BaseModel):
     def to_yaml(self) -> str:
         """Serializes the policy to stable YAML."""
         yaml = _yaml_module()
-        return str(yaml.safe_dump(self.model_dump(mode="json"), sort_keys=False))
+        return str(yaml.safe_dump(self.model_dump(mode="json", exclude_none=True), sort_keys=False))
 
 
 def load_policy(source: str | bytes | Path | dict[str, Any]) -> PiiPolicy:
@@ -97,7 +108,7 @@ def load_policy(source: str | bytes | Path | dict[str, Any]) -> PiiPolicy:
 
 def dump_policy_json(policy: PiiPolicy) -> str:
     """Serializes a policy to stable JSON."""
-    return json.dumps(policy.model_dump(mode="json"), indent=2) + "\n"
+    return json.dumps(policy.model_dump(mode="json", exclude_none=True), indent=2) + "\n"
 
 
 def _load_text(text: str) -> object:

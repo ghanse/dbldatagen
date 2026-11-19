@@ -31,6 +31,7 @@ from dbldatagen_profiler.pii import (
     SubstitutionOptions,
     detect,
     dump_policy_json,
+    load_policy,
     substitute,
 )
 from dbldatagen_profiler.pii.detect import analyze_table
@@ -295,6 +296,46 @@ def test_nested_policy_generalizes_suppresses_and_drops_struct_fields(spark: Spa
     row = result.tables["t"].first()
     assert row is not None and row.address.asDict() == {"zip": "021", "city": None}
     assert [item["action"] for item in result.report["columns"]] == ["generalize", "suppress", "drop"]
+
+
+def test_column_rules_handle_undetected_top_level_and_nested_fields(spark: SparkSession) -> None:
+    original_date = date(2020, 5, 17)
+    frame = spark.createDataFrame(
+        [
+            (
+                7,
+                "alice@example.com",
+                "hide-top",
+                "drop-top",
+                Row(day=original_date, mail="bob@example.com", hide="hide-nested", remove="drop-nested"),
+            )
+        ],
+        "number int, contact string, hidden string, removed string, payload struct<day:date,mail:string,hide:string,remove:string>",
+    )
+    profile = profile_dataframe("t", frame, detect_pii=False)
+    policy = PiiPolicy(
+        columns={
+            "t.number": PiiRule(action=PiiAction.SUBSTITUTE),
+            "t.contact": PiiRule(action=PiiAction.SUBSTITUTE, pii_class=PiiClass.EMAIL),
+            "t.hidden": PiiRule(action=PiiAction.SUPPRESS),
+            "t.removed": PiiRule(action=PiiAction.DROP),
+            "t.payload.day": PiiRule(action=PiiAction.SUBSTITUTE),
+            "t.payload.mail": PiiRule(action=PiiAction.SUBSTITUTE, pii_class=PiiClass.EMAIL),
+            "t.payload.hide": PiiRule(action=PiiAction.SUPPRESS),
+            "t.payload.remove": PiiRule(action=PiiAction.DROP),
+        }
+    )
+    result = substitute({"t": frame}, profile, key=b"undetected-column-key", policy=policy)
+    row = result.tables["t"].first()
+    assert row is not None
+    assert isinstance(row.number, int) and row.number != 7
+    assert row.contact != "alice@example.com" and "@" in row.contact
+    assert row.hidden is None and "removed" not in result.tables["t"].columns
+    assert isinstance(row.payload.day, date) and row.payload.day != original_date
+    assert row.payload.mail != "bob@example.com" and "@" in row.payload.mail
+    assert row.payload.hide is None and "remove" not in row.payload.asDict()
+    assert {f"{item['table']}.{item['column']}" for item in result.report["columns"]} == set(policy.columns)
+    assert all(item["rule_source"] == "column" for item in result.report["columns"])
 
 
 def test_nested_and_top_level_values_use_same_resolved_mapping_after_rehash(spark: SparkSession) -> None:
@@ -636,7 +677,7 @@ def test_date_generalization_to_year(spark: SparkSession) -> None:
     assert row is not None and row.dob == date(1980, 1, 1)
 
 
-def test_conflicting_explicit_fk_rules_are_rejected_with_both_columns(spark: SparkSession) -> None:
+def test_default_yaml_sensitivity_rules_do_not_conflict_with_one_column_edit(spark: SparkSession) -> None:
     parent = spark.createDataFrame([("a",)], "id string")
     child = spark.createDataFrame([("a",)], "id string")
     semantic = _semantic("account_id", "direct_identifier")
@@ -652,9 +693,58 @@ def test_conflicting_explicit_fk_rules_are_rejected_with_both_columns(spark: Spa
             )
         ],
     )
-    policy = PiiPolicy(columns={"child.id": PiiRule(action=PiiAction.KEEP)})
-    with pytest.raises(ValueError, match=r"conflicting explicit.*child\.id=keep.*parent\.id=substitute"):
-        substitute({"parent": parent, "child": child}, profile, key=b"drop-key", policy=policy)
+    loaded = load_policy(PiiPolicy().to_yaml())
+    policy = loaded.model_copy(update={"columns": {"child.id": PiiRule(action=PiiAction.KEEP)}})
+    result = substitute({"parent": parent, "child": child}, profile, key=b"default-file-key", policy=policy)
+    parent_row, child_row = result.tables["parent"].first(), result.tables["child"].first()
+    assert parent_row is not None and child_row is not None and parent_row.id == child_row.id
+
+
+def test_two_conflicting_explicit_fk_rules_are_rejected_with_both_columns(spark: SparkSession) -> None:
+    parent = spark.createDataFrame([("a",)], "id string")
+    child = spark.createDataFrame([("a",)], "id string")
+    semantic = _semantic("account_id", "direct_identifier")
+    profile = _profile(
+        [("parent", 1, [_column("id", semantic)]), ("child", 1, [_column("id", semantic)])],
+        relationships=[
+            Relationship(
+                child_table="child",
+                child_columns=["id"],
+                parent_table="parent",
+                parent_columns=["id"],
+                coverage=1.0,
+            )
+        ],
+    )
+    policy = PiiPolicy(
+        columns={
+            "child.id": PiiRule(action=PiiAction.KEEP),
+            "parent.id": PiiRule(action=PiiAction.SUPPRESS),
+        }
+    )
+    with pytest.raises(ValueError, match=r"conflicting explicit.*child\.id=keep.*parent\.id=suppress"):
+        substitute({"parent": parent, "child": child}, profile, key=b"conflict-key", policy=policy)
+
+
+def test_partial_fk_drop_is_rejected(spark: SparkSession) -> None:
+    parent = spark.createDataFrame([("a",)], "id string")
+    child = spark.createDataFrame([("a",)], "id string")
+    semantic = _semantic("account_id", "direct_identifier")
+    profile = _profile(
+        [("parent", 1, [_column("id", semantic)]), ("child", 1, [_column("id", semantic)])],
+        relationships=[
+            Relationship(
+                child_table="child",
+                child_columns=["id"],
+                parent_table="parent",
+                parent_columns=["id"],
+                coverage=1.0,
+            )
+        ],
+    )
+    policy = PiiPolicy(columns={"child.id": PiiRule(action=PiiAction.DROP)})
+    with pytest.raises(ValueError, match=r"cannot drop only part.*parent\.id"):
+        substitute({"parent": parent, "child": child}, profile, key=b"partial-drop-key", policy=policy)
 
 
 def test_fk_domain_uses_strictest_implicit_action(spark: SparkSession) -> None:
@@ -676,11 +766,14 @@ def test_fk_domain_uses_strictest_implicit_action(spark: SparkSession) -> None:
         ],
     )
     source = {"parent": parent, "child": child}
-    output = substitute(source, profile, key=b"strict-domain-key").tables
+    result = substitute(source, profile, key=b"strict-domain-key")
+    output = result.tables
     assert _relationship_stats(source, "child", ["zip"], "parent", ["zip"]) == _relationship_stats(
         output, "child", ["zip"], "parent", ["zip"]
     )
     assert {row.zip for row in output["child"].collect()}.isdisjoint({"02110", "10001"})
+    assert all(item["rule_source"] == "fk_group" for item in result.report["columns"])
+    assert all(item["winning_column"] == "parent.zip" for item in result.report["columns"])
 
 
 def test_full_fk_drop_is_allowed(spark: SparkSession) -> None:
@@ -709,7 +802,7 @@ def test_unknown_column_rule_is_rejected(spark: SparkSession) -> None:
     frame = spark.createDataFrame([("Boston",)], "city string")
     profile = _profile([("t", 1, [_column("city", _semantic("city", "quasi_identifier"))])])
     policy = PiiPolicy(columns={"t.ctiy": PiiRule(action=PiiAction.SUPPRESS)})
-    with pytest.raises(ValueError, match=r"match no profile column.*t\.ctiy"):
+    with pytest.raises(ValueError, match=r"match no input column.*t\.ctiy"):
         substitute({"t": frame}, profile, key=b"typo-key", policy=policy)
 
 

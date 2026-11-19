@@ -24,7 +24,10 @@ def test_default_policy_yaml_and_json_round_trip() -> None:
 def test_yaml_round_trip_preserves_overrides_and_parameters() -> None:
     policy = PiiPolicy(
         pii_class={PiiClass.POSTAL_CODE: PiiRule(action=PiiAction.GENERALIZE, parameters={"prefix_length": 3})},
-        columns={"people.city": PiiRule(action=PiiAction.SUPPRESS)},
+        columns={
+            "people.city": PiiRule(action=PiiAction.SUPPRESS),
+            "people.contact": PiiRule(action=PiiAction.SUBSTITUTE, pii_class=PiiClass.EMAIL),
+        },
     )
     assert load_policy(policy.to_yaml()) == policy
 
