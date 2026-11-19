@@ -87,6 +87,8 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P1.6 | Runner + evaluator: fresh-process samples, wall/CPU/RSS, paired bootstrap gate, policy JSON, results layout, noise control (same build vs itself) | P1.3–P1.5 | merged (PR #12); real Scorer wiring after P1.5 (P1.6a) |
 | P1.6a | Wire the runner to the real sampler + fidelity Scorer; end-to-end control run on tier xs | P1.5, P1.6 | merged (PR #14) |
 | P1.4b | Fix sampler privacy leak: clipped-normal draws land on exact observed min/max, recreating real-unique pairs (numeric fails partial_copy_rate_excess) | P1.4, P1.6a | merged (PR #15) |
+| P1.4c | Fix sampler leak: integer discretization over-weights exact profiled extrema (nested/wide privacy fail) | P1.4b | review approved (PR #19), gates running |
+| P1.4d | Follow-ups from P1.4c review: tests should use calibrated mu/sigma for endpoint mass and discrete moments in property test | P1.4c | todo |
 | P1.7 | RSI log tooling: append-only `log.jsonl` writer/validator + `LOG.md` renderer; `rsi/RSI.md` | P1.1 | merged (PR #4) |
 | P1.7a | Fix: `rsi_log.py append --kind` flag is dropped; add CLI-flag tests | P1.7 | merged (PR #5) |
 | P1.8 | Baseline run: freeze the harness, record the baseline + ceiling for every dataset | P1.2–P1.7 | in-progress |
@@ -95,6 +97,7 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P1.3b | Register real public datasets in the catalog (download + checksum hook exists; none registered) — needs a decision on which datasets are reachable through the proxy | P1.3 | todo |
 | P1.8a | Fix: profiler fails on nested at tier s (`TypeError: unhashable type: 'list'`) | P1.2, P2.1 | merged (PR #16) |
 | P1.8b | Fix: runner scores all fidelity cells in one SparkSession; driver OOM cascades into every later sample. Isolate per (build, dataset) worker, 8g driver | P1.6a | merged (PR #17) |
+| P1.8d | Follow-ups from P1.8c review: catalog manifest `_order_key` drops tz offset without normalizing to UTC (manifest.py:133); add 7- and 9-digit fraction parse tests | P1.8c | todo |
 | P1.9 | Rust engine scaffold (Polars vs DataFusion decision, CLI binary, spec-valid output for the baseline features) | P1.1, Rust toolchain | deferred (human decision 2026-11-06: PySpark-only Phase 1; Rust engine later) |
 
 ### Phase 1b — PII (human request 2026-11-07)
