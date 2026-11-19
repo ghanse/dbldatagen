@@ -1,0 +1,121 @@
+{
+  "actor": "worker:omnigent/p1-6-runner",
+  "baseline_commit": "da5d1e641ba2b53ecb301967fad6bc2d68a44cd5",
+  "candidate_commit": "da5d1e641ba2b53ecb301967fad6bc2d68a44cd5",
+  "experiment_id": "baseline-m-speed-0001",
+  "harness_hash": "cc84dbbcf5a631dfbfac570c489f9639a868ad7bdeac3bae6f076847f37506c5",
+  "kind": "benchmark",
+  "policy": "1a0f1225a27733fb52a301612c80b73849cf3f52c2b82c3e4eadb930a325e5cd",
+  "proposal_id": "baseline-m-speed-0001",
+  "results_path": "profiler/rsi/experiments/baseline-m-speed-0001",
+  "summary": "Benchmark baseline-m-speed-0001 verdict=rejected baseline=da5d1e641ba2 candidate=da5d1e641ba2",
+  "summary_metrics": {
+    "failed_fidelity": 0,
+    "failed_speed": 10,
+    "fidelity": {
+      "baseline/nested": {
+        "n": 5,
+        "privacy_all_passed": true,
+        "reconstruction_mean": 0.6960525912197533,
+        "relative_mean": 0.7000324875823938,
+        "structure_mean": 0.507936507936508
+      },
+      "baseline/numeric": {
+        "n": 5,
+        "privacy_all_passed": true,
+        "reconstruction_mean": 0.7699717796389316,
+        "relative_mean": 0.7741841622590402,
+        "structure_mean": 0.30769230769230776
+      },
+      "baseline/retail": {
+        "n": 5,
+        "privacy_all_passed": true,
+        "reconstruction_mean": 0.6150949594281927,
+        "relative_mean": 0.6534991970637535,
+        "structure_mean": 0.28644688644688654
+      },
+      "candidate/nested": {
+        "n": 5,
+        "privacy_all_passed": true,
+        "reconstruction_mean": 0.6960525912197533,
+        "relative_mean": 0.7000324875823938,
+        "structure_mean": 0.507936507936508
+      },
+      "candidate/numeric": {
+        "n": 5,
+        "privacy_all_passed": true,
+        "reconstruction_mean": 0.7699717796389316,
+        "relative_mean": 0.7741841622590402,
+        "structure_mean": 0.30769230769230776
+      },
+      "candidate/retail": {
+        "n": 5,
+        "privacy_all_passed": true,
+        "reconstruction_mean": 0.6150949594281927,
+        "relative_mean": 0.6534991970637535,
+        "structure_mean": 0.28644688644688654
+      }
+    },
+    "input_fractions": null,
+    "n_star": null,
+    "reasons": [
+      "failed_or_missing_samples",
+      "control",
+      "accuracy_crossing_interval"
+    ],
+    "speed": {
+      "baseline/nested@s": {
+        "cpu_s_median": 50.38819099999999,
+        "peak_rss_bytes_median": 410664960.0,
+        "wall_s_median": 212.67810841696337
+      },
+      "baseline/numeric@m": {
+        "cpu_s_median": 3.1685399999999992,
+        "peak_rss_bytes_median": 949256192.0,
+        "wall_s_median": 239.57202975003747
+      },
+      "baseline/numeric@s": {
+        "cpu_s_median": 3.138115,
+        "peak_rss_bytes_median": 276250624.0,
+        "wall_s_median": 15.362389917019755
+      },
+      "baseline/retail@m": {
+        "cpu_s_median": 2.700659,
+        "peak_rss_bytes_median": 698662912.0,
+        "wall_s_median": 9.057249791978393
+      },
+      "baseline/retail@s": {
+        "cpu_s_median": 1.873106,
+        "peak_rss_bytes_median": 251707392.0,
+        "wall_s_median": 3.412789875001181
+      },
+      "candidate/nested@s": {
+        "cpu_s_median": 49.825523000000004,
+        "peak_rss_bytes_median": 412385280.0,
+        "wall_s_median": 219.44043562503066
+      },
+      "candidate/numeric@m": {
+        "cpu_s_median": 3.156048000000001,
+        "peak_rss_bytes_median": 941572096.0,
+        "wall_s_median": 239.687647291983
+      },
+      "candidate/numeric@s": {
+        "cpu_s_median": 3.195213,
+        "peak_rss_bytes_median": 275791872.0,
+        "wall_s_median": 15.447050416958518
+      },
+      "candidate/retail@m": {
+        "cpu_s_median": 2.7099509999999993,
+        "peak_rss_bytes_median": 696713216.0,
+        "wall_s_median": 9.158228499989491
+      },
+      "candidate/retail@s": {
+        "cpu_s_median": 1.888442,
+        "peak_rss_bytes_median": 252051456.0,
+        "wall_s_median": 3.4409823330352083
+      }
+    },
+    "verdict": "rejected"
+  },
+  "work_item": "P1.6"
+}

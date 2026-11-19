@@ -1,0 +1,195 @@
+# Experiment baseline-m-speed-0001
+
+Verdict: **rejected**
+
+## Builds
+
+- Baseline: `da5d1e641ba2b53ecb301967fad6bc2d68a44cd5` (`<repo>`)
+- Candidate: `da5d1e641ba2b53ecb301967fad6bc2d68a44cd5` (`<repo>`)
+- Harness: `da5d1e641ba2b53ecb301967fad6bc2d68a44cd5` hash `cc84dbbcf5a6`
+- Control run: `True`
+
+## Measured
+
+- Driver wall time, process CPU time, and peak RSS for `profile_tables`
+- Profile JSON hash (created_at stripped) and cross-sample determinism
+- Paired reconstruction / structure / privacy scores at the fidelity tier
+
+## Not measured
+
+- Spark executor / JVM heap and RSS (driver process RSS only)
+- GPU / accelerator time
+- network and disk IO bytes
+- cluster-scale Spark (local[*] only)
+- end-to-end dbldatagen generation from the profile
+
+## Gates
+
+- `sample_completeness`: fail (failed_or_missing_samples)
+- `privacy`: pass (privacy_passed)
+- `control`: inconclusive (control)
+- `accuracy_mean`: inconclusive (accuracy_crossing_interval)
+- `accuracy_per_dataset`: pass (no_reconstruction_regression)
+- `structure`: pass (no_structure_regression)
+
+## Summary
+
+```json
+{
+  "control": true,
+  "experiment_id": "baseline-m-speed-0001",
+  "failed_fidelity": 0,
+  "failed_speed": 10,
+  "fidelity": {
+    "baseline/nested": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.6960525912197533,
+      "relative_mean": 0.7000324875823938,
+      "structure_mean": 0.507936507936508
+    },
+    "baseline/numeric": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.7699717796389316,
+      "relative_mean": 0.7741841622590402,
+      "structure_mean": 0.30769230769230776
+    },
+    "baseline/retail": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.6150949594281927,
+      "relative_mean": 0.6534991970637535,
+      "structure_mean": 0.28644688644688654
+    },
+    "candidate/nested": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.6960525912197533,
+      "relative_mean": 0.7000324875823938,
+      "structure_mean": 0.507936507936508
+    },
+    "candidate/numeric": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.7699717796389316,
+      "relative_mean": 0.7741841622590402,
+      "structure_mean": 0.30769230769230776
+    },
+    "candidate/retail": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.6150949594281927,
+      "relative_mean": 0.6534991970637535,
+      "structure_mean": 0.28644688644688654
+    }
+  },
+  "not_measured": [
+    "Spark executor / JVM heap and RSS (driver process RSS only)",
+    "GPU / accelerator time",
+    "network and disk IO bytes",
+    "cluster-scale Spark (local[*] only)",
+    "end-to-end dbldatagen generation from the profile"
+  ],
+  "profile_determinism": {
+    "deterministic": true,
+    "divergent": {}
+  },
+  "speed": {
+    "baseline/nested@s": {
+      "cpu_s_median": 50.38819099999999,
+      "n": 5,
+      "peak_rss_bytes_median": 410664960.0,
+      "profile_hashes": [
+        "f0b238d1963e4cb2998fdd4a4d2a7d49edd3eff7ad9bf66b38832b8a8f20a82c"
+      ],
+      "wall_s_median": 212.67810841696337
+    },
+    "baseline/numeric@m": {
+      "cpu_s_median": 3.1685399999999992,
+      "n": 5,
+      "peak_rss_bytes_median": 949256192.0,
+      "profile_hashes": [
+        "7ebf4fe6e2b3f66477a91bd9fbf50c0ef25c1e5064a88acae36e2d5ecc33b854"
+      ],
+      "wall_s_median": 239.57202975003747
+    },
+    "baseline/numeric@s": {
+      "cpu_s_median": 3.138115,
+      "n": 5,
+      "peak_rss_bytes_median": 276250624.0,
+      "profile_hashes": [
+        "96bdf2df4cf7405abdff6450e01cc398616c3bc4c15251add205f1a00a6ccfe3"
+      ],
+      "wall_s_median": 15.362389917019755
+    },
+    "baseline/retail@m": {
+      "cpu_s_median": 2.700659,
+      "n": 5,
+      "peak_rss_bytes_median": 698662912.0,
+      "profile_hashes": [
+        "4106990f6d3107a241b15e3ce62608cfff60623b54e9f475d78a3e8ed5066dcf"
+      ],
+      "wall_s_median": 9.057249791978393
+    },
+    "baseline/retail@s": {
+      "cpu_s_median": 1.873106,
+      "n": 5,
+      "peak_rss_bytes_median": 251707392.0,
+      "profile_hashes": [
+        "46bfdfcfb000d2d9e3140008ac90d999aade022c29b7a422981ef0b69fca4744"
+      ],
+      "wall_s_median": 3.412789875001181
+    },
+    "candidate/nested@s": {
+      "cpu_s_median": 49.825523000000004,
+      "n": 5,
+      "peak_rss_bytes_median": 412385280.0,
+      "profile_hashes": [
+        "f0b238d1963e4cb2998fdd4a4d2a7d49edd3eff7ad9bf66b38832b8a8f20a82c"
+      ],
+      "wall_s_median": 219.44043562503066
+    },
+    "candidate/numeric@m": {
+      "cpu_s_median": 3.156048000000001,
+      "n": 5,
+      "peak_rss_bytes_median": 941572096.0,
+      "profile_hashes": [
+        "7ebf4fe6e2b3f66477a91bd9fbf50c0ef25c1e5064a88acae36e2d5ecc33b854"
+      ],
+      "wall_s_median": 239.687647291983
+    },
+    "candidate/numeric@s": {
+      "cpu_s_median": 3.195213,
+      "n": 5,
+      "peak_rss_bytes_median": 275791872.0,
+      "profile_hashes": [
+        "96bdf2df4cf7405abdff6450e01cc398616c3bc4c15251add205f1a00a6ccfe3"
+      ],
+      "wall_s_median": 15.447050416958518
+    },
+    "candidate/retail@m": {
+      "cpu_s_median": 2.7099509999999993,
+      "n": 5,
+      "peak_rss_bytes_median": 696713216.0,
+      "profile_hashes": [
+        "4106990f6d3107a241b15e3ce62608cfff60623b54e9f475d78a3e8ed5066dcf"
+      ],
+      "wall_s_median": 9.158228499989491
+    },
+    "candidate/retail@s": {
+      "cpu_s_median": 1.888442,
+      "n": 5,
+      "peak_rss_bytes_median": 252051456.0,
+      "profile_hashes": [
+        "46bfdfcfb000d2d9e3140008ac90d999aade022c29b7a422981ef0b69fca4744"
+      ],
+      "wall_s_median": 3.4409823330352083
+    }
+  }
+}
+```
+
+## Profile determinism
+
+Deterministic: `True`
