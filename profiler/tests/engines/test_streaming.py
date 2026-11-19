@@ -298,6 +298,42 @@ def test_frozen_pii_labels_do_not_depend_on_batch_boundaries(spark: SparkSession
     assert frozen[2] == frozen[0]
 
 
+def _write_earlier_file(frame: DataFrame, path: Path) -> Path:
+    """Writes `frame` as one parquet file whose name and modification time sort before every existing file."""
+    before = set(path.glob("*.parquet"))
+    frame.coalesce(1).write.mode("append").parquet(str(path))
+    (written,) = set(path.glob("*.parquet")) - before
+    earlier = written.rename(path / "a0.parquet")
+    moment = min(file.stat().st_mtime for file in before) - 1
+    os.utime(earlier, (moment, moment))
+    assert earlier.name < min(file.name for file in before)
+    return earlier
+
+
+@pytest.mark.parametrize(("warmup", "frozen_first"), [(40, True), (45, False)])
+def test_warmup_set_is_arrival_order(spark: SparkSession, tmp_path: Path, warmup: int, frozen_first: bool) -> None:
+    source, checkpoint = tmp_path / "source", tmp_path / "checkpoint"
+    rows = [(i, f"person{i}@example.com") for i in range(40)] + [(i, f"hello world {i % 5}") for i in range(40, 60)]
+    df = spark.createDataFrame(rows, "id int, contact string")
+    _write_files([df.where("id < 20"), df.where("id >= 20 and id < 40")], source)
+    first = _run(spark, source, checkpoint, pii_warmup_rows=warmup, max_files=10)
+    state = json.loads((checkpoint / "t" / STATE_FILE).read_text(encoding="utf-8"))
+    assert (state["pii"] is not None) == frozen_first
+    _write_earlier_file(df.where("id >= 40"), source)
+    final = _run(spark, source, checkpoint, pii_warmup_rows=warmup, max_files=10)
+    state = json.loads((checkpoint / "t" / STATE_FILE).read_text(encoding="utf-8"))
+    assert state["batches"] == [[0, 1]] and state["pii"] is not None and state["sample"] == []
+    label = final.tables[0].columns[1].semantic
+    assert label is not None and label.pii_class == PiiClass.EMAIL
+    if frozen_first:
+        assert label == first.tables[0].columns[1].semantic
+    assert state["pii"]["semantics"]["contact"]["evidence"][-1]["match_rate"] == pytest.approx(min(1.0, 40 / warmup))
+    assert first.tables[0].row_count == 40 and final.tables[0].row_count == 60
+    contact = final.tables[0].columns[1]
+    assert contact.string is not None and contact.string.length is not None
+    assert contact.string.length.min == len("hello world 0")
+
+
 def test_batch_ids_are_merged_once_in_any_order(spark: SparkSession, tmp_path: Path) -> None:
     source = tmp_path / "source"
     _write_splits(spark.createDataFrame(_rows(30), SCHEMA), source, 1)

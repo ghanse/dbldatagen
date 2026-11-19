@@ -174,8 +174,8 @@ class TableState:
         schema: Spark schema of the table.
         row_count: Number of rows.
         columns: Column states in schema order.
-        sample: Bounded PII detection sample: the first `sample_size` rows in source order, with their sort keys.
-            Source order is given by the order columns of `state_for_dataframe`, then the batch engine's
+        sample: Bounded PII detection sample: the first `sample_size` rows in arrival order, with their sort keys.
+            Arrival order is given by the order columns of `state_for_dataframe`, then the batch engine's
             `(xxhash64, values)` sampling key.
         sample_size: Maximum sample size.
     """
@@ -232,7 +232,7 @@ def state_for_dataframe(
         df: Batch DataFrame to profile.
         sample_size: Maximum PII sample size.
         collect_sample: Whether to collect the PII detection sample (default true).
-        order_columns: Columns of `df` that give the source order of rows for the PII sample. They are not profiled.
+        order_columns: Columns of `df` that give the arrival order of rows for the PII sample. They are not profiled.
 
     Returns:
         The table state of every row in `df` except the order columns.
@@ -588,7 +588,7 @@ def _extreme(left: _Ordered | None, right: _Ordered | None, *, largest: bool) ->
 def _sample(
     df: DataFrame, schema: T.StructType, order_columns: Sequence[str], sample_size: int
 ) -> tuple[SampleEntry, ...]:
-    """Returns the first rows of `df` in source order, with their keys.
+    """Returns the first rows of `df` in arrival order, with their keys.
 
     Values of types the checkpoint cannot store (intervals other than day-time, variant, spatial, null) are sampled
     as null.

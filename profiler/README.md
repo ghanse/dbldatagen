@@ -93,14 +93,16 @@ batches, in whatever order batches arrive. Loading a checkpoint never executes c
 version fails with a clear error. In the file, sketches are base64, int64, decimal, and exact length totals are
 decimal strings, and floats are `float.hex` strings. The checkpoint must be on a local filesystem.
 
-PII detection runs on the first `pii_warmup_rows` rows (default 10,000) in source order. Once a table has seen that
+PII detection runs on the first `pii_warmup_rows` rows (default 10,000) in arrival order. Once a table has seen that
 many rows the detection result is frozen, so later batches do not change semantic labels, and the raw rows are
-dropped from the checkpoint. For file sources, source order is (file modification time, file path, row position in
-the file). That is the order in which Spark's file source takes files, so the frozen labels do not depend on how
-files are split into micro-batches. Row position is the Parquet row index; for JSON, rows within a file are ordered
-by the batch engine's xxhash64 sampling key. For other sources rows are ordered by that sampling key alone, which is
-deterministic for a given set of rows, but which rows have arrived by the time the warmup is reached depends on the
-source. When a table has no more rows than the warmup, the sample is every row, as in the batch engine, so semantics
+dropped from the checkpoint. Arrival order is the micro-batch id, then, within a batch, the file sort key (file
+modification time, file path) and the row position in the file. A stream cannot wait for data that might arrive
+later, so rows in a later batch never enter the warmup set, even if their file has an earlier name or modification
+time. A file that arrives after the freeze is still profiled into every statistic, but it never changes the frozen
+labels. Spark's file source takes files in modification-time order, so for files present when the stream starts the
+frozen labels do not depend on how the files are split into micro-batches. Row position is the Parquet row index;
+for JSON, rows within a file are ordered by the batch engine's xxhash64 sampling key. For non-file sources, rows
+within a batch are ordered by that sampling key alone. When a table has no more rows than the warmup, the sample is every row, as in the batch engine, so semantics
 and quasi-identifier sets equal the batch profile's. Until the warmup ends the checkpoint holds those raw rows as
 JSON; keep the checkpoint directory as private as the source data. Values of interval (other than day-time),
 variant, and spatial types are not kept in the sample. Snapshots follow the same privacy rules as batch profiles. A

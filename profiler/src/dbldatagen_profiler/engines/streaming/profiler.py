@@ -28,7 +28,8 @@ from dbldatagen_profiler.model import PrivacyPolicy, Profile
 PII_WARMUP_ROWS = 10_000
 AVAILABLE_NOW = "availableNow"
 STATE_FILE = "state.json"
-SOURCE_ORDER_COLUMNS = ("__profile_file_time", "__profile_file_path", "__profile_file_row")
+BATCH_COLUMN = "__profile_batch"
+FILE_ORDER_COLUMNS = ("__profile_file_time", "__profile_file_path", "__profile_file_row")
 
 
 class StreamingProfiler:
@@ -39,13 +40,15 @@ class StreamingProfiler:
     checkpoint lives next to it in `checkpoint_dir/<table>/spark`. A batch whose id is already in the set (a replay
     after a crash) is skipped, so restarts neither double-count nor lose batches, whatever order batches arrive in.
 
-    PII detection runs on the first `pii_warmup_rows` rows in source order and freezes once a table has seen that
-    many rows; the raw rows are then dropped from the checkpoint. For file sources, source order is
-    (file modification time, file path, row position in the file), which is the order in which Spark's file source
-    takes files, so the frozen result does not depend on how files are split into micro-batches. Row position is
-    the Parquet row index; for formats without one, rows within a file are ordered by the batch engine's xxhash64
-    sampling key. For other sources, rows are ordered by that sampling key alone: the result is deterministic for
-    a given set of rows, but which rows have arrived when the warmup is reached depends on the source.
+    PII detection runs on the first `pii_warmup_rows` rows in arrival order and freezes once a table has seen that
+    many rows; the raw rows are then dropped from the checkpoint. Arrival order is the micro-batch id, then, within a
+    batch, the file sort key (file modification time, file path) and the row position in the file. Rows in a later
+    batch never enter the warmup set, whatever their file names or times, and rows that arrive after the freeze are
+    still profiled into the statistics but never change the labels. Spark's file source takes files in
+    modification-time order, so for files present when the stream starts the frozen labels do not depend on how the
+    files are split into micro-batches. Row position is the Parquet row index; for formats without one, rows within
+    a file are ordered by the batch engine's xxhash64 sampling key. For non-file sources, rows within a batch are
+    ordered by that sampling key alone.
 
     Args:
         tables: Streaming DataFrames keyed by profile table name.
@@ -150,7 +153,8 @@ class StreamingProfiler:
         if current.has_batch(batch_id):
             return
         collect_sample = self._detect_pii and current.pii is None
-        order_columns = [column for column in SOURCE_ORDER_COLUMNS if column in batch.columns]
+        batch = batch.withColumn(BATCH_COLUMN, F.lit(batch_id))
+        order_columns = [BATCH_COLUMN, *(column for column in FILE_ORDER_COLUMNS if column in batch.columns)]
         batch.persist()
         try:
             state = state_for_dataframe(
@@ -173,13 +177,13 @@ class StreamingProfiler:
 
 
 def _with_source_order(frame: DataFrame) -> DataFrame:
-    """Adds the file source order columns when the source exposes file metadata."""
+    """Adds the file arrival-order columns when the source exposes file metadata."""
     metadata = F.col("_metadata")
     file_columns: list[Column] = [
-        F.unix_micros(metadata.file_modification_time).alias(SOURCE_ORDER_COLUMNS[0]),
-        metadata.file_path.alias(SOURCE_ORDER_COLUMNS[1]),
+        F.unix_micros(metadata.file_modification_time).alias(FILE_ORDER_COLUMNS[0]),
+        metadata.file_path.alias(FILE_ORDER_COLUMNS[1]),
     ]
-    for columns in ([*file_columns, metadata.row_index.alias(SOURCE_ORDER_COLUMNS[2])], file_columns):
+    for columns in ([*file_columns, metadata.row_index.alias(FILE_ORDER_COLUMNS[2])], file_columns):
         try:
             return frame.select("*", *columns)
         except AnalysisException:
