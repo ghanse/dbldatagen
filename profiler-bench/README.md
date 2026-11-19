@@ -323,6 +323,44 @@ uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi evaluate
   profiler/rsi/experiments/demo
 ```
 
+### Data-volume objective
+
+`profiler-bench/policies/data_volume.json` freezes a second RSI objective: the least input fraction `n*` that still
+reaches a per-dataset accuracy target `T_d`. The harness, not the profiler, chooses the input. For each fraction
+`f` on the geometric grid `(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0)` and each subset seed, it
+builds a deterministic **FK-preserving uniform** subset (sample parent tables at `f`, keep child rows whose foreign
+keys land in the sampled parents; method name `fk_preserving_uniform`). The profiler sees only that subset and is
+not told the full row counts. Reconstruction is scored against the **full** real tables; before sampling, each
+profiled `row_count` is scaled by `full_rows / profile_rows` for that table (equivalent to calling the reference
+sampler with a per-table scale) so synthetic row counts match. Distinct counts, cardinality, FK fan-out, and
+extrema remain the profiler's job to extrapolate.
+
+`T_d` is frozen per dataset as (full-data baseline relative reconstruction) − 0.01, with provenance in the policy.
+Compute a proposed policy from a baseline run at `f = 1` with:
+
+```bash
+uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi calibrate-targets \
+  --baseline profiler/rsi/experiments/<baseline-id> \
+  --output /tmp/data_volume.proposed.json
+```
+
+Polly freezes the accepted file. The measured curve reports relative reconstruction at every grid fraction over
+`S` subset seeds and `K` sampler seeds; `n*_d` is the smallest fraction whose paired-bootstrap CI lower bound on
+the mean clears `T_d` minus the control noise width (half the baseline `f = 1` CI width unless overridden). If no
+fraction reaches `T_d`, `n* = 1.0` and the dataset is flagged. Privacy remains a hard guard at every fraction.
+
+A `data_volume` proposal is accepted when the geometric mean of `n*` decreases by at least one grid step, at least
+one declared target improves by one grid step, no dataset's `n*` increases, reconstruction at `f = 1` does not
+regress beyond the default per-dataset bound, privacy passes everywhere, and every expected sample is present.
+Crossing intervals are inconclusive. Control runs are never accepted.
+
+```bash
+uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi run --mode data-volume \
+  --baseline /path/to/baseline --candidate /path/to/candidate \
+  --policy profiler-bench/policies/data_volume.json --experiment-id demo-dv \
+  [--datasets retail numeric] [--fractions 0.1 0.5 1.0] [--subset-seeds 1] [--fidelity-seeds 1] [--control]
+```
+
 **Measured:** driver wall / CPU / peak RSS for `profile_tables`; profile content hash; paired reconstruction,
 structure, and privacy scores. **Not measured:** Spark JVM/executor RSS, GPU time, network/disk IO, cluster-scale
 Spark, and end-to-end dbldatagen generation from the profile (see `not_measured` in the policy and each `REPORT.md`).

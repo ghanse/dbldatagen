@@ -74,6 +74,7 @@ class FakeScorer:
     metrics_config_hash: str = "fake-metrics"
     by_seed: dict[int, dict[str, Any]] = field(default_factory=dict)
     by_role_seed: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
+    relative_by_fraction: dict[float, float] = field(default_factory=dict)
     role: str = "baseline"
     raise_message: str | None = None
     crash_exit_code: int | None = None
@@ -134,6 +135,7 @@ class FakeScorer:
             metrics_config_hash=self.metrics_config_hash,
             by_seed=dict(self.by_seed),
             by_role_seed=dict(self.by_role_seed),
+            relative_by_fraction=dict(self.relative_by_fraction),
             role=role,
             raise_message=self.raise_message,
             crash_exit_code=self.crash_exit_code,
@@ -151,6 +153,7 @@ class FakeScorer:
             "metrics_config_hash": self.metrics_config_hash,
             "by_seed": {str(seed): dict(values) for seed, values in self.by_seed.items()},
             "by_role_seed": {f"{role}:{seed}": dict(values) for (role, seed), values in self.by_role_seed.items()},
+            "relative_by_fraction": {str(frac): value for frac, value in self.relative_by_fraction.items()},
             "role": self.role,
             "raise_message": self.raise_message,
             "crash_exit_code": self.crash_exit_code,
@@ -174,6 +177,9 @@ def scorer_from_spec(spec: dict[str, Any]) -> Scorer:
             metrics_config_hash=str(spec.get("metrics_config_hash", "fake-metrics")),
             by_seed={int(seed): dict(values) for seed, values in dict(spec.get("by_seed", {})).items()},
             by_role_seed=by_role_seed,
+            relative_by_fraction={
+                float(frac): float(value) for frac, value in dict(spec.get("relative_by_fraction", {})).items()
+            },
             role=str(spec.get("role", "baseline")),
             raise_message=spec.get("raise_message"),
             crash_exit_code=spec.get("crash_exit_code"),

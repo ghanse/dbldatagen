@@ -1,0 +1,74 @@
+{
+  "version": "1.0.0",
+  "mode": "data_volume",
+  "bootstrap": {
+    "samples": 2000,
+    "seed": 0,
+    "confidence": 0.95
+  },
+  "fractions": [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0],
+  "subset_seeds": 5,
+  "fidelity_seeds": 5,
+  "fidelity_tier": "s",
+  "dataset_seed": 0,
+  "subset_method": "fk_preserving_uniform",
+  "targets": {
+    "edge": {
+      "T_d": null,
+      "provenance": "Unset until P3.3 calibrate-targets freezes T_d from the full-data baseline (relative - 0.01)."
+    },
+    "nested": {
+      "T_d": null,
+      "provenance": "Unset until P3.3 calibrate-targets freezes T_d from the full-data baseline (relative - 0.01)."
+    },
+    "numeric": {
+      "T_d": null,
+      "provenance": "Unset until P3.3 calibrate-targets freezes T_d from the full-data baseline (relative - 0.01)."
+    },
+    "retail": {
+      "T_d": null,
+      "provenance": "Unset until P3.3 calibrate-targets freezes T_d from the full-data baseline (relative - 0.01)."
+    },
+    "strings": {
+      "T_d": null,
+      "provenance": "Unset until P3.3 calibrate-targets freezes T_d from the full-data baseline (relative - 0.01)."
+    },
+    "temporal": {
+      "T_d": null,
+      "provenance": "Unset until P3.3 calibrate-targets freezes T_d from the full-data baseline (relative - 0.01)."
+    }
+  },
+  "data_volume": {
+    "min_nstar_improvement_steps": 1,
+    "reached_rule": "ci_lower >= T_d - control_noise_width",
+    "reached_rule_note": "Paired bootstrap over (subset seed, sampler seed) for the per-fraction mean relative reconstruction. A fraction is reached only if the CI lower bound clears T_d minus the control noise width (half the baseline f=1 CI width, unless overridden in control_noise_width). A crossing interval is inconclusive.",
+    "control_noise_width": {}
+  },
+  "accuracy": {
+    "min_mean_improvement": 0.005,
+    "ci_lower_must_exceed": 0.0,
+    "max_dataset_regression": 0.01,
+    "max_structure_regression": 0.02
+  },
+  "privacy": {
+    "hard_guard": true,
+    "note": "Privacy cannot be disabled; every candidate dataset x fraction x subset seed x sampler seed must set privacy_passed=true."
+  },
+  "spark": {
+    "master": "local[2]",
+    "configs": {
+      "spark.sql.shuffle.partitions": "2",
+      "spark.sql.session.timeZone": "UTC",
+      "spark.ui.enabled": "false",
+      "spark.driver.memory": "2g"
+    }
+  },
+  "not_measured": [
+    "Spark executor / JVM heap and RSS (driver process RSS only)",
+    "GPU / accelerator time",
+    "network and disk IO bytes",
+    "cluster-scale Spark (local[*] only)",
+    "end-to-end dbldatagen generation from the profile",
+    "profiling wall time as an acceptance metric under the data-volume objective (recorded for diagnostics only)"
+  ]
+}
