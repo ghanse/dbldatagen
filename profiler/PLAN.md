@@ -111,7 +111,8 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 
 | P2.3 | Configurable PII handling policy: QIs substituted by default; per sensitivity / pii_class / column actions (substitute, generalize, suppress, drop, keep) (human decision 2026-11-18; contract `.polly/contracts/p2-3-pii-policy.md`) | P2.1 | merged (PR #21) |
 
-| P2.3a | PII policy follow-ups: clearer error for NaN/Inf in generic float substitution; document that generic int/decimal surrogates don't keep magnitude; capacity pre-check for small value spaces; replace the _protect_column argument shim by updating the streaming call site | P2.3, P3.1 | todo |
+| P2.3a | PII policy follow-ups part 1: FK full-drop with undetected side, DOB shift on original entity keys, NaN/Inf error, small-space capacity pre-check, docs | P2.3 | merged (PR #23) |
+| P2.3b | PII follow-ups: hidden entity-key column names must be checked case-insensitively (substitute.py ~L376-379; silent user-column loss); replace the _protect_column argument shim by updating the streaming call site | P2.3a, P3.1 | todo |
 
 ### Phase 3 — Streaming and data volume (human request 2026-11-18)
 
