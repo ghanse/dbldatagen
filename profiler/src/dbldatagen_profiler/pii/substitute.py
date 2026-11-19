@@ -104,7 +104,14 @@ def substitute(  # noqa: PLR0912, PLR0915
     for table_name, frame in tables.items():
         result = frame
         columns = {column.name: column for column in profiles[table_name].columns}
-        for name in frame.columns:
+        ordered_names = sorted(
+            frame.columns,
+            key=lambda name: decisions.get(f"{table_name}.{name}", (PiiRule(action=PiiAction.KEEP), "default"))[
+                0
+            ].action
+            == PiiAction.DROP,
+        )
+        for name in ordered_names:
             reference = f"{table_name}.{name}"
             current_column = columns.get(name)
             current_semantic = current_column.semantic if current_column is not None else None
@@ -331,8 +338,8 @@ def _domain_decisions(
         domain = domains[members[0]]
         domain_members = [reference for reference, member_domain in domains.items() if member_domain == domain]
         dropped = [reference for reference, (rule, _) in rules.items() if rule.action == PiiAction.DROP]
-        if dropped and (len(dropped) != len(domain_members)):
-            missing = sorted(set(domain_members) - set(dropped))
+        if dropped and len(dropped) != len(members):
+            missing = sorted(set(members) - set(dropped))
             raise ValueError(f"cannot drop only part of an FK-linked column set; also drop {missing}")
         if len(explicit) >= 2 and len({rules[reference][0].model_dump_json() for reference in explicit}) > 1:
             descriptions = ", ".join(f"{reference}={rules[reference][0].action.value}" for reference in sorted(rules))
@@ -388,7 +395,9 @@ def _build_mapping(
     if values is None:
         raise ValueError(f"domain {domain!r} has no columns")
     mapping = values.distinct().withColumn("counter", F.lit(0))
-    if not generic:
+    if generic:
+        _validate_generic_values(mapping, data_type, members[0])
+    else:
         _check_surrogate_capacity(mapping, semantic, members)
     make = F.udf(
         lambda value, counter: _mapping_value(semantic, value, data_type, domain, key, options, counter),
@@ -516,6 +525,18 @@ def _validate_generic_type(data_type: T.DataType, reference: str) -> None:
         raise ValueError(
             f"generic substitute is not supported for Spark type {data_type.simpleString()!r} on {reference!r}"
         )
+
+
+def _validate_generic_values(mapping: DataFrame, data_type: T.DataType, reference: str) -> None:
+    if isinstance(data_type, (T.FloatType, T.DoubleType)):
+        non_finite = F.isnan("original") | (F.abs("original") == F.lit(float("inf")))
+        if mapping.where(non_finite).limit(1).count() != 0:
+            raise ValueError(f"generic float substitution requires finite values for column {reference!r}")
+    if isinstance(data_type, T.DecimalType) and data_type.precision <= 9:
+        count = mapping.count()
+        space = 2 * 10**data_type.precision - 1
+        if count > space - count:
+            raise ValueError(f"surrogate space is too small to preserve distinct values for column {reference!r}")
 
 
 def _check_surrogate_capacity(mapping: DataFrame, semantic: Semantic, members: list[str]) -> None:
