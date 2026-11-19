@@ -71,6 +71,8 @@ Design rules:
 5. **Accept / reject** — the evaluator applies the frozen policy; a different-vendor reviewer checks the diff. Logged `disposition`.
    Rejected patches are retained in `rsi/experiments/<id>/`. The human merges accepted PRs.
 
+Phase 4 features P4.2 and P4.3 enter as RSI proposals and merge only through the accuracy gate (human decision 2026-11-18).
+
 ## Work items
 
 Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiting human merge) · `merged` · `blocked`
@@ -116,7 +118,15 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P3.1 | Incremental profiling with Spark Structured Streaming: mergeable per-batch states, restart-safe checkpoints, snapshots equal to batch on exact stats (contract `.polly/contracts/p3-1-streaming.md`) | P1.2 | in-progress |
 | P3.2 | Data-volume RSI objective: least input fraction reaching a frozen accuracy target per dataset; harness-controlled FK-preserving subsets; new policy `data_volume.json` (contract `.polly/contracts/p3-2-data-volume.md`) | P1.6a, P1.8 | in-progress |
 | P3.3 | Calibrate data-volume targets T_d from the frozen baseline and run the first data-volume baseline | P1.8, P3.2 | todo |
-| P3.4 | Real public datasets via Databricks Marketplace / samples, exported with `genie exec` (replaces P1.3b) | P1.3 | exploring |
+| P3.4 | Real public datasets via Databricks samples / Marketplace, exported with `genie exec` (Statement Execution API, ARROW_STREAM, chunked) into the gitignored cache, never committed. Shortlist: samples.tpcds_sf1, samples.wanderbricks, Marketplace 'Simulated Retail Customer Data' (nested), TPC-H regenerated locally, samples.nyctaxi.trips. Blocked: CLI login expired for fevm-gh-ws-001 | P1.3 | blocked (auth) |
+
+### Phase 4 — Queued features (human request 2026-11-18; start after Phase 1 baseline, P2.3, P3.1, P3.2)
+
+| ID | Item | Depends on | Status |
+|----|------|------------|--------|
+| P4.1 | Profile subsets by criteria: random, stratified by key, temporal by date range/window, and LLM-prompted (natural-language criterion translated to a reviewed, deterministic filter/sample spec; LLM is a pluggable interface, none shipped by default). Record the subset spec in profile source metadata | P3.2 (shares subset machinery) | queued |
+| P4.2 | Fit regex pattern(s) to fixed-length text columns: per-position character-class inference, multiple patterns with coverage, privacy-safe (dialect + k rules from P1.5). Enters RSI as an accuracy proposal | P1.8 | queued |
+| P4.3 | Variable-length text: a small local model fit to PII-masked real text, shipped in the profile, and used by the sampler to generate like text (human decision). Required guards: memorization metric (long-n-gram overlap with real text vs a holdout baseline), canary-insertion test, k-threshold on vocabulary, PII masking before fitting, model size cap; privacy guard fails the proposal if any trip. New text fidelity metrics; spec 0.3 | P2.3, P1.8 | queued |
 
 ### Phase 2 — RSI iterations (Step 2)
 
