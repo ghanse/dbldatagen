@@ -16,6 +16,7 @@ profiler/
   src/dbldatagen_profiler/
     model/                        profile spec as pydantic models
     engines/spark/                baseline PySpark profiling engine
+    engines/streaming/            incremental profiling with Spark Structured Streaming
     cli.py                        `dbldatagen-profile` command
   spec/
     profile.schema.json           JSON Schema generated from the model
@@ -45,6 +46,51 @@ uv run --package dbldatagen-profiler --all-extras dbldatagen-profile profile \
 
 The input format may be `parquet`, `csv`, or `delta`. PySpark is an optional extra; install
 `dbldatagen-profiler[spark]` when using the engine as a library.
+
+### Streaming
+
+`dbldatagen_profiler.engines.streaming` profiles data as it arrives. Each micro-batch is reduced to a mergeable
+state (one Spark aggregate per nesting level, like the batch engine), and states are merged on the driver:
+
+```python
+from dbldatagen_profiler.engines.streaming import StreamingProfiler, merge_states, profile_states, state_for_dataframe
+
+profiler = StreamingProfiler({"orders": spark.readStream.schema(schema).parquet(path)}, checkpoint_dir="ckpt")
+profiler.start()               # writeStream.foreachBatch, trigger "availableNow" (default) or e.g. "30 seconds"
+snapshot = profiler.profile()  # spec-valid profile of every batch merged so far; callable at any time
+profiler.await_termination()
+profiler.stop()
+
+state = merge_states(state_for_dataframe(df_a), state_for_dataframe(df_b))  # a batch DataFrame as one micro-batch
+profile = profile_states({"orders": state})
+```
+
+From the command line, for file sources:
+
+```bash
+uv run --package dbldatagen-profiler --all-extras dbldatagen-profile stream \
+  --table orders=data/orders --format parquet --checkpoint ckpt --trigger availableNow -o profile.json
+```
+
+With an interval trigger the command runs until interrupted and rewrites `profile.json` every 10 seconds.
+
+A snapshot equals the batch profile of the same rows on these statistics: row count, null fraction, nested
+`value_count`, numeric and temporal min/max (lossless for decimal and int64), string and collection length
+min/max/mean, boolean true fraction, PII semantics, and quasi-identifier sets (before the PII warmup freezes them).
+Numeric mean/stddev and collection length stddev are merged in floating point (Chan et al.) and match to rounding
+error. Distinct counts come from Spark's built-in HyperLogLog sketch (`hll_sketch_agg`, lgConfigK 12) and are marked
+`exact: false`; the relative standard error is 1.04/√4096 ≈ 1.6%, so about 99.7% of estimates are within 4.9%.
+`hll_sketch_agg` needs Spark 3.5 or later.
+
+State is written atomically to `<checkpoint>/<table>/state.pkl` after every batch, keyed by batch id; Spark's own
+checkpoint is `<checkpoint>/<table>/spark`. A batch that Spark replays after a crash is skipped if its id is already
+in the state, so restarts neither double-count nor lose batches. The checkpoint must be on a local filesystem.
+
+PII detection uses the batch engine's deterministic sample (the 10,000 rows with the smallest xxhash64 key), kept
+across batches. Once a table has seen `pii_warmup_rows` rows (default 10,000) the detection result is frozen, so later
+batches do not change semantic labels, and the sample is dropped from the checkpoint. Until then the checkpoint
+holds those raw sample rows; keep the checkpoint directory as private as the source data. Snapshots follow the same
+privacy rules as batch profiles. A PII handling policy (`pii_policy`) is not supported yet.
 
 ## The profile spec
 

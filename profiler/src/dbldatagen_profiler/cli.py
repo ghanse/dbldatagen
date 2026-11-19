@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from importlib import import_module
 from pathlib import Path
 
-from dbldatagen_profiler.model import SourceInfo, dump_profile, load_profile, render_json_schema
+from dbldatagen_profiler.model import Profile, SourceInfo, dump_profile, load_profile, render_json_schema
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -54,6 +54,18 @@ def _build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--format", choices=("parquet", "csv", "delta"), default="parquet", help="Input format.")
     profile.add_argument("-o", "--output", type=Path, required=True, help="Output profile JSON file.")
     profile.set_defaults(handler=_profile)
+
+    stream = commands.add_parser("stream", help="Profile file sources incrementally with Spark Structured Streaming.")
+    stream.add_argument("--table", action="append", required=True, metavar="NAME=PATH", help="Named input table.")
+    stream.add_argument("--format", choices=("parquet", "delta", "json"), default="parquet", help="Input format.")
+    stream.add_argument("--checkpoint", type=Path, required=True, help="Checkpoint directory.")
+    stream.add_argument(
+        "--trigger",
+        default="availableNow",
+        help="'availableNow' (default) or a processing-time interval such as '30 seconds'.",
+    )
+    stream.add_argument("-o", "--output", type=Path, required=True, help="Output profile JSON file.")
+    stream.set_defaults(handler=_stream)
 
     pii = commands.add_parser("pii", help="Detect or substitute personally identifying data.")
     pii_commands = pii.add_subparsers(dest="pii_command", required=True)
@@ -131,6 +143,45 @@ def _profile(args: argparse.Namespace) -> int:
         print(f"dbldatagen-profile profile: {error}", file=sys.stderr)
         return 1
     return 0
+
+
+def _stream(args: argparse.Namespace) -> int:
+    """Profiles streaming file sources and writes the profile snapshot after each poll and at the end."""
+    spark_errors = import_module("pyspark.errors")
+    py4j_errors = import_module("py4j.protocol")
+    profiler = None
+    try:
+        spark, tables = _spark_inputs(args)
+        paths = dict(_parse_table(value) for value in args.table)
+        streams = {
+            name: spark.readStream.schema(frame.schema).format(args.format).load(paths[name])  # type: ignore[attr-defined]
+            for name, frame in tables.items()
+        }
+        StreamingProfiler = import_module("dbldatagen_profiler.engines.streaming").StreamingProfiler
+        profiler = StreamingProfiler(streams, checkpoint_dir=args.checkpoint, trigger=args.trigger)
+        profiler.start()
+        try:
+            while not profiler.await_termination(timeout=10):
+                _write_snapshot(profiler.profile(), args)
+        except KeyboardInterrupt:
+            profiler.stop()
+        _write_snapshot(profiler.profile(), args)
+    except (OSError, ValueError, spark_errors.PySparkException, py4j_errors.Py4JError) as error:
+        print(f"dbldatagen-profile stream: {error}", file=sys.stderr)
+        return 1
+    finally:
+        if profiler is not None:
+            profiler.stop()
+    return 0
+
+
+def _write_snapshot(profile: Profile, args: argparse.Namespace) -> None:
+    """Writes a validated profile snapshot atomically to `args.output`."""
+    profile.source = SourceInfo(name=", ".join(_parse_table(value)[0] for value in args.table), format=args.format)
+    text = dump_profile(load_profile(profile.model_dump(mode="json"), strict=True)) + "\n"
+    temporary = args.output.with_name(f"{args.output.name}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(args.output)
 
 
 def _spark_inputs(args: argparse.Namespace) -> tuple[object, dict[str, object]]:
