@@ -104,12 +104,13 @@ def substitute(  # noqa: PLR0912, PLR0915
     for table_name, frame in tables.items():
         result = frame
         columns = {column.name: column for column in profiles[table_name].columns}
+        entity_columns = _entity_columns(profile, table_name)
+        entity_keys = _capture_entity_keys(result, entity_columns)
+        for entity_column, hidden in entity_keys.items():
+            result = result.withColumn(hidden, F.col(entity_column))
         ordered_names = sorted(
             frame.columns,
-            key=lambda name: decisions.get(f"{table_name}.{name}", (PiiRule(action=PiiAction.KEEP), "default"))[
-                0
-            ].action
-            == PiiAction.DROP,
+            key=lambda name: _is_drop(decisions.get(f"{table_name}.{name}")),
         )
         for name in ordered_names:
             reference = f"{table_name}.{name}"
@@ -192,10 +193,12 @@ def substitute(  # noqa: PLR0912, PLR0915
             elif effective_semantic is not None and rule.action == PiiAction.SUBSTITUTE:
                 date_shift_key: str | None = None
                 if effective_semantic.pii_class == PiiClass.DATE_OF_BIRTH:
-                    entity_columns = _entity_columns(profile, table_name)
                     date_shift_key = "entity" if entity_columns else "value"
                     transform = _date_shift_udf(domains[reference], key, opts.date_shift_days)
-                    result = result.withColumn(name, transform(F.col(name), *(F.col(item) for item in entity_columns)))
+                    result = result.withColumn(
+                        name,
+                        transform(F.col(name), *(F.col(entity_keys[item]) for item in entity_columns)),
+                    )
                 elif effective_semantic.pii_class == PiiClass.FREE_TEXT_PII:
                     transform = _substitution_udf(
                         effective_semantic, domains[reference], key, opts, frame.schema[name].dataType
@@ -249,7 +252,7 @@ def substitute(  # noqa: PLR0912, PLR0915
                         ),
                     }
                 )
-        output[table_name] = result
+        output[table_name] = result.drop(*entity_keys.values())
     return SubstitutionResult(tables=output, report={"columns": reports})
 
 
@@ -367,6 +370,22 @@ def _entity_columns(profile: Profile, table_name: str) -> list[str]:
         ):
             return relationship.child_columns
     return []
+
+
+def _capture_entity_keys(frame: DataFrame, entity_columns: list[str]) -> dict[str, str]:
+    used = set(frame.columns)
+    captured: dict[str, str] = {}
+    for index, column in enumerate(entity_columns):
+        hidden = f"__pii_entity_{index}"
+        while hidden in used:
+            hidden = f"_{hidden}"
+        captured[column] = hidden
+        used.add(hidden)
+    return captured
+
+
+def _is_drop(decision: tuple[PiiRule, str] | None) -> bool:
+    return decision is not None and decision[0].action == PiiAction.DROP
 
 
 def _build_mapping(
@@ -532,9 +551,17 @@ def _validate_generic_values(mapping: DataFrame, data_type: T.DataType, referenc
         non_finite = F.isnan("original") | (F.abs("original") == F.lit(float("inf")))
         if mapping.where(non_finite).limit(1).count() != 0:
             raise ValueError(f"generic float substitution requires finite values for column {reference!r}")
-    if isinstance(data_type, T.DecimalType) and data_type.precision <= 9:
-        count = mapping.count()
+    space: int | None = None
+    if isinstance(data_type, T.ByteType):
+        space = 2**8
+    elif isinstance(data_type, T.ShortType):
+        space = 2**16
+    elif isinstance(data_type, T.IntegerType):
+        space = 2**32
+    elif isinstance(data_type, T.DecimalType) and data_type.precision <= 9:
         space = 2 * 10**data_type.precision - 1
+    if space is not None:
+        count = mapping.count()
         if count > space - count:
             raise ValueError(f"surrogate space is too small to preserve distinct values for column {reference!r}")
 
