@@ -10,16 +10,17 @@ keeps the rows whose primary key (all non-nested columns when it has none) hashe
 then, parents first, a row is dropped when a parent it references through a declared foreign key was dropped.
 
 Exports use the Statement Execution API with `EXTERNAL_LINKS` and `ARROW_STREAM`. Each chunk's link is
-requested just before the chunk is downloaded, and requested again if it expired, so every chunk is fetched
-while its link is valid. Credentials come from `DATABRICKS_HOST` and `DATABRICKS_TOKEN`, or from
-`databricks auth token` for `DATABRICKS_CONFIG_PROFILE`; the warehouse from `DATABRICKS_WAREHOUSE_ID`.
-Without them, or offline, an export raises `Unavailable`; a cached instance needs neither.
+requested just before the chunk is downloaded; an expired link is requested again, up to `LINK_ATTEMPTS` times with
+backoff. Each table's source `SELECT COUNT(*)` must match the rows received and the declared count. See `connect`
+for the environment variables. Any network or authentication failure raises `Unavailable`; a cached instance
+needs no warehouse.
 """
 
 from __future__ import annotations
 
 import configparser
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -49,6 +50,10 @@ from profiler_bench.catalog.store import META_FILE, Materialized, cache_dir, is_
 REAL_TIERS = ("s", "full")
 FULL_FILE_ROWS = 1_000_000
 POLL_SECONDS = 2.0
+RETRY_SECONDS = 2.0
+LINK_ATTEMPTS = 3
+WAREHOUSE_ENV = "PROFILER_BENCH_DATABRICKS_WAREHOUSE_ID"
+PROFILE_ENV = "PROFILER_BENCH_DATABRICKS_PROFILE"
 TIMEOUT = 120.0
 _NULL = "\0"
 _SEPARATOR = "\x1f"
@@ -292,15 +297,19 @@ class Warehouse:
 def connect() -> Warehouse:
     """Returns the configured warehouse.
 
+    The warehouse is `PROFILER_BENCH_DATABRICKS_WAREHOUSE_ID`. The host and token are `DATABRICKS_HOST` and
+    `DATABRICKS_TOKEN`, or else come from the profile `PROFILER_BENCH_DATABRICKS_PROFILE` (default: the CLI's
+    `DATABRICKS_CONFIG_PROFILE`, then `DEFAULT`) through `~/.databrickscfg` and `databricks auth token`.
+
     Raises:
         Unavailable: If no warehouse, host, or token can be found.
     """
-    warehouse_id = os.environ.get("DATABRICKS_WAREHOUSE_ID")
+    warehouse_id = os.environ.get(WAREHOUSE_ENV)
     if not warehouse_id:
-        raise Unavailable("set DATABRICKS_WAREHOUSE_ID to the SQL warehouse to export from")
+        raise Unavailable(f"set {WAREHOUSE_ENV} to the SQL warehouse to export from")
     host, token = os.environ.get("DATABRICKS_HOST"), os.environ.get("DATABRICKS_TOKEN")
     if not (host and token):
-        profile = os.environ.get("DATABRICKS_CONFIG_PROFILE", "DEFAULT")
+        profile = os.environ.get(PROFILE_ENV) or os.environ.get("DATABRICKS_CONFIG_PROFILE") or "DEFAULT"
         host = host or _profile_host(profile)
         token = _cli_token(profile)
     host = host.rstrip("/")
@@ -311,7 +320,7 @@ def _profile_host(profile: str) -> str:
     config = configparser.ConfigParser()
     config.read(os.environ.get("DATABRICKS_CONFIG_FILE", Path.home() / ".databrickscfg"))
     if not config.has_option(profile, "host"):
-        raise Unavailable(f"set DATABRICKS_HOST and DATABRICKS_TOKEN, or a profile {profile!r} with a host")
+        raise Unavailable(f"set DATABRICKS_HOST and DATABRICKS_TOKEN, or {PROFILE_ENV} to a profile with a host")
     return config.get(profile, "host")
 
 
@@ -323,7 +332,7 @@ def _cli_token(profile: str) -> str:
         raise Unavailable(f"set DATABRICKS_TOKEN, or install the databricks CLI ({error})") from error
     if result.returncode != 0:
         reason = (result.stderr.strip().splitlines() or ["no output"])[-1]
-        raise Unavailable(f"`{' '.join(command)}` failed: {reason}")
+        raise Unavailable(f"`databricks auth token` failed for the configured profile: {reason}")
     return str(json.loads(result.stdout)["access_token"])
 
 
@@ -341,72 +350,94 @@ def _call(warehouse: Warehouse, method: str, path: str, body: dict[str, Any] | N
     except urllib.error.HTTPError as error:
         if error.code in (401, 403):
             raise Unavailable(f"{warehouse.host} rejected the credentials (HTTP {error.code})") from error
+        if error.code == 429 or error.code >= 500:
+            raise Unavailable(f"{warehouse.host} is unavailable (HTTP {error.code})") from error
         raise
-    except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+    except (OSError, http.client.HTTPException) as error:
         raise Unavailable(f"cannot reach {warehouse.host}: {error}") from error
 
 
 def export(dataset: RealDataset, warehouse: Warehouse) -> dict[str, pa.Table]:
-    """Exports every table of `dataset` and checks it against the declared rows, schema, and pinned hashes.
+    """Exports every table of `dataset` and checks it against the source, the declaration, and the pinned hashes.
+
+    Each table's `SELECT COUNT(*)` on the source, the rows received, and the declared row count must agree.
 
     Raises:
-        Unavailable: If the warehouse cannot be used.
-        ValueError: If a table differs from its declaration or its pinned hash.
+        Unavailable: If the warehouse or a result link cannot be used.
+        ValueError: If a table differs from its source count, its declaration, or its pinned hash.
     """
-    tables = {spec.name: _export_table(warehouse, spec) for spec in dataset.tables}
+    tables = {}
     for spec in dataset.manifest().tables:
-        table = tables[spec.name]
+        source = next(t for t in dataset.tables if t.name == spec.name)
+        counted = _count(warehouse, source)
+        table = tables[spec.name] = _export_table(warehouse, source)
+        label = f"{dataset.name}.{spec.name}"
+        if not counted == table.num_rows == spec.row_count:
+            raise ValueError(
+                f"{label}: source COUNT(*) {counted}, received {table.num_rows}, declared {spec.row_count}"
+            )
         actual = [(f.name, spark_type(f.type)) for f in table.schema]
         expected = [(c.name, c.type) for c in spec.columns]
         if actual != expected:
-            raise ValueError(f"{dataset.name}.{spec.name}: schema {actual} != declared {expected}")
-        if table.num_rows != spec.row_count:
-            raise ValueError(f"{dataset.name}.{spec.name}: {table.num_rows} rows != declared {spec.row_count}")
+            raise ValueError(f"{label}: schema {actual} != declared {expected}")
         pinned, digest = dataset.hashes.get(spec.name), table_hash(table)
         if pinned is not None and digest != pinned:
-            raise ValueError(f"{dataset.name}.{spec.name}: hash {digest} != pinned {pinned}")
+            raise ValueError(f"{label}: hash {digest} != pinned {pinned}")
     return tables
 
 
-def _export_table(warehouse: Warehouse, spec: RealTable) -> pa.Table:
+def _run(warehouse: Warehouse, statement: str, disposition: str, result_format: str) -> dict[str, Any]:
     body = {
         "warehouse_id": warehouse.warehouse_id,
-        "statement": spec.sql,
+        "statement": statement,
         "wait_timeout": "30s",
         "on_wait_timeout": "CONTINUE",
-        "disposition": "EXTERNAL_LINKS",
-        "format": "ARROW_STREAM",
+        "disposition": disposition,
+        "format": result_format,
     }
     response = _call(warehouse, "POST", "/api/2.0/sql/statements", body)
-    statement = response["statement_id"]
     while response["status"]["state"] in ("PENDING", "RUNNING"):
         time.sleep(POLL_SECONDS)
-        response = _call(warehouse, "GET", f"/api/2.0/sql/statements/{statement}")
+        response = _call(warehouse, "GET", f"/api/2.0/sql/statements/{response['statement_id']}")
     status = response["status"]
     if status["state"] != "SUCCEEDED":
-        raise RuntimeError(f"{spec.source}: statement {status['state']}: {status.get('error', {}).get('message')}")
-    chunks = [_chunk(warehouse, statement, i) for i in range(response["manifest"].get("total_chunk_count", 0))]
+        raise RuntimeError(f"{statement}: {status['state']}: {status.get('error', {}).get('message')}")
+    return response
+
+
+def _count(warehouse: Warehouse, spec: RealTable) -> int:
+    response = _run(warehouse, f"SELECT COUNT(*) FROM {spec.source}", "INLINE", "JSON_ARRAY")
+    return int(response["result"]["data_array"][0][0])
+
+
+def _export_table(warehouse: Warehouse, spec: RealTable) -> pa.Table:
+    response = _run(warehouse, spec.sql, "EXTERNAL_LINKS", "ARROW_STREAM")
+    chunks = response["manifest"].get("total_chunk_count", 0)
     if not chunks:
         raise ValueError(f"{spec.source}: the export returned no rows")
-    return pa.concat_tables(chunks)
+    return pa.concat_tables([_chunk(warehouse, response["statement_id"], i) for i in range(chunks)])
 
 
 def _chunk(warehouse: Warehouse, statement: str, index: int) -> pa.Table:
-    try:
-        return _download(warehouse, statement, index)
-    except urllib.error.HTTPError as error:
-        if error.code != 403:
-            raise
-    return _download(warehouse, statement, index)
+    """Returns one result chunk, fetching a fresh link before each of `LINK_ATTEMPTS` attempts while links expire."""
+    for attempt in range(LINK_ATTEMPTS):
+        if attempt:
+            time.sleep(RETRY_SECONDS * 2 ** (attempt - 1))
+        path = f"/api/2.0/sql/statements/{statement}/result/chunks/{index}"
+        links = [link["external_link"] for link in _call(warehouse, "GET", path)["external_links"]]
+        try:
+            return pa.concat_tables([_download(url) for url in links])
+        except urllib.error.HTTPError as error:
+            if error.code != 403:
+                raise Unavailable(f"chunk {index} download failed (HTTP {error.code})") from error
+        except (OSError, http.client.HTTPException, pa.ArrowInvalid) as error:
+            raise Unavailable(f"chunk {index} download failed: {error}") from error
+    raise Unavailable(f"chunk {index} link expired on {LINK_ATTEMPTS} attempts")
 
 
-def _download(warehouse: Warehouse, statement: str, index: int) -> pa.Table:
-    links = _call(warehouse, "GET", f"/api/2.0/sql/statements/{statement}/result/chunks/{index}")["external_links"]
-    parts = []
-    for link in links:
-        with urllib.request.urlopen(link["external_link"], timeout=TIMEOUT) as response:
-            parts.append(ipc.open_stream(response.read()).read_all())
-    return pa.concat_tables(parts)
+def _download(url: str) -> pa.Table:
+    with urllib.request.urlopen(url, timeout=TIMEOUT) as response:
+        return ipc.open_stream(response.read()).read_all()
 
 
 def table_sizes(instance: Materialized) -> dict[str, int]:

@@ -98,16 +98,24 @@ row counts, the schema, and the logical hash of every exported table, pinned aft
 never committed: it lives in the gitignored cache under `real/<dataset>/<tier>`.
 
 ```bash
-export DATABRICKS_CONFIG_PROFILE=fevm-gh-ws-001 DATABRICKS_WAREHOUSE_ID=<warehouse id>
+export PROFILER_BENCH_DATABRICKS_PROFILE=<profile> PROFILER_BENCH_DATABRICKS_WAREHOUSE_ID=<warehouse id>
 python -m profiler_bench.catalog real --tier full   # export, check rows, schema, and pinned hashes
 python -m profiler_bench.catalog real               # tier s, derived from the cached export
 ```
 
 `real.materialize(dataset, tier)` exports through the Statement Execution API (`EXTERNAL_LINKS`, `ARROW_STREAM`). It
-requests each chunk's link just before downloading the chunk and requests it again if it expired, so every chunk is
-fetched while its link is valid. Credentials come from `DATABRICKS_HOST` and `DATABRICKS_TOKEN`, or from
-`databricks auth token -p $DATABRICKS_CONFIG_PROFILE` (unset a stale `DATABRICKS_WORKSPACE_ID` if that fails).
-Without a warehouse or credentials, or offline, it raises `Unavailable` with the reason, and the command line prints
+requests each chunk's link just before downloading the chunk; an expired link is requested again, up to three times
+with backoff. Each table's source `SELECT COUNT(*)`, the rows received, and the declared row count must agree, and the
+schema and pinned hash must match.
+
+| Variable | Meaning |
+|---|---|
+| `PROFILER_BENCH_DATABRICKS_WAREHOUSE_ID` | SQL warehouse to export from (required) |
+| `PROFILER_BENCH_DATABRICKS_PROFILE` | `~/.databrickscfg` profile for the host, with the token from `databricks auth token`; defaults to `DATABRICKS_CONFIG_PROFILE`, then `DEFAULT` |
+| `DATABRICKS_HOST`, `DATABRICKS_TOKEN` | used instead of the profile when both are set |
+
+If `databricks auth token` fails, unset a stale `DATABRICKS_WORKSPACE_ID`. Without a warehouse or credentials, or on
+any network or authentication failure, the export raises `Unavailable` with the reason and the command line prints
 `skipped <dataset>: <reason>`. A cached tier needs neither.
 
 | Tier | Contents |
@@ -125,7 +133,7 @@ run, but each real dataset has one sample, so there is no independent holdout or
 | `tpcds_sf1` | `samples.tpcds_sf1`: `customer`, `customer_address`, `date_dim`, `item`, `store_sales`, `web_sales` | Internal use, no stated licence. TPC caveat: the data comes from the TPC-DS generator, and results measured on it are not TPC-DS benchmark results and must not be published as such (TPC fair-use policy) |
 | `wanderbricks` | `samples.wanderbricks`, all 16 tables | Internal use, no stated licence |
 | `nyctaxi_trips` | `samples.nyctaxi.trips` | Internal use, no stated licence |
-| `simulated_retail` | Marketplace listing *Simulated Retail Customer Data* (provider Databricks), installed in fevm-gh-ws-001 as catalog `simulated_retail_customer_data`; schema `v01`: `customers`, `sales`, `sales_orders` | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) under the [Marketplace consumer terms](https://cms.databricks.com/sites/default/files/2023-01/marketplace-consumer-terms_0.pdf). Attribution: "Simulated Retail Customer Data" by Databricks, Databricks Marketplace, CC BY 4.0 |
+| `simulated_retail` | Marketplace listing *Simulated Retail Customer Data* (provider Databricks), installed as catalog `simulated_retail_customer_data`; schema `v01`: `customers`, `sales`, `sales_orders` | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) under the [Marketplace consumer terms](https://cms.databricks.com/sites/default/files/2023-01/marketplace-consumer-terms_0.pdf). Attribution: "Simulated Retail Customer Data" by Databricks, Databricks Marketplace, CC BY 4.0 |
 
 ### Public datasets
 
@@ -418,5 +426,5 @@ make bench-test    # pytest profiler-bench/tests (m-tier tests are marked slow; 
 make bench-lint    # black, ruff, mypy
 ```
 
-Tests marked `network` export one tiny real table from a warehouse; they are skipped unless selected with
-`-m network` and skip themselves when no warehouse is configured.
+Tests marked `network` export one tiny real table from a warehouse. They are skipped unless selected with
+`-m network`, and skip themselves when `PROFILER_BENCH_DATABRICKS_WAREHOUSE_ID` is unset.

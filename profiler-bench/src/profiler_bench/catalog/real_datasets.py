@@ -387,8 +387,8 @@ SIMULATED_RETAIL = RealDataset(
     terms=(
         "Databricks Marketplace consumer terms "
         "(https://cms.databricks.com/sites/default/files/2023-01/marketplace-consumer-terms_0.pdf). Attribution: "
-        "'Simulated Retail Customer Data' by Databricks, Databricks Marketplace, CC BY 4.0. Installed in "
-        f"fevm-gh-ws-001 as catalog {RETAIL_CATALOG}."
+        "'Simulated Retail Customer Data' by Databricks, Databricks Marketplace, CC BY 4.0. Install the listing as "
+        f"catalog {RETAIL_CATALOG} in the workspace you export from."
     ),
     tables=(
         RealTable(

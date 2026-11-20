@@ -1,3 +1,4 @@
+import os
 import socket
 from pathlib import Path
 
@@ -9,12 +10,21 @@ from pyspark.sql import SparkSession
 from profiler_bench.catalog import DATASETS, REAL_DATASETS, verify
 from profiler_bench.catalog.__main__ import main
 from profiler_bench.catalog.manifest import ForeignKey
-from profiler_bench.catalog.real import RealDataset, RealTable, Unavailable, instance_dir, materialize, subset
+from profiler_bench.catalog.real import (
+    PROFILE_ENV,
+    WAREHOUSE_ENV,
+    RealDataset,
+    RealTable,
+    Unavailable,
+    instance_dir,
+    materialize,
+    subset,
+)
 from profiler_bench.catalog.real_datasets import WANDERBRICKS
 from profiler_bench.catalog.store import write_instance
 
 
-ENV = ("DATABRICKS_WAREHOUSE_ID", "DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_CONFIG_PROFILE")
+ENV = (WAREHOUSE_ENV, PROFILE_ENV, "DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_CONFIG_PROFILE")
 
 FIXTURE = RealDataset(
     name="fixture",
@@ -81,7 +91,7 @@ def test_privacy_paths_must_name_columns() -> None:
 
 
 def test_export_without_a_warehouse_is_unavailable(offline: None, tmp_path: Path) -> None:
-    with pytest.raises(Unavailable, match="DATABRICKS_WAREHOUSE_ID"):
+    with pytest.raises(Unavailable, match=WAREHOUSE_ENV):
         materialize(FIXTURE, "full", tmp_path)
     assert not instance_dir(FIXTURE, "full", tmp_path).exists()
 
@@ -89,7 +99,7 @@ def test_export_without_a_warehouse_is_unavailable(offline: None, tmp_path: Path
 def test_export_without_credentials_is_unavailable(
     offline: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("DATABRICKS_WAREHOUSE_ID", "w")
+    monkeypatch.setenv(WAREHOUSE_ENV, "w")
     with pytest.raises(Unavailable, match="DATABRICKS_HOST"):
         materialize(FIXTURE, "s", tmp_path)
 
@@ -98,7 +108,7 @@ def test_export_offline_is_unavailable(offline: None, tmp_path: Path, monkeypatc
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    monkeypatch.setenv("DATABRICKS_WAREHOUSE_ID", "w")
+    monkeypatch.setenv(WAREHOUSE_ENV, "w")
     monkeypatch.setenv("DATABRICKS_HOST", f"http://127.0.0.1:{port}")
     monkeypatch.setenv("DATABRICKS_TOKEN", "t")
     with pytest.raises(Unavailable, match="cannot reach"):
@@ -107,7 +117,7 @@ def test_export_offline_is_unavailable(offline: None, tmp_path: Path, monkeypatc
 
 def test_cli_skips_unavailable_datasets(offline: None, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["real", "nyctaxi_trips", "--cache-dir", str(tmp_path)]) == 0
-    assert capsys.readouterr().out.startswith("skipped nyctaxi_trips: set DATABRICKS_WAREHOUSE_ID")
+    assert capsys.readouterr().out.startswith(f"skipped nyctaxi_trips: set {WAREHOUSE_ENV}")
 
 
 def test_subset_is_deterministic_capped_and_closed() -> None:
@@ -143,6 +153,8 @@ def test_tier_s_derives_from_a_cached_export(offline: None, tmp_path: Path, spar
 
 @pytest.mark.network
 def test_export_one_table_end_to_end(tmp_path: Path) -> None:
+    if not os.environ.get(WAREHOUSE_ENV):
+        pytest.skip(f"set {WAREHOUSE_ENV} to run the network test")
     amenities = next(t for t in WANDERBRICKS.tables if t.name == "amenities")
     dataset = RealDataset(
         name="amenities_probe",
