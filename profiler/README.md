@@ -170,10 +170,11 @@ Quantiles require at least six times `privacy.min_value_count` (k) non-null valu
 core grid step. A tail point `q` also needs k rows beyond it (`non_null * min(q, 1 - q) >= k`); otherwise it is dropped.
 
 Integer columns with 2 to 64 distinct values get an exact histogram instead of quantiles, from one extra grouped Spark
-job per table (or nested column). Each bin starts as one value and merges with its upper neighbour until it holds at
-least k rows. When `privacy.extremes` is `suppressed`, the outer edges are widened to the nearest multiples, strictly
-outside the data, of a power of ten one digit shorter than the value range, and `generalized_outer_edges` is true; the
-histogram is omitted if the widened edges fall outside the integer type.
+job per table (or nested level: all sibling fields of a struct/map share that job). Each bin starts as one value and
+merges with its upper neighbour until it holds at least k rows. When `privacy.extremes` is `suppressed`, the outer
+edges are widened to the nearest multiples, strictly outside the data, of a power of ten one digit shorter than the
+value range, and `generalized_outer_edges` is true; the histogram is omitted if the widened edges fall outside the
+integer type.
 
 `mean` and `stddev` are always approximate JSON numbers. Histogram bins are `[lo, hi)` except the last, which is
 `[lo, hi]`. The edges span every profiled value, and `counts` are row counts, with `sampled: true` when they come from
@@ -186,10 +187,11 @@ The `privacy` block records the policy the producer applied:
 - `min_value_count` (default 10): a value may appear in `top_values` or an enumeration constraint only if at least this
   many rows hold it. The model checks `top_values` frequencies against the table's row count and null fraction, and
   each enumeration's `min_value_count` (the row count of its rarest value). String `patterns` must also cover at least
-  this many values. For nested columns, counts come from the column's `value_count` (the number of nested values its
-  statistics cover); struct fields inherit their parent's count. A nested array or map child that has `patterns` or
-  `top_values` but no `value_count` is rejected. Literals embedded in regexes are checked by the benchmark's privacy
-  guard, not by the model.
+  this many values, and each histogram bin count must be at least this many (with absolute counts summing to the
+  column's non-null count unless `sampled`). For nested columns, counts come from the column's `value_count` (the
+  number of nested values its statistics cover); struct fields inherit their parent's count. A nested array or map
+  child that has `patterns`, `top_values`, or a `histogram` but no `value_count` is rejected. Literals embedded in
+  regexes are checked by the benchmark's privacy guard, not by the model.
 - `extremes` and `enumerations`: `exact`, `generalized`, or `suppressed`. When suppressed, min/max statistics and
   range bounds (for `extremes`), or `top_values` and enumeration constraints (for `enumerations`), must be absent.
 

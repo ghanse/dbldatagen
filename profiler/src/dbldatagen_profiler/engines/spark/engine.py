@@ -363,41 +363,56 @@ def _profile_children(df: DataFrame, field: T.StructField, privacy: PrivacyPolic
     data_type = field.dataType
     value = df[_VALUE]
     if isinstance(data_type, T.StructType):
-        return [
-            _profile_nested_column(
-                df.select(value.getField(child.name).alias(_VALUE)),
-                T.StructField(child.name, child.dataType, child.nullable),
-                privacy,
-            )
+        fields = [
+            (T.StructField(child.name, child.dataType, child.nullable), value.getField(child.name))
             for child in data_type.fields
         ]
+        return _profile_nested_fields(df, fields, privacy)
     if isinstance(data_type, T.ArrayType):
         child_df = df.select(F.explode(value).alias(_VALUE))
-        return [
-            _profile_nested_column(
-                child_df, T.StructField("element", data_type.elementType, data_type.containsNull), privacy
-            )
-        ]
+        return _profile_nested_fields(
+            child_df,
+            [(T.StructField("element", data_type.elementType, data_type.containsNull), child_df[_VALUE])],
+            privacy,
+        )
     if not isinstance(data_type, T.MapType):
         raise TypeError(f"unsupported nested Spark data type: {data_type}")
     exploded = df.select(F.explode(value).alias("key", "value"))
+    return _profile_nested_fields(
+        exploded,
+        [
+            (T.StructField("key", data_type.keyType, False), F.col("key")),
+            (T.StructField("value", data_type.valueType, data_type.valueContainsNull), F.col("value")),
+        ],
+        privacy,
+    )
+
+
+def _profile_nested_fields(
+    df: DataFrame, children: list[tuple[T.StructField, Column]], privacy: PrivacyPolicy
+) -> list[ColumnProfile]:
+    """Profiles sibling nested fields with one aggregate and one histogram value-count job per level."""
+    expressions: list[Column] = [F.count(F.lit(1)).alias("__row_count")]
+    for index, (field, column) in enumerate(children):
+        expressions.extend(_aggregate_expressions(column, field.dataType, index))
+    values = _with_value_counts(
+        df,
+        [(f"c{index}", column, field.dataType) for index, (field, column) in enumerate(children)],
+        _collect_aggregate(df, expressions),
+    )
+    row_count = int(values["__row_count"])
     return [
-        _profile_nested_column(
-            exploded.select(F.col(source).alias(_VALUE)),
-            T.StructField(name, child_type, nullable),
+        _column_from_aggregate(
+            field,
+            values,
+            index,
+            row_count,
             privacy,
+            nested=True,
+            df=df.select(column.alias(_VALUE)),
         )
-        for name, source, child_type, nullable in (
-            ("key", "key", data_type.keyType, False),
-            ("value", "value", data_type.valueType, data_type.valueContainsNull),
-        )
+        for index, (field, column) in enumerate(children)
     ]
-
-
-def _profile_nested_column(df: DataFrame, field: T.StructField, privacy: PrivacyPolicy) -> ColumnProfile:
-    expressions = [F.count(F.lit(1)).alias("__row_count"), *_aggregate_expressions(df[_VALUE], field.dataType, 0)]
-    values = _with_value_counts(df, [("c0", df[_VALUE], field.dataType)], _collect_aggregate(df, expressions))
-    return _column_from_aggregate(field, values, 0, int(values["__row_count"]), privacy, nested=True, df=df)
 
 
 def _collect_aggregate(df: DataFrame, expressions: list[Column]) -> dict[str, Any]:

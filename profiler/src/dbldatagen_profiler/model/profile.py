@@ -1026,8 +1026,8 @@ def _check_column_privacy(column: ColumnProfile, value_count: int | None, policy
         policy: Privacy policy the producer declared.
 
     Raises:
-        ValueError: If a value or pattern covers fewer than `policy.min_value_count` values, literal-bearing
-            statistics have no known value count, or a suppressed value class is present.
+        ValueError: If a value, pattern, or histogram bin covers fewer than `policy.min_value_count` values,
+            literal-bearing statistics have no known value count, or a suppressed value class is present.
     """
     k = policy.min_value_count
     if column.semantic is not None and column.semantic.sensitivity in {
@@ -1040,30 +1040,56 @@ def _check_column_privacy(column: ColumnProfile, value_count: int | None, policy
         if string.patterns and any(not _is_generalized_pattern(pattern.regex) for pattern in string.patterns):
             raise ValueError(f"column {column.name!r}: sensitive patterns must contain character classes only")
     stats = column.numeric or column.temporal
+    histogram = column.numeric.histogram if column.numeric else None
     if policy.extremes == ValueTreatment.SUPPRESSED and stats is not None:
-        histogram = column.numeric.histogram if column.numeric else None
-        if stats.min is not None or stats.max is not None:
-            raise ValueError(f"column {column.name!r}: min/max present but privacy.extremes is suppressed")
-        if any(q.q in (0.0, 1.0) for q in stats.quantiles or []):
-            raise ValueError(f"column {column.name!r}: q=0 or q=1 quantile present but privacy.extremes is suppressed")
-        if histogram is not None and not histogram.generalized_outer_edges:
-            raise ValueError(
-                f"column {column.name!r}: histogram outer edges must be generalized when extremes are suppressed"
-            )
+        _check_suppressed_extremes(column.name, stats, histogram)
     string = column.string or StringStats()
     if string.top_values and policy.enumerations == ValueTreatment.SUPPRESSED:
         raise ValueError(f"column {column.name!r}: top_values present but privacy.enumerations is suppressed")
     if value_count is None:
-        if string.top_values or string.patterns:
-            raise ValueError(f"column {column.name!r}: nested patterns or top_values require value_count")
+        if string.top_values or string.patterns or histogram is not None:
+            raise ValueError(f"column {column.name!r}: nested patterns, top_values, or histogram require value_count")
         return
     non_null_rows = value_count * (1.0 - column.null_fraction)
     if stats is not None and stats.quantiles and non_null_rows < k * QUANTILE_INTERVALS:
         raise ValueError(f"column {column.name!r}: quantiles require at least {k * QUANTILE_INTERVALS} non-null values")
+    if histogram is not None:
+        _check_histogram_privacy(column.name, histogram, non_null_rows, k)
     rare = [entry.value for entry in string.top_values or [] if round(entry.frequency * non_null_rows) < k]
     rare += [pattern.regex for pattern in string.patterns or [] if round(pattern.coverage * non_null_rows) < k]
     if rare:
         raise ValueError(f"column {column.name!r}: top_values or patterns cover fewer than {k} rows: {rare}")
+
+
+def _check_suppressed_extremes(name: str, stats: NumericStats | TemporalStats, histogram: Histogram | None) -> None:
+    """Rejects min/max, q=0/1, and exact histogram outer edges under extremes=suppressed."""
+    if stats.min is not None or stats.max is not None:
+        raise ValueError(f"column {name!r}: min/max present but privacy.extremes is suppressed")
+    if any(q.q in (0.0, 1.0) for q in stats.quantiles or []):
+        raise ValueError(f"column {name!r}: q=0 or q=1 quantile present but privacy.extremes is suppressed")
+    if histogram is not None and not histogram.generalized_outer_edges:
+        raise ValueError(f"column {name!r}: histogram outer edges must be generalized when extremes are suppressed")
+
+
+def _check_histogram_privacy(name: str, histogram: Histogram, non_null_rows: float, k: int) -> None:
+    """Rejects histogram bins that cover fewer than `k` rows, and count totals that miss the non-null mass.
+
+    Absolute bin counts must each be at least `k` and (unless `sampled`) sum to the column's non-null count.
+    Fraction-encoded counts (values in (0, 1]) are scaled by `non_null_rows` before the `k` check; the sum
+    rule applies only to absolute counts.
+    """
+    non_null = round(non_null_rows)
+    # Counts are typed as non-negative ints today; float fractions would arrive only if the encoding widens.
+    fractional = any(isinstance(count, float) and 0.0 < count <= 1.0 for count in histogram.counts)
+    rare = [
+        count for count in histogram.counts if (round(float(count) * non_null_rows) if fractional else int(count)) < k
+    ]
+    if rare:
+        raise ValueError(f"column {name!r}: histogram bins cover fewer than {k} rows: {rare}")
+    if not fractional and not histogram.sampled and sum(histogram.counts) != non_null:
+        raise ValueError(
+            f"column {name!r}: histogram counts must sum to {non_null} non-null values, got {sum(histogram.counts)}"
+        )
 
 
 def _is_generalized_pattern(regex: str) -> bool:

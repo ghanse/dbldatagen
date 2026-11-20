@@ -201,13 +201,18 @@ def test_high_cardinality_and_non_integer_columns_keep_quantiles(spark: SparkSes
 
 
 def test_nested_integer_children_get_histograms(spark: SparkSession) -> None:
-    frame = spark.range(100).selectExpr("array(CAST(id % 4 AS INT)) AS items")
+    frame = spark.range(100).selectExpr(
+        "array(CAST(id % 4 AS INT)) AS items",
+        "named_struct('a', CAST(id % 3 AS INT), 'b', CAST(id % 5 AS INT)) AS pair",
+    )
     columns = profile_dataframe("nested", frame).tables[0].columns
 
     assert columns[0].children is not None
     histogram = columns[0].children[0].numeric.histogram if columns[0].children[0].numeric else None
     assert histogram is not None and histogram.edges == [0, 1, 2, 3, 3]
     assert histogram.counts == [25, 25, 25, 25]
+    assert columns[1].children is not None
+    assert [child.numeric.histogram is not None for child in columns[1].children if child.numeric] == [True, True]
 
 
 @pytest.mark.parametrize(
