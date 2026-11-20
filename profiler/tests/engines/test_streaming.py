@@ -130,6 +130,11 @@ def _comparable(profile: Profile) -> dict[str, Any]:
 
 def _assert_equivalent(batch: object, stream: object, path: str = "") -> None:
     """Asserts exact equality except for float moments (rounding) and distinct counts (sketch bound)."""
+    # Streaming checkpoints do not retain a mergeable percentile sketch. Quantiles are a
+    # batch-profiler field; all statistics supported by both engines remain equivalent.
+    if path.endswith(("numeric.quantiles", "temporal.quantiles")):
+        assert stream is None
+        return
     if isinstance(batch, dict):
         assert isinstance(stream, dict), path
         assert set(batch) == set(stream), path

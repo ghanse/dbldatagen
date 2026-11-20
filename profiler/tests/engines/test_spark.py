@@ -140,8 +140,19 @@ def test_profiles_flat_statistics(spark: SparkSession) -> None:
     assert number.numeric.max == "2"
     assert number.numeric.mean == pytest.approx(1.5)
     assert number.numeric.stddev == pytest.approx(2**-0.5)
+    assert [(item.q, item.value) for item in number.numeric.quantiles or []] == [
+        (0.0, "1"),
+        (0.1, "1"),
+        (0.25, "1"),
+        (0.5, "1"),
+        (0.75, "2"),
+        (0.9, "2"),
+        (1.0, "2"),
+    ]
     assert text.string.length.model_dump(exclude_none=True) == {"min": 1, "max": 4, "mean": 2.5}
     assert moment.temporal.min == "2026-01-01T00:00:00Z"
+    assert moment.temporal.quantiles is not None
+    assert moment.temporal.quantiles[3].value == "2026-01-01T00:00:00Z"
     assert flag.boolean.true_fraction == 0.5
     assert columns["all_null"].numeric.model_dump(exclude_none=True) == {}
     assert columns["constant"].numeric.stddev == 0.0
@@ -220,7 +231,7 @@ def test_non_finite_float_extremes_are_omitted(spark: SparkSession) -> None:
     assert "max" not in column.numeric.model_dump(exclude_none=True)
 
 
-def test_lossless_decimal_and_int64_extremes(spark: SparkSession) -> None:
+def test_lossless_decimal_and_int64_extremes_and_quantiles(spark: SparkSession) -> None:
     schema = T.StructType([T.StructField("integer", T.LongType()), T.StructField("decimal", T.DecimalType(38, 18))])
     rows = [
         (-(2**63), Decimal("-99999999999999999999.999999999999999999")),
@@ -232,6 +243,42 @@ def test_lossless_decimal_and_int64_extremes(spark: SparkSession) -> None:
     assert columns[0].numeric.max == "9223372036854775807"
     assert columns[1].numeric.min == "-99999999999999999999.999999999999999999"
     assert columns[1].numeric.max == "99999999999999999999.999999999999999999"
+    assert [item.value for item in columns[0].numeric.quantiles or []] == [
+        "-9223372036854775808",
+        "-9223372036854775808",
+        "-9223372036854775808",
+        "-9223372036854775808",
+        "9223372036854775807",
+        "9223372036854775807",
+        "9223372036854775807",
+    ]
+
+
+def test_lossless_decimal_quantiles(spark: SparkSession) -> None:
+    values = [Decimal("1.250000000000000000"), Decimal("9.750000000000000000")]
+    frame = spark.createDataFrame([(value,) for value in values], "value decimal(38,18)")
+    stats = profile_dataframe("lossless", frame).tables[0].columns[0].numeric
+
+    assert stats is not None
+    quantiles = stats.quantiles or []
+    assert [type(item.value) for item in quantiles] == [str] * 7
+    assert [item.value for item in quantiles] == [
+        "1.250000000000000000",
+        "1.250000000000000000",
+        "1.250000000000000000",
+        "1.250000000000000000",
+        "9.750000000000000000",
+        "9.750000000000000000",
+        "9.750000000000000000",
+    ]
+
+
+def test_lossy_decimal_quantiles_are_omitted(spark: SparkSession) -> None:
+    values = [Decimal("9007199254740993.123456789012345678"), Decimal("9007199254740995.987654321098765432")]
+    frame = spark.createDataFrame([(value,) for value in values], "value decimal(38,18)")
+    stats = profile_dataframe("lossy", frame).tables[0].columns[0].numeric
+
+    assert stats is not None and stats.quantiles is None
 
 
 def test_large_numeric_aggregates_do_not_overflow_in_ansi_mode(spark: SparkSession) -> None:
@@ -282,6 +329,10 @@ def test_suppressed_extremes_produce_valid_profile(spark: SparkSession) -> None:
     assert profile.tables[0].columns[1].temporal is not None
     assert profile.tables[0].columns[0].numeric.min is None
     assert profile.tables[0].columns[1].temporal.min is None
+    numeric_quantiles = profile.tables[0].columns[0].numeric.quantiles or []
+    temporal_quantiles = profile.tables[0].columns[1].temporal.quantiles or []
+    assert [item.q for item in numeric_quantiles] == [0.1, 0.25, 0.5, 0.75, 0.9]
+    assert [item.q for item in temporal_quantiles] == [0.1, 0.25, 0.5, 0.75, 0.9]
 
 
 def test_nested_columns_have_value_counts(spark: SparkSession) -> None:

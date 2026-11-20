@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from math import isfinite
 from typing import Any
@@ -25,6 +25,7 @@ from dbldatagen_profiler.model import (
     NumericStats,
     PrivacyPolicy,
     Profile,
+    Quantile,
     QuasiIdentifierSet,
     StringStats,
     TableProfile,
@@ -52,6 +53,12 @@ _NUMERIC_TYPES = (
     T.DecimalType,
 )
 _TEMPORAL_TYPES = (T.DateType, T.TimestampType)
+
+# A fixed, deterministic grid gives the sampler useful tail and quartile shape without
+# making each aggregate sketch unnecessarily large. Spark documents accuracy as an
+# inverse relative-error bound; 10,000 therefore targets 1e-4 rank error.
+_QUANTILE_GRID = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
+_QUANTILE_ACCURACY = 10_000
 
 
 def profile_tables(
@@ -264,6 +271,7 @@ def _aggregate_expressions(column: Column, data_type: T.DataType, index: int) ->
                 F.max(column).alias(f"{prefix}_max"),
                 F.avg(approximate).alias(f"{prefix}_mean"),
                 F.stddev_samp(approximate).alias(f"{prefix}_stddev"),
+                F.percentile_approx(column, list(_QUANTILE_GRID), _QUANTILE_ACCURACY).alias(f"{prefix}_quantiles"),
             ]
         )
     elif isinstance(data_type, _string_types()):
@@ -280,6 +288,9 @@ def _aggregate_expressions(column: Column, data_type: T.DataType, index: int) ->
             [
                 _temporal_extreme_literal(F.min(column), data_type).alias(f"{prefix}_min"),
                 _temporal_extreme_literal(F.max(column), data_type).alias(f"{prefix}_max"),
+                F.percentile_approx(
+                    _temporal_quantile_key(column, data_type), list(_QUANTILE_GRID), _QUANTILE_ACCURACY
+                ).alias(f"{prefix}_quantiles"),
             ]
         )
     elif isinstance(data_type, T.BooleanType):
@@ -391,12 +402,34 @@ def _numeric_stats(
     data_type: T.DataType, values: Mapping[str, Any], prefix: str, privacy: PrivacyPolicy
 ) -> NumericStats:
     include_extremes = privacy.extremes != ValueTreatment.SUPPRESSED
+    raw_quantiles = values.get(f"{prefix}_quantiles")
+    # Spark evaluates decimal percentiles through doubles. At high precision this can
+    # silently change values, so publish decimal quantiles only when the sketch retains
+    # the exact native extrema; omission is safer than a lossy "exact" encoding.
+    if (
+        isinstance(data_type, T.DecimalType)
+        and isinstance(raw_quantiles, list)
+        and raw_quantiles
+        and (raw_quantiles[0] != values.get(f"{prefix}_min") or raw_quantiles[-1] != values.get(f"{prefix}_max"))
+    ):
+        raw_quantiles = None
     return NumericStats(
         min=_encode_numeric(values.get(f"{prefix}_min"), data_type) if include_extremes else None,
         max=_encode_numeric(values.get(f"{prefix}_max"), data_type) if include_extremes else None,
         mean=_finite_float(values.get(f"{prefix}_mean")),
         stddev=_finite_float(values.get(f"{prefix}_stddev")),
+        quantiles=_quantiles(raw_quantiles, data_type, include_extremes),
     )
+
+
+def _quantiles(values: object, data_type: T.DataType, include_extremes: bool) -> list[Quantile] | None:
+    if not isinstance(values, list):
+        return None
+    pairs = list(zip(_QUANTILE_GRID, values, strict=True))
+    if not include_extremes:
+        pairs = [(q, value) for q, value in pairs if q not in (0.0, 1.0)]
+    encoded = [Quantile(q=q, value=value) for q, raw in pairs if (value := _encode_numeric(raw, data_type)) is not None]
+    return encoded or None
 
 
 def _encode_numeric(value: object, data_type: T.DataType) -> int | float | str | None:
@@ -430,12 +463,46 @@ def _length_stats(values: Mapping[str, Any], prefix: str, *, include_stddev: boo
 def _temporal_stats(
     data_type: T.DataType, values: Mapping[str, Any], prefix: str, privacy: PrivacyPolicy
 ) -> TemporalStats:
-    if privacy.extremes == ValueTreatment.SUPPRESSED:
-        return TemporalStats()
+    include_extremes = privacy.extremes != ValueTreatment.SUPPRESSED
     return TemporalStats(
-        min=_encode_temporal(values.get(f"{prefix}_min"), data_type),
-        max=_encode_temporal(values.get(f"{prefix}_max"), data_type),
+        min=_encode_temporal(values.get(f"{prefix}_min"), data_type) if include_extremes else None,
+        max=_encode_temporal(values.get(f"{prefix}_max"), data_type) if include_extremes else None,
+        quantiles=_temporal_quantiles(values.get(f"{prefix}_quantiles"), data_type, include_extremes),
     )
+
+
+def _temporal_quantile_key(column: Column, data_type: T.DataType) -> Column:
+    """Maps temporal values to exact ordered integer keys for percentile_approx."""
+    if isinstance(data_type, T.DateType):
+        return F.unix_date(column)
+    if isinstance(data_type, _time_types()):
+        seconds = F.second(column).cast("decimal(16,6)")
+        return (F.hour(column) * 3_600_000_000 + F.minute(column) * 60_000_000 + seconds * 1_000_000).cast("long")
+    return F.unix_micros(column.cast("timestamp"))
+
+
+def _temporal_quantiles(values: object, data_type: T.DataType, include_extremes: bool) -> list[Quantile] | None:
+    if not isinstance(values, list):
+        return None
+    pairs = list(zip(_QUANTILE_GRID, values, strict=True))
+    if not include_extremes:
+        pairs = [(q, value) for q, value in pairs if q not in (0.0, 1.0)]
+    encoded = [Quantile(q=q, value=_encode_temporal_key(int(value), data_type)) for q, value in pairs]
+    return encoded or None
+
+
+def _encode_temporal_key(value: int, data_type: T.DataType) -> str:
+    if isinstance(data_type, T.DateType):
+        return (date(1970, 1, 1) + timedelta(days=value)).isoformat()
+    if isinstance(data_type, _time_types()):
+        hours, remainder = divmod(value, 3_600_000_000)
+        minutes, remainder = divmod(remainder, 60_000_000)
+        seconds, micros = divmod(remainder, 1_000_000)
+        return canonicalize_iso_fraction(time(hours, minutes, seconds, micros).isoformat())
+    moment = datetime(1970, 1, 1) + timedelta(microseconds=value)
+    timespec = "microseconds" if moment.microsecond else "seconds"
+    rendered = canonicalize_iso_fraction(moment.isoformat(timespec=timespec))
+    return rendered if isinstance(data_type, _timestamp_ntz_types()) else f"{rendered}Z"
 
 
 def _temporal_extreme_literal(extreme: Column, data_type: T.DataType) -> Column:
