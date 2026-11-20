@@ -9,7 +9,14 @@ from pyspark.sql import functions as F
 
 from profiler_bench.catalog import Manifest, load, materialize
 from profiler_bench.catalog.manifest import Column, Format, Table
-from profiler_bench.fidelity import ReconstructionScore, ceiling, load_config, overall, score_reconstruction
+from profiler_bench.fidelity import (
+    ReconstructionScore,
+    ceiling,
+    load_config,
+    overall,
+    reconstruction,
+    score_reconstruction,
+)
 from profiler_bench.fidelity.scores import TableReconstruction
 
 
@@ -248,6 +255,42 @@ def test_effective_weights_are_renormalized_over_present_groups(numeric_identica
     assert sum(table.weights.values()) == pytest.approx(1.0)
     total = sum(config[g] for g in table.groups)
     assert table.weights["marginal"] == pytest.approx(config["marginal"] / total)
+
+
+def test_reconstruction_collects_full_synth_rows_before_projecting(
+    spark: SparkSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Synth may include type-mismatched columns; collect must hash the full row, not the projected match set."""
+    n = 500
+    real_pdf = pd.DataFrame({"id": np.arange(n), "group": np.arange(n) % 3, "value": np.arange(n, dtype=float)})
+    synth_pdf = real_pdf.assign(extra=np.arange(n))  # extra column: not in real / not in `good`
+    table = Table(
+        name="t",
+        row_count=n,
+        primary_key=("id",),
+        columns=(
+            Column(name="id", type="bigint", unique=True),
+            Column(name="group", type="bigint"),
+            Column(name="value", type="double"),
+        ),
+    )
+    manifest = Manifest(dataset="partial", tier="xs", structure_seed=0, description="", tables=(table,))
+    seen: list[list[str]] = []
+    real_collect = reconstruction.collect
+
+    def wrapped(df: DataFrame, truth: Table | None, rows: int, cap: int, seed: int) -> object:
+        seen.append(list(df.columns))
+        return real_collect(df, truth, rows, cap, seed)
+
+    monkeypatch.setattr(reconstruction, "collect", wrapped)
+    score_reconstruction(
+        {"t": spark.createDataFrame(real_pdf)},
+        {"t": spark.createDataFrame(synth_pdf)},
+        manifest,
+        seed=0,
+    )
+    assert len(seen) >= 2
+    assert "extra" in seen[1], seen
 
 
 def test_shuffling_one_of_two_equal_uuid_columns_drops_the_score(spark: SparkSession) -> None:

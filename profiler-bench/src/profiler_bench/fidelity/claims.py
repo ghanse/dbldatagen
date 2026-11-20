@@ -3,7 +3,8 @@
 Structure recovery credits claims about planted structure against the manifest. Claims about structure the manifest
 does not plant are checked here instead: a true claim is neutral and a false one counts as 0 in precision, so spraying
 claims cannot raise precision and false claims lower it. Fractions are compared with the catalog's share tolerance,
-keys must hold exactly, and dependencies use the structure dependency tolerance on a bounded sample.
+keys must hold exactly, and dependencies use the structure dependency tolerance on a bounded full-row sample
+(hashed before projecting to the claimed columns).
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 
+import pandas as pd
 from pyspark.errors import AnalysisException
 from pyspark.sql import Column as SparkColumn
 from pyspark.sql import DataFrame
@@ -96,17 +98,29 @@ class Verifier:
         satisfied = 1.0 - (row["bad"] or 0) / rows if rows else 1.0
         return not share("satisfied", satisfied, claim.satisfied_fraction, rows)
 
-    def dependency(self, table: str, dependency: Dependency) -> bool:
-        """Returns whether a claimed dependency strength matches the real one on a bounded sample."""
-        if not self._columns(table, dependency.columns):
-            return False
-        df = self.real[table].select(*(quoted(c) for c in dependency.columns))
-        leaves, frames = collect(df, None, self.rows(table), self.config.sampling.max_rows, self.seed)
+    def dependency_sample(self, table: str, columns: Sequence[str]) -> tuple[pd.DataFrame, dict[str, str]] | None:
+        """Returns a full-row bounded sample and leaf kinds for `columns`, or None if unavailable.
+
+        Rows are hashed over the whole table before projecting to `columns`. Projecting first would make
+        `bounded()` hash only the claimed pair, so identical low-cardinality pairs are kept or dropped together
+        and dependence measures (especially Pearson) are biased.
+        """
+        if not self._columns(table, columns):
+            return None
+        leaves, frames = collect(self.real[table], None, self.rows(table), self.config.sampling.max_rows, self.seed)
         frame = frames[ROW_FRAME]
         limit = self.config.marginal.categorical_max_distinct
-        kinds = {leaf.path: leaf_kind(leaf, frame[leaf.path], limit) for leaf in leaves}
-        if set(kinds) != set(dependency.columns):
+        kinds = {leaf.path: leaf_kind(leaf, frame[leaf.path], limit) for leaf in leaves if leaf.path in columns}
+        if set(kinds) != set(columns):
+            return None
+        return frame, kinds
+
+    def dependency(self, table: str, dependency: Dependency) -> bool:
+        """Returns whether a claimed dependency strength matches the real one on a bounded sample."""
+        sampled = self.dependency_sample(table, dependency.columns)
+        if sampled is None:
             return False
+        frame, kinds = sampled
         value = pair_measure(frame, dependency.columns, dependency.method.value, kinds, self.config)
         n = max(len(frame), 1)
         allowed = self.config.structure_tolerances.dependency + 4 * (1 - dependency.value**2) / math.sqrt(n)
