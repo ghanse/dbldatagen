@@ -76,7 +76,8 @@ With an interval trigger the command runs until interrupted and rewrites `profil
 
 The streaming engine requires pyspark 3.5 or later (for Spark's `hll_sketch_agg`); `StreamingProfiler` and
 `dbldatagen-profile stream` fail with a clear error on older versions. The batch engine still supports pyspark 3.4.1.
-Quantiles are batch-only because streaming checkpoints do not retain a mergeable percentile sketch.
+Quantiles and cross-column dependencies are batch-only because streaming checkpoints do not retain mergeable
+percentile sketches or cross-column moments.
 
 A snapshot equals the batch profile of the same rows on these statistics: row count, null fraction, nested
 `value_count`, numeric and temporal min/max (lossless for decimal and int64), string and collection length
@@ -137,6 +138,15 @@ A profile contains:
 - `relationships`: foreign keys from child columns to parent columns, with coverage, confidence, and fan-out. Fan-out
   counts child rows for every parent key, including keys with none; child keys that match no parent are left out and
   show up in `coverage` instead.
+- `dependencies`: the Spark engine computes Pearson correlation for at most 64 top-level numeric/temporal pairs in
+  the existing per-table aggregate. Pairs are selected deterministically by increasing distance in schema order, then
+  by the left column's schema position, so adjacent columns are considered first and a 200-column table does not
+  generate every possible pair. Temporal-temporal and conventionally named ID/key pairs are not candidates, and
+  correlations with absolute value above 0.999 are omitted. A dependency requires at least
+  `privacy.min_value_count` paired finite values and a finite correlation. Numeric values are converted to doubles;
+  dates to UTC epoch days; timestamps, timestamp-without-time-zone, and times to UTC epoch seconds. The profile
+  contains only the aggregate coefficient and column names, never source values or row samples. Dependencies are
+  batch-only.
 - `semantic`: optional PII class, sensitivity, confidence, and value-free detection evidence. Tables may also record
   sampled pairs and triples that behave as quasi-identifiers.
 

@@ -18,6 +18,8 @@ from dbldatagen_profiler.model import (
     SPEC_VERSION,
     BooleanStats,
     ColumnProfile,
+    DependenceMethod,
+    Dependency,
     DistinctCount,
     EngineInfo,
     Histogram,
@@ -65,6 +67,12 @@ _QUANTILE_GRID = (0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0)
 _TAIL_QUANTILES = frozenset({0.01, 0.05, 0.95, 0.99})
 _QUANTILE_ACCURACY = 10_000
 _HISTOGRAM_MAX_DISTINCT = 64
+
+# Pearson pairs are selected in increasing schema-index distance, then by the
+# left index. This puts adjacent columns first and caps wide-table aggregate
+# growth deterministically instead of constructing every possible pair.
+_MAX_PEARSON_PAIRS = 64
+_MAX_PEARSON_CORRELATION = 0.999
 
 
 def profile_tables(
@@ -140,6 +148,20 @@ def _profile_table(
     expressions: list[Column] = [F.count(F.lit(1)).alias("__row_count")]
     for index, field in enumerate(df.schema.fields):
         expressions.extend(_aggregate_expressions(df[field.name], field.dataType, index))
+    pairs = _pearson_pairs(df)
+    for pair_index, (_, _, left, right) in enumerate(pairs):
+        paired = left.isNotNull() & right.isNotNull()
+        paired_left = F.when(paired, left)
+        paired_right = F.when(paired, right)
+        denominator = F.stddev_samp(paired_left) * F.stddev_samp(paired_right)
+        expressions.extend(
+            [
+                F.count(F.when(paired, 1)).alias(f"p{pair_index}_support"),
+                F.when(denominator != 0, F.covar_samp(paired_left, paired_right) / denominator).alias(
+                    f"p{pair_index}_correlation"
+                ),
+            ]
+        )
     values = _with_value_counts(
         df,
         [(f"c{index}", df[field.name], field.dataType) for index, field in enumerate(df.schema.fields)],
@@ -157,7 +179,79 @@ def _profile_table(
     quasi = [
         QuasiIdentifierSet(columns=names, unique_fraction=unique, k_anonymity=k) for names, unique, k in quasi_sets
     ]
-    return TableProfile(name=name, row_count=row_count, columns=protected, quasi_identifier_sets=quasi or None)
+    dependencies = _dependencies_from_aggregate(pairs, values, privacy)
+    return TableProfile(
+        name=name,
+        row_count=row_count,
+        columns=protected,
+        dependencies=dependencies or None,
+        quasi_identifier_sets=quasi or None,
+    )
+
+
+def _pearson_pairs(df: DataFrame) -> list[tuple[str, str, Column, Column]]:
+    """Returns a deterministic, bounded set of finite numeric/temporal pairs.
+
+    Numeric columns use their double representation. Dates use UTC epoch days;
+    timestamps, timestamp-without-time-zone, and times use UTC epoch seconds.
+    Non-finite inputs are converted to null before support and correlation are
+    computed. Pairs are ordered by schema distance and then left schema index.
+    """
+    eligible = [
+        (index, field.name, field.dataType, _pearson_value(df[field.name], field.dataType))
+        for index, field in enumerate(df.schema.fields)
+        if isinstance(field.dataType, (*_NUMERIC_TYPES, *_temporal_types())) and not _key_like_name(field.name)
+    ]
+    ordered = sorted(
+        (
+            (right_index - left_index, left_index, left_name, right_name, left, right)
+            for left_index, left_name, left_type, left in eligible
+            for right_index, right_name, right_type, right in eligible
+            if left_index < right_index
+            and not (isinstance(left_type, _temporal_types()) and isinstance(right_type, _temporal_types()))
+        ),
+        key=lambda pair: (pair[0], pair[1]),
+    )
+    return [
+        (left_name, right_name, left, right)
+        for _, _, left_name, right_name, left, right in ordered[:_MAX_PEARSON_PAIRS]
+    ]
+
+
+def _key_like_name(name: str) -> bool:
+    """Returns whether a top-level column name conventionally denotes a key."""
+    normalized = name.casefold()
+    return normalized in {"id", "key"} or normalized.endswith(("_id", "_key"))
+
+
+def _pearson_value(column: Column, data_type: T.DataType) -> Column:
+    if isinstance(data_type, T.DateType):
+        value = F.datediff(column, F.lit("1970-01-01")).cast("double")
+    elif isinstance(data_type, _time_types()):
+        value = (F.hour(column) * 3600 + F.minute(column) * 60 + F.second(column)).cast("double")
+    elif isinstance(data_type, (*_TEMPORAL_TYPES, *_timestamp_ntz_types())):
+        value = column.cast("timestamp").cast("double")
+    else:
+        value = column.cast("double")
+    return F.when(value.isNotNull() & ~F.isnan(value) & (F.abs(value) != float("inf")), value)
+
+
+def _dependencies_from_aggregate(
+    pairs: list[tuple[str, str, Column, Column]],
+    values: Mapping[str, Any],
+    privacy: PrivacyPolicy,
+) -> list[Dependency]:
+    dependencies = []
+    for index, (left, right, _, _) in enumerate(pairs):
+        correlation = _finite_float(values[f"p{index}_correlation"])
+        supported = int(values[f"p{index}_support"]) >= privacy.min_value_count
+        if supported and correlation is not None and abs(correlation) <= _MAX_PEARSON_CORRELATION:
+            dependencies.append(
+                Dependency(
+                    columns=(left, right), method=DependenceMethod.PEARSON, value=max(-1.0, min(1.0, correlation))
+                )
+            )
+    return dependencies
 
 
 def _protect_column(
