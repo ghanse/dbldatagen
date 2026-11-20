@@ -2,8 +2,11 @@
 
 A table is flattened into leaves: every primitive top-level column and struct field, plus the length of every array,
 map, and binary value. Array elements and map entries are exploded into their own frames, so nested values are
-compared as values, not rows. Rows are selected by a seeded hash of their content, which is independent of
-partitioning and selects identical rows on both sides of a comparison.
+compared as values, not rows. Rows are selected by a seeded hash of their full content, which is independent of
+partitioning and selects identical rows on both sides of a comparison. Callers must
+pass the full row (or a row-identity hash) into `bounded` / `collect` before projecting
+to a column subset; hashing a projection collapses duplicate value tuples and biases
+dependence measures on low-cardinality columns.
 """
 
 from __future__ import annotations

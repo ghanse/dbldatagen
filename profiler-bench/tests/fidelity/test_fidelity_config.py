@@ -12,6 +12,7 @@ def test_packaged_config_loads_and_hash_is_stable() -> None:
     first, second = load_config(), load_config()
     assert first.hash() == second.hash()
     assert len(first.hash()) == 64
+    assert first.version == "1.9.0"
 
 
 def test_hash_ignores_formatting_but_not_values(tmp_path: Path) -> None:
