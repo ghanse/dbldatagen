@@ -402,32 +402,54 @@ def _numeric_stats(
     data_type: T.DataType, values: Mapping[str, Any], prefix: str, privacy: PrivacyPolicy
 ) -> NumericStats:
     include_extremes = privacy.extremes != ValueTreatment.SUPPRESSED
-    raw_quantiles = values.get(f"{prefix}_quantiles")
-    # Spark evaluates decimal percentiles through doubles. At high precision this can
-    # silently change values, so publish decimal quantiles only when the sketch retains
-    # the exact native extrema; omission is safer than a lossy "exact" encoding.
-    if (
-        isinstance(data_type, T.DecimalType)
-        and isinstance(raw_quantiles, list)
-        and raw_quantiles
-        and (raw_quantiles[0] != values.get(f"{prefix}_min") or raw_quantiles[-1] != values.get(f"{prefix}_max"))
-    ):
+    raw_quantiles = _supported_quantile_values(values, prefix, privacy)
+    if not _exact_quantile_types(raw_quantiles, data_type):
         raw_quantiles = None
     return NumericStats(
         min=_encode_numeric(values.get(f"{prefix}_min"), data_type) if include_extremes else None,
         max=_encode_numeric(values.get(f"{prefix}_max"), data_type) if include_extremes else None,
         mean=_finite_float(values.get(f"{prefix}_mean")),
         stddev=_finite_float(values.get(f"{prefix}_stddev")),
-        quantiles=_quantiles(raw_quantiles, data_type, include_extremes),
+        quantiles=_quantiles(
+            raw_quantiles,
+            data_type,
+            include_extremes,
+            values.get(f"{prefix}_min"),
+            values.get(f"{prefix}_max"),
+        ),
     )
 
 
-def _quantiles(values: object, data_type: T.DataType, include_extremes: bool) -> list[Quantile] | None:
+def _supported_quantile_values(values: Mapping[str, Any], prefix: str, privacy: PrivacyPolicy) -> list[Any] | None:
+    raw = values.get(f"{prefix}_quantiles")
+    support = values.get(f"{prefix}_non_null")
+    if not isinstance(raw, list) or not isinstance(support, int):
+        return None
+    return raw if support >= privacy.min_value_count * (len(_QUANTILE_GRID) - 1) else None
+
+
+def _exact_quantile_types(values: list[Any] | None, data_type: T.DataType) -> bool:
+    if values is None:
+        return True
+    if isinstance(data_type, T.DecimalType):
+        return all(isinstance(value, Decimal) and value.as_tuple().exponent == -data_type.scale for value in values)
+    if isinstance(data_type, T.LongType):
+        return all(isinstance(value, int) and not isinstance(value, bool) for value in values)
+    return True
+
+
+def _quantiles(
+    values: object,
+    data_type: T.DataType,
+    include_extremes: bool,
+    minimum: object,
+    maximum: object,
+) -> list[Quantile] | None:
     if not isinstance(values, list):
         return None
     pairs = list(zip(_QUANTILE_GRID, values, strict=True))
     if not include_extremes:
-        pairs = [(q, value) for q, value in pairs if q not in (0.0, 1.0)]
+        pairs = [(q, value) for q, value in pairs if q not in (0.0, 1.0) and value not in (minimum, maximum)]
     encoded = [Quantile(q=q, value=value) for q, raw in pairs if (value := _encode_numeric(raw, data_type)) is not None]
     return encoded or None
 
@@ -464,10 +486,13 @@ def _temporal_stats(
     data_type: T.DataType, values: Mapping[str, Any], prefix: str, privacy: PrivacyPolicy
 ) -> TemporalStats:
     include_extremes = privacy.extremes != ValueTreatment.SUPPRESSED
+    raw_quantiles = _supported_quantile_values(values, prefix, privacy)
+    minimum = _encode_temporal(values.get(f"{prefix}_min"), data_type)
+    maximum = _encode_temporal(values.get(f"{prefix}_max"), data_type)
     return TemporalStats(
-        min=_encode_temporal(values.get(f"{prefix}_min"), data_type) if include_extremes else None,
-        max=_encode_temporal(values.get(f"{prefix}_max"), data_type) if include_extremes else None,
-        quantiles=_temporal_quantiles(values.get(f"{prefix}_quantiles"), data_type, include_extremes),
+        min=minimum if include_extremes else None,
+        max=maximum if include_extremes else None,
+        quantiles=_temporal_quantiles(raw_quantiles, data_type, include_extremes, minimum, maximum),
     )
 
 
@@ -481,14 +506,20 @@ def _temporal_quantile_key(column: Column, data_type: T.DataType) -> Column:
     return F.unix_micros(column.cast("timestamp"))
 
 
-def _temporal_quantiles(values: object, data_type: T.DataType, include_extremes: bool) -> list[Quantile] | None:
+def _temporal_quantiles(
+    values: object,
+    data_type: T.DataType,
+    include_extremes: bool,
+    minimum: str | None,
+    maximum: str | None,
+) -> list[Quantile] | None:
     if not isinstance(values, list):
         return None
     pairs = list(zip(_QUANTILE_GRID, values, strict=True))
+    encoded = [(q, _encode_temporal_key(int(value), data_type)) for q, value in pairs]
     if not include_extremes:
-        pairs = [(q, value) for q, value in pairs if q not in (0.0, 1.0)]
-    encoded = [Quantile(q=q, value=_encode_temporal_key(int(value), data_type)) for q, value in pairs]
-    return encoded or None
+        encoded = [(q, value) for q, value in encoded if q not in (0.0, 1.0) and value not in (minimum, maximum)]
+    return [Quantile(q=q, value=value) for q, value in encoded] or None
 
 
 def _encode_temporal_key(value: int, data_type: T.DataType) -> str:

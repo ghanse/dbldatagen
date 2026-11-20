@@ -30,6 +30,7 @@ SPEC_VERSION = "0.2.0"
 SUPPORTED_MAJOR_VERSION = int(SPEC_VERSION.split(".", maxsplit=1)[0])
 STRICT_CONTEXT_KEY = "strict"
 DEFAULT_MIN_VALUE_COUNT = 10
+QUANTILE_INTERVALS = 6
 
 Fraction = Annotated[float, Field(ge=0.0, le=1.0)]
 Count = Annotated[int, Field(ge=0)]
@@ -1057,6 +1058,8 @@ def _check_column_privacy(column: ColumnProfile, value_count: int | None, policy
             raise ValueError(f"column {column.name!r}: nested patterns or top_values require value_count")
         return
     non_null_rows = value_count * (1.0 - column.null_fraction)
+    if stats is not None and stats.quantiles and non_null_rows < k * QUANTILE_INTERVALS:
+        raise ValueError(f"column {column.name!r}: quantiles require at least {k * QUANTILE_INTERVALS} non-null values")
     rare = [entry.value for entry in string.top_values or [] if round(entry.frequency * non_null_rows) < k]
     rare += [pattern.regex for pattern in string.patterns or [] if round(pattern.coverage * non_null_rows) < k]
     if rare:

@@ -10,7 +10,7 @@ from pyspark.sql import Row, SparkSession
 from pyspark.sql import types as T
 
 from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
-from dbldatagen_profiler.engines.spark.engine import _logical_type
+from dbldatagen_profiler.engines.spark.engine import _logical_type, _numeric_stats
 from dbldatagen_profiler.model import LogicalType, PrivacyPolicy, ValueTreatment, profile_json_schema
 
 
@@ -140,19 +140,10 @@ def test_profiles_flat_statistics(spark: SparkSession) -> None:
     assert number.numeric.max == "2"
     assert number.numeric.mean == pytest.approx(1.5)
     assert number.numeric.stddev == pytest.approx(2**-0.5)
-    assert [(item.q, item.value) for item in number.numeric.quantiles or []] == [
-        (0.0, "1"),
-        (0.1, "1"),
-        (0.25, "1"),
-        (0.5, "1"),
-        (0.75, "2"),
-        (0.9, "2"),
-        (1.0, "2"),
-    ]
+    assert number.numeric.quantiles is None
     assert text.string.length.model_dump(exclude_none=True) == {"min": 1, "max": 4, "mean": 2.5}
     assert moment.temporal.min == "2026-01-01T00:00:00Z"
-    assert moment.temporal.quantiles is not None
-    assert moment.temporal.quantiles[3].value == "2026-01-01T00:00:00Z"
+    assert moment.temporal.quantiles is None
     assert flag.boolean.true_fraction == 0.5
     assert columns["all_null"].numeric.model_dump(exclude_none=True) == {}
     assert columns["constant"].numeric.stddev == 0.0
@@ -164,6 +155,15 @@ def test_profiles_empty_table(spark: SparkSession) -> None:
     assert table.columns[0].null_fraction == 0.0
     assert table.columns[0].distinct_count is not None
     assert table.columns[0].distinct_count.value == 0
+
+
+def test_profiles_numeric_and_temporal_quantiles_with_sufficient_support(spark: SparkSession) -> None:
+    frame = spark.range(60).selectExpr("id AS number", "date_add(DATE '2026-01-01', CAST(id AS INT)) AS day")
+    columns = profile_dataframe("quantiles", frame).tables[0].columns
+
+    assert columns[0].numeric is not None and columns[1].temporal is not None
+    assert [item.q for item in columns[0].numeric.quantiles or []] == [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
+    assert [item.q for item in columns[1].temporal.quantiles or []] == [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
 
 
 def test_timestamp_fraction_is_canonical_six_digits(spark: SparkSession) -> None:
@@ -236,7 +236,7 @@ def test_lossless_decimal_and_int64_extremes_and_quantiles(spark: SparkSession) 
     rows = [
         (-(2**63), Decimal("-99999999999999999999.999999999999999999")),
         (2**63 - 1, Decimal("99999999999999999999.999999999999999999")),
-    ]
+    ] * 30
     columns = profile_dataframe("lossless", spark.createDataFrame(rows, schema)).tables[0].columns
     assert columns[0].numeric is not None and columns[1].numeric is not None
     assert columns[0].numeric.min == "-9223372036854775808"
@@ -256,7 +256,7 @@ def test_lossless_decimal_and_int64_extremes_and_quantiles(spark: SparkSession) 
 
 def test_lossless_decimal_quantiles(spark: SparkSession) -> None:
     values = [Decimal("1.250000000000000000"), Decimal("9.750000000000000000")]
-    frame = spark.createDataFrame([(value,) for value in values], "value decimal(38,18)")
+    frame = spark.createDataFrame([(value,) for value in values] * 30, "value decimal(38,18)")
     stats = profile_dataframe("lossless", frame).tables[0].columns[0].numeric
 
     assert stats is not None
@@ -273,12 +273,57 @@ def test_lossless_decimal_quantiles(spark: SparkSession) -> None:
     ]
 
 
-def test_lossy_decimal_quantiles_are_omitted(spark: SparkSession) -> None:
-    values = [Decimal("9007199254740993.123456789012345678"), Decimal("9007199254740995.987654321098765432")]
-    frame = spark.createDataFrame([(value,) for value in values], "value decimal(38,18)")
-    stats = profile_dataframe("lossy", frame).tables[0].columns[0].numeric
+def test_decimal_quantile_interiors_never_round_trip_through_float(spark: SparkSession) -> None:
+    values = [
+        Decimal("1.0000000000"),
+        Decimal("2.0000000001"),
+        Decimal("3.0000000001"),
+        Decimal("4.0000000001"),
+        Decimal("5.0000000001"),
+        Decimal("6.0000000001"),
+        Decimal("9.0000000000"),
+    ]
+    frame = spark.createDataFrame([(value,) for value in values for _ in range(10)], "value decimal(38,10)")
+    stats = profile_dataframe("lossless", frame).tables[0].columns[0].numeric
 
-    assert stats is not None and stats.quantiles is None
+    assert stats is not None
+    assert [item.value for item in stats.quantiles or []] == [
+        "1.0000000000",
+        "1.0000000000",
+        "2.0000000001",
+        "4.0000000001",
+        "6.0000000001",
+        "9.0000000000",
+        "9.0000000000",
+    ]
+
+
+def test_non_decimal_quantile_result_omits_all_decimal_quantiles() -> None:
+    low = Decimal("1.0000000000")
+    high = Decimal("9.0000000000")
+    values = {
+        "c0_non_null": 60,
+        "c0_min": low,
+        "c0_max": high,
+        "c0_quantiles": [low, low, 3.0000000001, Decimal("5.0000000000"), high, high, high],
+    }
+
+    assert _numeric_stats(T.DecimalType(38, 10), values, "c0", PrivacyPolicy()).quantiles is None
+    values["c0_quantiles"] = [low, low, Decimal("3.000000001"), low, high, high, high]
+    assert _numeric_stats(T.DecimalType(38, 10), values, "c0", PrivacyPolicy()).quantiles is None
+
+
+def test_non_integral_quantile_result_omits_all_int64_quantiles() -> None:
+    low = 2**63 - 100
+    high = 2**63 - 1
+    values = {
+        "c0_non_null": 60,
+        "c0_min": low,
+        "c0_max": high,
+        "c0_quantiles": [low, low, float(low + 25), low + 50, high, high, high],
+    }
+
+    assert _numeric_stats(T.LongType(), values, "c0", PrivacyPolicy()).quantiles is None
 
 
 def test_large_numeric_aggregates_do_not_overflow_in_ansi_mode(spark: SparkSession) -> None:
@@ -320,19 +365,20 @@ def test_large_numeric_aggregates_do_not_overflow_in_ansi_mode(spark: SparkSessi
             spark.conf.set(key, previous)
 
 
-def test_suppressed_extremes_produce_valid_profile(spark: SparkSession) -> None:
+@pytest.mark.parametrize("row_count", [1, 59, 60])
+def test_suppressed_extremes_never_appear_as_quantiles(spark: SparkSession, row_count: int) -> None:
     policy = PrivacyPolicy(extremes=ValueTreatment.SUPPRESSED)
     profile = profile_dataframe(
-        "private", spark.createDataFrame([(1, date(2026, 1, 1))], "n int, d date"), privacy=policy
+        "private",
+        spark.createDataFrame([(1, date(2026, 1, 1))] * row_count, "n int, d date"),
+        privacy=policy,
     )
     assert profile.tables[0].columns[0].numeric is not None
     assert profile.tables[0].columns[1].temporal is not None
     assert profile.tables[0].columns[0].numeric.min is None
     assert profile.tables[0].columns[1].temporal.min is None
-    numeric_quantiles = profile.tables[0].columns[0].numeric.quantiles or []
-    temporal_quantiles = profile.tables[0].columns[1].temporal.quantiles or []
-    assert [item.q for item in numeric_quantiles] == [0.1, 0.25, 0.5, 0.75, 0.9]
-    assert [item.q for item in temporal_quantiles] == [0.1, 0.25, 0.5, 0.75, 0.9]
+    assert profile.tables[0].columns[0].numeric.quantiles is None
+    assert profile.tables[0].columns[1].temporal.quantiles is None
 
 
 def test_nested_columns_have_value_counts(spark: SparkSession) -> None:

@@ -76,6 +76,7 @@ With an interval trigger the command runs until interrupted and rewrites `profil
 
 The streaming engine requires pyspark 3.5 or later (for Spark's `hll_sketch_agg`); `StreamingProfiler` and
 `dbldatagen-profile stream` fail with a clear error on older versions. The batch engine still supports pyspark 3.4.1.
+Quantiles are batch-only because streaming checkpoints do not retain a mergeable percentile sketch.
 
 A snapshot equals the batch profile of the same rows on these statistics: row count, null fraction, nested
 `value_count`, numeric and temporal min/max (lossless for decimal and int64), string and collection length
@@ -165,6 +166,8 @@ component (e.g. `"2024-02-04T16:27:43.791440Z"`) and omit the fraction otherwise
 The Spark profiler emits numeric and temporal quantiles on the fixed grid
 `[0, 0.1, 0.25, 0.5, 0.75, 0.9, 1]` using `percentile_approx` accuracy 10,000. When
 `privacy.extremes` is `suppressed`, it omits the `q=0` and `q=1` points along with min and max.
+Quantiles require at least six times `privacy.min_value_count` non-null values, one k-sized support interval per grid
+step.
 
 `mean` and `stddev` are always approximate JSON numbers. Histogram bins are `[lo, hi)` except the last, which is
 `[lo, hi]`. The edges span every profiled value, and `counts` are row counts, with `sampled: true` when they come from

@@ -202,6 +202,7 @@ def numeric_column(**numeric: object) -> dict[str, Any]:
 def test_suppressed_extremes_cover_quantiles_and_histogram_edges(
     minimal_profile: dict[str, Any], numeric: dict[str, Any], ok: bool
 ) -> None:
+    minimal_profile["tables"][0]["row_count"] = 60
     minimal_profile["privacy"] = {"extremes": "suppressed"}
     minimal_profile["tables"][0]["columns"].append(numeric_column(**numeric))
     if ok:
@@ -212,10 +213,20 @@ def test_suppressed_extremes_cover_quantiles_and_histogram_edges(
 
 
 def test_extreme_quantiles_and_exact_edges_are_allowed_by_default(minimal_profile: dict[str, Any]) -> None:
+    minimal_profile["tables"][0]["row_count"] = 60
     histogram = {"edges": [0.3, 9.7], "counts": [2]}
     quantiles = [{"q": 0.0, "value": 0.3}, {"q": 1.0, "value": 9.7}]
     minimal_profile["tables"][0]["columns"].append(numeric_column(quantiles=quantiles, histogram=histogram))
     load_profile(minimal_profile)
+
+
+def test_quantiles_require_k_rows_per_grid_interval(minimal_profile: dict[str, Any]) -> None:
+    minimal_profile["privacy"] = {"min_value_count": 10, "extremes": "suppressed"}
+    minimal_profile["tables"][0]["row_count"] = 59
+    minimal_profile["tables"][0]["columns"].append(numeric_column(quantiles=[{"q": 0.5, "value": 5.0}]))
+
+    with pytest.raises(ValidationError, match="quantiles require at least 60 non-null values"):
+        load_profile(minimal_profile, strict=True)
 
 
 @pytest.mark.parametrize(("coverage", "ok"), [(0.02, True), (0.018, False)])
