@@ -10,7 +10,7 @@ from pyspark.sql import Row, SparkSession
 from pyspark.sql import types as T
 
 from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
-from dbldatagen_profiler.engines.spark.engine import _logical_type
+from dbldatagen_profiler.engines.spark.engine import _histogram, _logical_type, _numeric_stats
 from dbldatagen_profiler.model import LogicalType, PrivacyPolicy, ValueTreatment, profile_json_schema
 
 
@@ -140,8 +140,10 @@ def test_profiles_flat_statistics(spark: SparkSession) -> None:
     assert number.numeric.max == "2"
     assert number.numeric.mean == pytest.approx(1.5)
     assert number.numeric.stddev == pytest.approx(2**-0.5)
+    assert number.numeric.quantiles is None
     assert text.string.length.model_dump(exclude_none=True) == {"min": 1, "max": 4, "mean": 2.5}
     assert moment.temporal.min == "2026-01-01T00:00:00Z"
+    assert moment.temporal.quantiles is None
     assert flag.boolean.true_fraction == 0.5
     assert columns["all_null"].numeric.model_dump(exclude_none=True) == {}
     assert columns["constant"].numeric.stddev == 0.0
@@ -153,6 +155,101 @@ def test_profiles_empty_table(spark: SparkSession) -> None:
     assert table.columns[0].null_fraction == 0.0
     assert table.columns[0].distinct_count is not None
     assert table.columns[0].distinct_count.value == 0
+
+
+CORE_GRID = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
+FULL_GRID = [0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0]
+
+
+@pytest.mark.parametrize(
+    ("rows", "grid"),
+    [
+        (60, CORE_GRID),
+        (199, CORE_GRID),
+        (200, [0.0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1.0]),
+        (999, [0.0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1.0]),
+        (1000, FULL_GRID),
+    ],
+)
+def test_tail_quantiles_need_k_rows_beyond_them(spark: SparkSession, rows: int, grid: list[float]) -> None:
+    frame = spark.range(rows).selectExpr("id * 1.5 AS number", "date_add(DATE '2026-01-01', CAST(id AS INT)) AS day")
+    columns = profile_dataframe("quantiles", frame).tables[0].columns
+
+    assert columns[0].numeric is not None and columns[1].temporal is not None
+    assert [item.q for item in columns[0].numeric.quantiles or []] == grid
+    assert [item.q for item in columns[1].temporal.quantiles or []] == grid
+
+
+def test_low_cardinality_integers_get_k_anonymous_histogram(spark: SparkSession) -> None:
+    counts = {0: 3, 1: 4, 2: 40, 3: 25, 4: 12, 6: 9, 9: 1}
+    frame = spark.createDataFrame([(value,) for value, count in counts.items() for _ in range(count)], "n int")
+    stats = profile_dataframe("histogram", frame).tables[0].columns[0].numeric
+
+    assert stats is not None and stats.histogram is not None
+    assert stats.quantiles is None
+    assert stats.histogram.edges == [0, 3, 4, 6, 9]
+    assert stats.histogram.counts == [47, 25, 12, 10]
+    assert not stats.histogram.generalized_outer_edges
+
+
+def test_high_cardinality_and_non_integer_columns_keep_quantiles(spark: SparkSession) -> None:
+    frame = spark.range(1000).selectExpr("id % 65 AS wide", "CAST(id % 3 AS DOUBLE) AS real")
+    columns = profile_dataframe("quantiles", frame).tables[0].columns
+
+    assert all(column.numeric is not None and column.numeric.histogram is None for column in columns)
+    assert all(column.numeric is not None and column.numeric.quantiles for column in columns)
+
+
+def test_nested_integer_children_get_histograms(spark: SparkSession) -> None:
+    frame = spark.range(100).selectExpr(
+        "array(CAST(id % 4 AS INT)) AS items",
+        "named_struct('a', CAST(id % 3 AS INT), 'b', CAST(id % 5 AS INT)) AS pair",
+    )
+    columns = profile_dataframe("nested", frame).tables[0].columns
+
+    assert columns[0].children is not None
+    histogram = columns[0].children[0].numeric.histogram if columns[0].children[0].numeric else None
+    assert histogram is not None and histogram.edges == [0, 1, 2, 3, 3]
+    assert histogram.counts == [25, 25, 25, 25]
+    assert columns[1].children is not None
+    assert [child.numeric.histogram is not None for child in columns[1].children if child.numeric] == [True, True]
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        ([(5, 9), (6, 1)], None),
+        ([(5, 10), (6, 9)], None),
+        ([(5, 10), (6, 10)], ([5, 6, 6], [10, 10])),
+        ([(1, 1), (2, 30), (3, 30), (4, 1)], ([1, 3, 4], [31, 31])),
+    ],
+)
+def test_histogram_bins_hold_at_least_k_rows(
+    counts: list[tuple[int, int]], expected: tuple[list[int], list[int]] | None
+) -> None:
+    histogram = _histogram(counts, T.IntegerType(), PrivacyPolicy())
+
+    assert (histogram and (histogram.edges, histogram.counts)) == expected
+
+
+def test_suppressed_extremes_widen_histogram_outer_edges() -> None:
+    policy = PrivacyPolicy(extremes=ValueTreatment.SUPPRESSED)
+    histogram = _histogram([(23, 10), (40, 10), (70, 10)], T.IntegerType(), policy)
+    on_step = _histogram([(20, 10), (25, 10), (30, 10)], T.IntegerType(), policy)
+
+    assert histogram is not None and on_step is not None
+    assert histogram.generalized_outer_edges and histogram.edges == [20, 40, 70, 80]
+    assert on_step.edges == [10, 25, 30, 40]
+    assert _histogram([(-128, 10), (0, 10)], T.ByteType(), policy) is None
+    assert _histogram([(0, 10), (2**63 - 1, 10)], T.LongType(), policy) is None
+
+
+def test_int64_histogram_edges_are_lossless() -> None:
+    values = {"c0_non_null": 20, "c0_value_counts": [(-(2**63), 10), (2**63 - 1, 10)]}
+    histogram = _numeric_stats(T.LongType(), values, "c0", PrivacyPolicy()).histogram
+
+    assert histogram is not None
+    assert histogram.edges == [str(-(2**63)), str(2**63 - 1), str(2**63 - 1)]
 
 
 def test_timestamp_fraction_is_canonical_six_digits(spark: SparkSession) -> None:
@@ -220,18 +317,93 @@ def test_non_finite_float_extremes_are_omitted(spark: SparkSession) -> None:
     assert "max" not in column.numeric.model_dump(exclude_none=True)
 
 
-def test_lossless_decimal_and_int64_extremes(spark: SparkSession) -> None:
+def test_lossless_decimal_and_int64_extremes_and_quantiles(spark: SparkSession) -> None:
     schema = T.StructType([T.StructField("integer", T.LongType()), T.StructField("decimal", T.DecimalType(38, 18))])
     rows = [
         (-(2**63), Decimal("-99999999999999999999.999999999999999999")),
         (2**63 - 1, Decimal("99999999999999999999.999999999999999999")),
-    ]
+    ] * 30
     columns = profile_dataframe("lossless", spark.createDataFrame(rows, schema)).tables[0].columns
     assert columns[0].numeric is not None and columns[1].numeric is not None
     assert columns[0].numeric.min == "-9223372036854775808"
     assert columns[0].numeric.max == "9223372036854775807"
     assert columns[1].numeric.min == "-99999999999999999999.999999999999999999"
     assert columns[1].numeric.max == "99999999999999999999.999999999999999999"
+    assert columns[0].numeric.quantiles is None
+    assert columns[0].numeric.histogram is not None
+    assert columns[0].numeric.histogram.edges == ["-9223372036854775808", "9223372036854775807", "9223372036854775807"]
+
+
+def test_lossless_decimal_quantiles(spark: SparkSession) -> None:
+    values = [Decimal("1.250000000000000000"), Decimal("9.750000000000000000")]
+    frame = spark.createDataFrame([(value,) for value in values] * 30, "value decimal(38,18)")
+    stats = profile_dataframe("lossless", frame).tables[0].columns[0].numeric
+
+    assert stats is not None
+    quantiles = stats.quantiles or []
+    assert [type(item.value) for item in quantiles] == [str] * 7
+    assert [item.value for item in quantiles] == [
+        "1.250000000000000000",
+        "1.250000000000000000",
+        "1.250000000000000000",
+        "1.250000000000000000",
+        "9.750000000000000000",
+        "9.750000000000000000",
+        "9.750000000000000000",
+    ]
+
+
+def test_decimal_quantile_interiors_never_round_trip_through_float(spark: SparkSession) -> None:
+    values = [
+        Decimal("1.0000000000"),
+        Decimal("2.0000000001"),
+        Decimal("3.0000000001"),
+        Decimal("4.0000000001"),
+        Decimal("5.0000000001"),
+        Decimal("6.0000000001"),
+        Decimal("9.0000000000"),
+    ]
+    frame = spark.createDataFrame([(value,) for value in values for _ in range(10)], "value decimal(38,10)")
+    stats = profile_dataframe("lossless", frame).tables[0].columns[0].numeric
+
+    assert stats is not None
+    assert [item.value for item in stats.quantiles or []] == [
+        "1.0000000000",
+        "1.0000000000",
+        "2.0000000001",
+        "4.0000000001",
+        "6.0000000001",
+        "9.0000000000",
+        "9.0000000000",
+    ]
+
+
+def test_non_decimal_quantile_result_omits_all_decimal_quantiles() -> None:
+    low = Decimal("1.0000000000")
+    high = Decimal("9.0000000000")
+    values = {
+        "c0_non_null": 60,
+        "c0_min": low,
+        "c0_max": high,
+        "c0_quantiles": [low, low, low, low, 3.0000000001, Decimal("5.0000000000"), high, high, high, high, high],
+    }
+
+    assert _numeric_stats(T.DecimalType(38, 10), values, "c0", PrivacyPolicy()).quantiles is None
+    values["c0_quantiles"] = [low, low, low, low, Decimal("3.000000001"), low, high, high, high, high, high]
+    assert _numeric_stats(T.DecimalType(38, 10), values, "c0", PrivacyPolicy()).quantiles is None
+
+
+def test_non_integral_quantile_result_omits_all_int64_quantiles() -> None:
+    low = 2**63 - 100
+    high = 2**63 - 1
+    values = {
+        "c0_non_null": 60,
+        "c0_min": low,
+        "c0_max": high,
+        "c0_quantiles": [low, low, low, low, float(low + 25), low + 50, high, high, high, high, high],
+    }
+
+    assert _numeric_stats(T.LongType(), values, "c0", PrivacyPolicy()).quantiles is None
 
 
 def test_large_numeric_aggregates_do_not_overflow_in_ansi_mode(spark: SparkSession) -> None:
@@ -273,15 +445,20 @@ def test_large_numeric_aggregates_do_not_overflow_in_ansi_mode(spark: SparkSessi
             spark.conf.set(key, previous)
 
 
-def test_suppressed_extremes_produce_valid_profile(spark: SparkSession) -> None:
+@pytest.mark.parametrize("row_count", [1, 59, 60])
+def test_suppressed_extremes_never_appear_as_quantiles(spark: SparkSession, row_count: int) -> None:
     policy = PrivacyPolicy(extremes=ValueTreatment.SUPPRESSED)
     profile = profile_dataframe(
-        "private", spark.createDataFrame([(1, date(2026, 1, 1))], "n int, d date"), privacy=policy
+        "private",
+        spark.createDataFrame([(1, date(2026, 1, 1))] * row_count, "n int, d date"),
+        privacy=policy,
     )
     assert profile.tables[0].columns[0].numeric is not None
     assert profile.tables[0].columns[1].temporal is not None
     assert profile.tables[0].columns[0].numeric.min is None
     assert profile.tables[0].columns[1].temporal.min is None
+    assert profile.tables[0].columns[0].numeric.quantiles is None
+    assert profile.tables[0].columns[1].temporal.quantiles is None
 
 
 def test_nested_columns_have_value_counts(spark: SparkSession) -> None:

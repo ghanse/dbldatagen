@@ -195,13 +195,14 @@ def numeric_column(**numeric: object) -> dict[str, Any]:
         ({"quantiles": [{"q": 0.01, "value": 1.0}, {"q": 0.99, "value": 9.0}]}, True),
         ({"quantiles": [{"q": 0.0, "value": 0.0}]}, False),
         ({"quantiles": [{"q": 1.0, "value": 10.0}]}, False),
-        ({"histogram": {"edges": [0, 5, 10], "counts": [1, 1], "generalized_outer_edges": True}}, True),
-        ({"histogram": {"edges": [0.3, 5, 9.7], "counts": [1, 1]}}, False),
+        ({"histogram": {"edges": [0, 5, 10], "counts": [30, 30], "generalized_outer_edges": True}}, True),
+        ({"histogram": {"edges": [0.3, 5, 9.7], "counts": [30, 30]}}, False),
     ],
 )
 def test_suppressed_extremes_cover_quantiles_and_histogram_edges(
     minimal_profile: dict[str, Any], numeric: dict[str, Any], ok: bool
 ) -> None:
+    minimal_profile["tables"][0]["row_count"] = 60
     minimal_profile["privacy"] = {"extremes": "suppressed"}
     minimal_profile["tables"][0]["columns"].append(numeric_column(**numeric))
     if ok:
@@ -212,10 +213,62 @@ def test_suppressed_extremes_cover_quantiles_and_histogram_edges(
 
 
 def test_extreme_quantiles_and_exact_edges_are_allowed_by_default(minimal_profile: dict[str, Any]) -> None:
-    histogram = {"edges": [0.3, 9.7], "counts": [2]}
+    minimal_profile["tables"][0]["row_count"] = 60
+    histogram = {"edges": [0.3, 9.7], "counts": [60]}
     quantiles = [{"q": 0.0, "value": 0.3}, {"q": 1.0, "value": 9.7}]
     minimal_profile["tables"][0]["columns"].append(numeric_column(quantiles=quantiles, histogram=histogram))
     load_profile(minimal_profile)
+
+
+@pytest.mark.parametrize(
+    ("counts", "row_count", "match"),
+    [
+        ([1, 1], 60, "histogram bins cover fewer than 10"),
+        ([9, 51], 60, "histogram bins cover fewer than 10"),
+        ([10, 49], 60, "histogram counts must sum to 60"),
+        ([30, 30], 59, "histogram counts must sum to 59"),
+    ],
+)
+def test_histogram_bins_below_k_or_wrong_total_are_rejected(
+    minimal_profile: dict[str, Any], counts: list[int], row_count: int, match: str
+) -> None:
+    minimal_profile["tables"][0]["row_count"] = row_count
+    minimal_profile["tables"][0]["columns"].append(numeric_column(histogram={"edges": [0, 5, 10], "counts": counts}))
+    with pytest.raises(ValidationError, match=match):
+        load_profile(minimal_profile)
+
+
+def test_histogram_bins_at_exactly_k_are_accepted(minimal_profile: dict[str, Any]) -> None:
+    minimal_profile["tables"][0]["row_count"] = 20
+    minimal_profile["tables"][0]["columns"].append(numeric_column(histogram={"edges": [0, 5, 10], "counts": [10, 10]}))
+    load_profile(minimal_profile)
+
+
+def test_nested_histogram_uses_value_count_for_k(minimal_profile: dict[str, Any]) -> None:
+    histogram: dict[str, Any] = {"edges": [0, 1, 2], "counts": [9, 11]}
+    element = {
+        "name": "element",
+        "logical_type": "int32",
+        "source_type": "int",
+        "nullable": True,
+        "null_fraction": 0.0,
+        "value_count": 20,
+        "numeric": {"histogram": histogram},
+    }
+    profile = profile_with(minimal_profile, logical_type="array", source_type="array<int>", children=[element])
+    with pytest.raises(ValidationError, match="histogram bins cover fewer than 10"):
+        load_profile(profile)
+    histogram["counts"] = [10, 10]
+    load_profile(profile)
+
+
+def test_quantiles_require_k_rows_per_grid_interval(minimal_profile: dict[str, Any]) -> None:
+    minimal_profile["privacy"] = {"min_value_count": 10, "extremes": "suppressed"}
+    minimal_profile["tables"][0]["row_count"] = 59
+    minimal_profile["tables"][0]["columns"].append(numeric_column(quantiles=[{"q": 0.5, "value": 5.0}]))
+
+    with pytest.raises(ValidationError, match="quantiles require at least 60 non-null values"):
+        load_profile(minimal_profile, strict=True)
 
 
 @pytest.mark.parametrize(("coverage", "ok"), [(0.02, True), (0.018, False)])

@@ -76,6 +76,7 @@ With an interval trigger the command runs until interrupted and rewrites `profil
 
 The streaming engine requires pyspark 3.5 or later (for Spark's `hll_sketch_agg`); `StreamingProfiler` and
 `dbldatagen-profile stream` fail with a clear error on older versions. The batch engine still supports pyspark 3.4.1.
+Quantiles are batch-only because streaming checkpoints do not retain a mergeable percentile sketch.
 
 A snapshot equals the batch profile of the same rows on these statistics: row count, null fraction, nested
 `value_count`, numeric and temporal min/max (lossless for decimal and int64), string and collection length
@@ -155,12 +156,25 @@ Literal values (min, max, quantiles, histogram edges, range bounds, enumeration 
 | `time` | `HH:MM:SS[.fffffffff]` | `"08:30:00"` |
 | `timestamp` | `YYYY-MM-DDTHH:MM:SS[.f]` with `Z` or `±HH:MM` | `"2026-11-06T08:30:00Z"` |
 | `timestamp_ntz` | the same without an offset | `"2026-11-06T08:30:00"` |
+| `string` | JSON string | `"gold"` |
+| `boolean` | JSON boolean | `true` |
 
 Producers emit exactly six fractional digits when a temporal value has a non-zero sub-second
 component (e.g. `"2024-02-04T16:27:43.791440Z"`) and omit the fraction otherwise. Consumers parse
 1–9 fractional digits via `parse_temporal` so odd lengths from older profiles still load on Python 3.10.
-| `string` | JSON string | `"gold"` |
-| `boolean` | JSON boolean | `true` |
+
+The Spark profiler emits numeric and temporal quantiles on the fixed grid
+`[0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1]` using `percentile_approx` accuracy 10,000. When
+`privacy.extremes` is `suppressed`, it omits the `q=0` and `q=1` points along with min and max.
+Quantiles require at least six times `privacy.min_value_count` (k) non-null values, one k-sized support interval per
+core grid step. A tail point `q` also needs k rows beyond it (`non_null * min(q, 1 - q) >= k`); otherwise it is dropped.
+
+Integer columns with 2 to 64 distinct values get an exact histogram instead of quantiles, from one extra grouped Spark
+job per table (or nested level: all sibling fields of a struct/map share that job). Each bin starts as one value and
+merges with its upper neighbour until it holds at least k rows. When `privacy.extremes` is `suppressed`, the outer
+edges are widened to the nearest multiples, strictly outside the data, of a power of ten one digit shorter than the
+value range, and `generalized_outer_edges` is true; the histogram is omitted if the widened edges fall outside the
+integer type.
 
 `mean` and `stddev` are always approximate JSON numbers. Histogram bins are `[lo, hi)` except the last, which is
 `[lo, hi]`. The edges span every profiled value, and `counts` are row counts, with `sampled: true` when they come from
@@ -173,10 +187,11 @@ The `privacy` block records the policy the producer applied:
 - `min_value_count` (default 10): a value may appear in `top_values` or an enumeration constraint only if at least this
   many rows hold it. The model checks `top_values` frequencies against the table's row count and null fraction, and
   each enumeration's `min_value_count` (the row count of its rarest value). String `patterns` must also cover at least
-  this many values. For nested columns, counts come from the column's `value_count` (the number of nested values its
-  statistics cover); struct fields inherit their parent's count. A nested array or map child that has `patterns` or
-  `top_values` but no `value_count` is rejected. Literals embedded in regexes are checked by the benchmark's privacy
-  guard, not by the model.
+  this many values, and each histogram bin count must be at least this many (with absolute counts summing to the
+  column's non-null count unless `sampled`). For nested columns, counts come from the column's `value_count` (the
+  number of nested values its statistics cover); struct fields inherit their parent's count. A nested array or map
+  child that has `patterns`, `top_values`, or a `histogram` but no `value_count` is rejected. Literals embedded in
+  regexes are checked by the benchmark's privacy guard, not by the model.
 - `extremes` and `enumerations`: `exact`, `generalized`, or `suppressed`. When suppressed, min/max statistics and
   range bounds (for `extremes`), or `top_values` and enumeration constraints (for `enumerations`), must be absent.
 
