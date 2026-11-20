@@ -92,6 +92,8 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P1.4c | Fix sampler leak: integer discretization over-weights exact profiled extrema (nested/wide privacy fail) | P1.4b | merged (PR #19) |
 | P1.4d | Follow-ups from P1.4c review: tests should use calibrated mu/sigma for endpoint mass and discrete moments in property test | P1.4c | todo |
 | rsi-0003a | Follow-ups to rsi-0003 (after its disposition, so the benchmarked commit stays the merged one): tie the Pearson support floor to privacy.min_value_count/k instead of 3; README streaming-equivalence list names the dependency gap | rsi-0003 | todo |
+| rsi-0002b | Quantile tails + k-anonymous int histograms | rsi-0002 | ACCEPTED, merged (PR #31) |
+| rsi-0002c | Speed follow-up: rsi-0002b slowed nested@s profiling 197s -> 334s (extra histogram value-count job); fold histogram counts into the existing aggregate | rsi-0002b | todo |
 | P1.7 | RSI log tooling: append-only `log.jsonl` writer/validator + `LOG.md` renderer; `rsi/RSI.md` | P1.1 | merged (PR #4) |
 | P1.7a | Fix: `rsi_log.py append --kind` flag is dropped; add CLI-flag tests | P1.7 | merged (PR #5) |
 | P1.8 | Baseline run: freeze the harness, record the baseline + ceiling for every dataset | P1.2–P1.7 | merged (PR #25): frozen baseline; see profiler/rsi/BASELINE.md |
