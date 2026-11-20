@@ -20,6 +20,7 @@ from dbldatagen_profiler.model import (
     ColumnProfile,
     DistinctCount,
     EngineInfo,
+    Histogram,
     LengthStats,
     LogicalType,
     NumericStats,
@@ -33,6 +34,7 @@ from dbldatagen_profiler.model import (
     ValueTreatment,
     canonicalize_iso_fraction,
 )
+from dbldatagen_profiler.model.profile import QUANTILE_INTERVALS
 from dbldatagen_profiler.pii.detect import analyze_table
 from dbldatagen_profiler.pii.policy import PiiAction, PiiPolicy
 
@@ -54,11 +56,15 @@ _NUMERIC_TYPES = (
 )
 _TEMPORAL_TYPES = (T.DateType, T.TimestampType)
 
+_INTEGER_BITS: dict[type[T.DataType], int] = {T.ByteType: 7, T.ShortType: 15, T.IntegerType: 31, T.LongType: 63}
+
 # A fixed, deterministic grid gives the sampler useful tail and quartile shape without
 # making each aggregate sketch unnecessarily large. Spark documents accuracy as an
 # inverse relative-error bound; 10,000 therefore targets 1e-4 rank error.
-_QUANTILE_GRID = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
+_QUANTILE_GRID = (0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0)
+_TAIL_QUANTILES = frozenset({0.01, 0.05, 0.95, 0.99})
 _QUANTILE_ACCURACY = 10_000
+_HISTOGRAM_MAX_DISTINCT = 64
 
 
 def profile_tables(
@@ -134,7 +140,11 @@ def _profile_table(
     expressions: list[Column] = [F.count(F.lit(1)).alias("__row_count")]
     for index, field in enumerate(df.schema.fields):
         expressions.extend(_aggregate_expressions(df[field.name], field.dataType, index))
-    values = _collect_aggregate(df, expressions)
+    values = _with_value_counts(
+        df,
+        [(f"c{index}", df[field.name], field.dataType) for index, field in enumerate(df.schema.fields)],
+        _collect_aggregate(df, expressions),
+    )
     row_count = int(values["__row_count"])
     columns = [
         _column_from_aggregate(field, values, index, row_count, privacy, nested=False, df=df)
@@ -386,7 +396,7 @@ def _profile_children(df: DataFrame, field: T.StructField, privacy: PrivacyPolic
 
 def _profile_nested_column(df: DataFrame, field: T.StructField, privacy: PrivacyPolicy) -> ColumnProfile:
     expressions = [F.count(F.lit(1)).alias("__row_count"), *_aggregate_expressions(df[_VALUE], field.dataType, 0)]
-    values = _collect_aggregate(df, expressions)
+    values = _with_value_counts(df, [("c0", df[_VALUE], field.dataType)], _collect_aggregate(df, expressions))
     return _column_from_aggregate(field, values, 0, int(values["__row_count"]), privacy, nested=True, df=df)
 
 
@@ -398,11 +408,33 @@ def _collect_aggregate(df: DataFrame, expressions: list[Column]) -> dict[str, An
     return row.asDict()
 
 
+def _with_value_counts(
+    df: DataFrame, columns: list[tuple[str, Column, T.DataType]], values: dict[str, Any]
+) -> dict[str, Any]:
+    """Adds exact sorted (value, count) pairs for low-cardinality integer columns, in one grouped job."""
+    eligible = [
+        (prefix, column)
+        for prefix, column, data_type in columns
+        if isinstance(data_type, tuple(_INTEGER_BITS)) and 2 <= values[f"{prefix}_distinct"] <= _HISTOGRAM_MAX_DISTINCT
+    ]
+    if not eligible:
+        return values
+    entries = F.explode(
+        F.array(*(F.struct(F.lit(prefix).alias("p"), column.cast("long").alias("v")) for prefix, column in eligible))
+    )
+    rows = df.select(entries.alias("e")).select("e.*").where(F.col("v").isNotNull()).groupBy("p", "v").count()
+    counts: dict[str, list[tuple[int, int]]] = {prefix: [] for prefix, _ in eligible}
+    for row in sorted(rows.collect(), key=lambda row: (row["p"], row["v"])):
+        counts[row["p"]].append((row["v"], row["count"]))
+    return {**values, **{f"{prefix}_value_counts": pairs for prefix, pairs in counts.items()}}
+
+
 def _numeric_stats(
     data_type: T.DataType, values: Mapping[str, Any], prefix: str, privacy: PrivacyPolicy
 ) -> NumericStats:
     include_extremes = privacy.extremes != ValueTreatment.SUPPRESSED
-    raw_quantiles = _supported_quantile_values(values, prefix, privacy)
+    histogram = _histogram(values.get(f"{prefix}_value_counts"), data_type, privacy)
+    raw_quantiles = None if histogram else _supported_quantiles(values, prefix, privacy)
     if not _exact_quantile_types(raw_quantiles, data_type):
         raw_quantiles = None
     return NumericStats(
@@ -417,37 +449,81 @@ def _numeric_stats(
             values.get(f"{prefix}_min"),
             values.get(f"{prefix}_max"),
         ),
+        histogram=histogram,
     )
 
 
-def _supported_quantile_values(values: Mapping[str, Any], prefix: str, privacy: PrivacyPolicy) -> list[Any] | None:
+def _histogram(counts: list[tuple[int, int]] | None, data_type: T.DataType, privacy: PrivacyPolicy) -> Histogram | None:
+    """Builds a histogram from exact value counts, merging neighbours until every bin holds k rows.
+
+    Bin edges are the lowest value of each bin plus the highest value of the last bin. When extremes are
+    suppressed, the outer edges are widened to the nearest round numbers strictly outside the data.
+    """
+    if not counts:
+        return None
+    k = privacy.min_value_count
+    bins: list[list[int]] = []
+    for value, count in counts:
+        if bins and bins[-1][2] < k:
+            bins[-1][1:] = [value, bins[-1][2] + count]
+        else:
+            bins.append([value, value, count])
+    if len(bins) > 1 and bins[-1][2] < k:
+        _, high, count = bins.pop()
+        bins[-1][1:] = [high, bins[-1][2] + count]
+    if len(bins) < 2:
+        return None
+    edges = [low for low, _, _ in bins] + [bins[-1][1]]
+    suppressed = privacy.extremes == ValueTreatment.SUPPRESSED
+    if suppressed:
+        step = 10 ** (len(str(edges[-1] - edges[0])) - 1)
+        edges[0], edges[-1] = (edges[0] - 1) // step * step, (edges[-1] // step + 1) * step
+        bound = 2 ** _INTEGER_BITS[type(data_type)]
+        if edges[0] < -bound or edges[-1] >= bound:
+            return None
+    return Histogram(
+        edges=[_encode_numeric(edge, data_type) for edge in edges],
+        counts=[count for _, _, count in bins],
+        generalized_outer_edges=suppressed,
+    )
+
+
+def _supported_quantiles(
+    values: Mapping[str, Any], prefix: str, privacy: PrivacyPolicy
+) -> list[tuple[float, Any]] | None:
+    """Returns (q, value) pairs with enough non-null support.
+
+    The core grid needs `min_value_count` rows per core interval; a tail point `q` also needs
+    `min_value_count` rows between it and the nearer extreme.
+    """
     raw = values.get(f"{prefix}_quantiles")
     support = values.get(f"{prefix}_non_null")
-    if not isinstance(raw, list) or not isinstance(support, int):
+    k = privacy.min_value_count
+    if not isinstance(raw, list) or not isinstance(support, int) or support < k * QUANTILE_INTERVALS:
         return None
-    return raw if support >= privacy.min_value_count * (len(_QUANTILE_GRID) - 1) else None
+    pairs = zip(_QUANTILE_GRID, raw, strict=True)
+    return [(q, value) for q, value in pairs if q not in _TAIL_QUANTILES or support * min(q, 1 - q) >= k]
 
 
-def _exact_quantile_types(values: list[Any] | None, data_type: T.DataType) -> bool:
-    if values is None:
+def _exact_quantile_types(pairs: list[tuple[float, Any]] | None, data_type: T.DataType) -> bool:
+    if pairs is None:
         return True
     if isinstance(data_type, T.DecimalType):
-        return all(isinstance(value, Decimal) and value.as_tuple().exponent == -data_type.scale for value in values)
+        return all(isinstance(value, Decimal) and value.as_tuple().exponent == -data_type.scale for _, value in pairs)
     if isinstance(data_type, T.LongType):
-        return all(isinstance(value, int) and not isinstance(value, bool) for value in values)
+        return all(isinstance(value, int) and not isinstance(value, bool) for _, value in pairs)
     return True
 
 
 def _quantiles(
-    values: object,
+    pairs: list[tuple[float, Any]] | None,
     data_type: T.DataType,
     include_extremes: bool,
     minimum: object,
     maximum: object,
 ) -> list[Quantile] | None:
-    if not isinstance(values, list):
+    if pairs is None:
         return None
-    pairs = list(zip(_QUANTILE_GRID, values, strict=True))
     if not include_extremes:
         pairs = [(q, value) for q, value in pairs if q not in (0.0, 1.0) and value not in (minimum, maximum)]
     encoded = [Quantile(q=q, value=value) for q, raw in pairs if (value := _encode_numeric(raw, data_type)) is not None]
@@ -486,7 +562,7 @@ def _temporal_stats(
     data_type: T.DataType, values: Mapping[str, Any], prefix: str, privacy: PrivacyPolicy
 ) -> TemporalStats:
     include_extremes = privacy.extremes != ValueTreatment.SUPPRESSED
-    raw_quantiles = _supported_quantile_values(values, prefix, privacy)
+    raw_quantiles = _supported_quantiles(values, prefix, privacy)
     minimum = _encode_temporal(values.get(f"{prefix}_min"), data_type)
     maximum = _encode_temporal(values.get(f"{prefix}_max"), data_type)
     return TemporalStats(
@@ -507,15 +583,14 @@ def _temporal_quantile_key(column: Column, data_type: T.DataType) -> Column:
 
 
 def _temporal_quantiles(
-    values: object,
+    pairs: list[tuple[float, Any]] | None,
     data_type: T.DataType,
     include_extremes: bool,
     minimum: str | None,
     maximum: str | None,
 ) -> list[Quantile] | None:
-    if not isinstance(values, list):
+    if pairs is None:
         return None
-    pairs = list(zip(_QUANTILE_GRID, values, strict=True))
     encoded = [(q, _encode_temporal_key(int(value), data_type)) for q, value in pairs]
     if not include_extremes:
         encoded = [(q, value) for q, value in encoded if q not in (0.0, 1.0) and value not in (minimum, maximum)]

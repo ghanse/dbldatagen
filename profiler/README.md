@@ -164,10 +164,16 @@ component (e.g. `"2024-02-04T16:27:43.791440Z"`) and omit the fraction otherwise
 1–9 fractional digits via `parse_temporal` so odd lengths from older profiles still load on Python 3.10.
 
 The Spark profiler emits numeric and temporal quantiles on the fixed grid
-`[0, 0.1, 0.25, 0.5, 0.75, 0.9, 1]` using `percentile_approx` accuracy 10,000. When
+`[0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1]` using `percentile_approx` accuracy 10,000. When
 `privacy.extremes` is `suppressed`, it omits the `q=0` and `q=1` points along with min and max.
-Quantiles require at least six times `privacy.min_value_count` non-null values, one k-sized support interval per grid
-step.
+Quantiles require at least six times `privacy.min_value_count` (k) non-null values, one k-sized support interval per
+core grid step. A tail point `q` also needs k rows beyond it (`non_null * min(q, 1 - q) >= k`); otherwise it is dropped.
+
+Integer columns with 2 to 64 distinct values get an exact histogram instead of quantiles, from one extra grouped Spark
+job per table (or nested column). Each bin starts as one value and merges with its upper neighbour until it holds at
+least k rows. When `privacy.extremes` is `suppressed`, the outer edges are widened to the nearest multiples, strictly
+outside the data, of a power of ten one digit shorter than the value range, and `generalized_outer_edges` is true; the
+histogram is omitted if the widened edges fall outside the integer type.
 
 `mean` and `stddev` are always approximate JSON numbers. Histogram bins are `[lo, hi)` except the last, which is
 `[lo, hi]`. The edges span every profiled value, and `counts` are row counts, with `sampled: true` when they come from
