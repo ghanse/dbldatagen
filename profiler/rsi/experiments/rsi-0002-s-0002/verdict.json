@@ -1,0 +1,239 @@
+{
+  "gates": [
+    {
+      "detail": {
+        "expected_fidelity": 60,
+        "expected_speed": 60
+      },
+      "name": "sample_completeness",
+      "passed": true,
+      "reason": "all_samples_ok",
+      "status": "pass"
+    },
+    {
+      "detail": {
+        "failed": [
+          "fidelity/candidate/nested/s/seed-0",
+          "fidelity/candidate/nested/s/seed-3",
+          "fidelity/candidate/nested/s/seed-4"
+        ]
+      },
+      "name": "privacy",
+      "passed": false,
+      "reason": "privacy_guard_failed",
+      "status": "fail"
+    },
+    {
+      "detail": {},
+      "name": "control",
+      "passed": true,
+      "reason": "distinct_builds",
+      "status": "pass"
+    },
+    {
+      "detail": {
+        "ci": {
+          "confidence": 0.95,
+          "crosses_zero": false,
+          "high": 0.0017842147265583921,
+          "low": 0.0009794529086912854,
+          "method": "stratified_dataset_mean",
+          "n": 6,
+          "n_bootstrap": 2000,
+          "point": 0.0014008500518936761,
+          "seed": 0,
+          "statistic": "mean"
+        },
+        "ci_floor": 0.0,
+        "estimand": "equally weighted mean across datasets of per-dataset mean paired differences; stratified bootstrap resamples seeds within each dataset (datasets are fixed strata). A hierarchical bootstrap that also resamples datasets is an unused alternative.",
+        "mean_across_datasets": 0.0014008500518936761,
+        "min_improvement": 0.005,
+        "per_dataset_mean_improvement": {
+          "edge": 0.009799610409201364,
+          "nested": -0.009333926015774142,
+          "numeric": 0.009800648428052972,
+          "retail": -0.0025258838426467367,
+          "strings": -0.0002490532140182244,
+          "temporal": 0.000913704546546823
+        }
+      },
+      "name": "accuracy_mean",
+      "passed": false,
+      "reason": "accuracy_insufficient",
+      "status": "fail"
+    },
+    {
+      "detail": {
+        "datasets": {
+          "edge": {
+            "confidence": 0.95,
+            "crosses_zero": false,
+            "high": -0.009310973082054553,
+            "low": -0.010299972783292333,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": -0.009799610409201364,
+            "seed": 1,
+            "statistic": "mean"
+          },
+          "nested": {
+            "confidence": 0.95,
+            "crosses_zero": false,
+            "high": 0.009457998639373378,
+            "low": 0.00918940353448161,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.009333926015774142,
+            "seed": 1,
+            "statistic": "mean"
+          },
+          "numeric": {
+            "confidence": 0.95,
+            "crosses_zero": false,
+            "high": -0.009168297916562995,
+            "low": -0.010331985705142977,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": -0.009800648428052972,
+            "seed": 1,
+            "statistic": "mean"
+          },
+          "retail": {
+            "confidence": 0.95,
+            "crosses_zero": false,
+            "high": 0.004940288628589085,
+            "low": 0.00048024301957478867,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0025258838426467367,
+            "seed": 1,
+            "statistic": "mean"
+          },
+          "strings": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0009174777098053255,
+            "low": -0.0004193712817688766,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0002490532140182244,
+            "seed": 1,
+            "statistic": "mean"
+          },
+          "temporal": {
+            "confidence": 0.95,
+            "crosses_zero": false,
+            "high": -0.0007762945219965456,
+            "low": -0.0010239179904510732,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": -0.000913704546546823,
+            "seed": 1,
+            "statistic": "mean"
+          }
+        },
+        "max_regression": 0.01
+      },
+      "name": "accuracy_per_dataset",
+      "passed": true,
+      "reason": "no_reconstruction_regression",
+      "status": "pass"
+    },
+    {
+      "detail": {
+        "datasets": {
+          "edge": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          },
+          "nested": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          },
+          "numeric": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          },
+          "retail": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          },
+          "strings": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          },
+          "temporal": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          }
+        },
+        "max_regression": 0.02
+      },
+      "name": "structure",
+      "passed": true,
+      "reason": "no_structure_regression",
+      "status": "pass"
+    }
+  ],
+  "interval_note": "Each gate uses a two-sided percentile CI at the policy confidence level; there is no family-wise coverage guarantee across gates.",
+  "proposal_type": "accuracy",
+  "reasons": [
+    "privacy_guard_failed",
+    "accuracy_insufficient"
+  ],
+  "verdict": "rejected"
+}
