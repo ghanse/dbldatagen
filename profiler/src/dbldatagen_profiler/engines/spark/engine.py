@@ -14,6 +14,7 @@ from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
+from dbldatagen_profiler.engines.spark import patterns
 from dbldatagen_profiler.model import (
     SPEC_VERSION,
     BooleanStats,
@@ -23,9 +24,11 @@ from dbldatagen_profiler.model import (
     LengthStats,
     LogicalType,
     NumericStats,
+    Pattern,
     PrivacyPolicy,
     Profile,
     QuasiIdentifierSet,
+    Semantic,
     StringStats,
     TableProfile,
     TemporalStats,
@@ -52,6 +55,7 @@ _NUMERIC_TYPES = (
     T.DecimalType,
 )
 _TEMPORAL_TYPES = (T.DateType, T.TimestampType)
+_LITERAL_FREE = frozenset({"direct_identifier", "secret", "free_text"})
 
 
 def profile_tables(
@@ -133,6 +137,7 @@ def _profile_table(
         _column_from_aggregate(field, values, index, row_count, privacy, nested=False, df=df)
         for index, field in enumerate(df.schema.fields)
     ]
+    columns = _with_string_patterns(name, df, columns, row_count, privacy, semantics, pii_policy)
     protected = [
         _protect_column(column, table=name, path=column.name, semantics=semantics, pii_policy=pii_policy)
         for column in columns
@@ -141,6 +146,42 @@ def _profile_table(
         QuasiIdentifierSet(columns=names, unique_fraction=unique, k_anonymity=k) for names, unique, k in quasi_sets
     ]
     return TableProfile(name=name, row_count=row_count, columns=protected, quasi_identifier_sets=quasi or None)
+
+
+def _with_string_patterns(
+    table: str,
+    df: DataFrame,
+    columns: list[ColumnProfile],
+    row_count: int,
+    privacy: PrivacyPolicy,
+    semantics: Mapping[str, Any],
+    pii_policy: PiiPolicy | None,
+) -> list[ColumnProfile]:
+    """Adds privacy-safe `string.patterns` to string columns reachable through structs, in one Spark job."""
+    targets = patterns.string_paths(df.schema)
+    k = privacy.min_value_count
+    shapes = patterns.collect_shapes(df, [expr for _, expr in targets], k)
+    found: dict[str, list[Pattern]] = {}
+    for index, (path, _) in enumerate(targets):
+        column = patterns.column_at(columns, path)
+        literal_free = _literal_free(f"{table}.{path}", semantics.get(path), pii_policy)
+        emitted = patterns.patterns_for(
+            shapes.get(index, []), patterns.non_null_count(column, row_count), k, literal_free=literal_free
+        )
+        if emitted:
+            found[path] = emitted
+    return patterns.with_patterns(columns, found)
+
+
+def _literal_free(reference: str, semantic: Semantic | None, pii_policy: PiiPolicy | None) -> bool:
+    """Returns whether a column's patterns must be literal-free: it is sensitive or any PII policy rule covers it."""
+    if semantic is not None and semantic.sensitivity.value in _LITERAL_FREE:
+        return True
+    if pii_policy is None:
+        return False
+    if reference in pii_policy.columns:
+        return True
+    return semantic is not None and pii_policy.resolve(reference, semantic)[0].action != PiiAction.KEEP
 
 
 def _protect_column(

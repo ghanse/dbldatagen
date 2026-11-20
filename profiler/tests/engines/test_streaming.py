@@ -122,10 +122,23 @@ def _run(
 
 
 def _comparable(profile: Profile) -> dict[str, Any]:
+    """Returns the profile without fields the streaming engine does not produce (string patterns are batch-only)."""
     data = profile.model_dump(mode="json")
     data.pop("created_at")
     data.pop("engine")
+    _drop_patterns(data)
     return data
+
+
+def _drop_patterns(data: object) -> None:
+    if isinstance(data, dict):
+        if isinstance(data.get("string"), dict):
+            data["string"]["patterns"] = None
+        for value in data.values():
+            _drop_patterns(value)
+    elif isinstance(data, list):
+        for item in data:
+            _drop_patterns(item)
 
 
 def _assert_equivalent(batch: object, stream: object, path: str = "") -> None:
