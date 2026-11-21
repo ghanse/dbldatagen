@@ -114,7 +114,7 @@ def expected_sample_keys(run: dict[str, Any]) -> dict[str, set[str]]:
     speed: set[str] = set()
     for dataset in datasets:
         for tier in speed_tiers:
-            n = int(speed_n.get(tier, speed_n.get("s", 5)))
+            n = int(speed_n[tier])
             for role in roles:
                 for sample_index in range(n):
                     speed.add(f"speed/{role}/{dataset}/{tier}/{sample_index}")
