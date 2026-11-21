@@ -116,6 +116,7 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 
 | P2.3a | PII policy follow-ups part 1: FK full-drop with undetected side, DOB shift on original entity keys, NaN/Inf error, small-space capacity pre-check, docs | P2.3 | merged (PR #23) |
 | P2.4 | Opt-in `perturb` PII action (noise / affine) to keep Pearson correlations on sensitive numeric and temporal columns (human decision 2026-11-21) | P2.3 | in-progress (cursor) |
+| P2.5 | PII policy preset `keys_map_rest_perturb`: substitute (mapping) on PK/FK/unique keys, perturb on non-key numeric/temporal columns (sensitive/QI by default; `perturb_scope: all_numeric` optional) | P2.4 | queued (after PR #34) |
 | P2.3b | PII follow-ups: hidden entity-key column names must be checked case-insensitively (substitute.py ~L376-379; silent user-column loss); replace the _protect_column argument shim by updating the streaming call site | P2.3a, P3.1 | merged (PR #24) |
 
 ### Phase 3 — Streaming and data volume (human request 2026-11-18)
