@@ -164,3 +164,14 @@ def test_struct_fields_get_patterns_and_profiles_are_deterministic(spark: SparkS
     assert [(p.regex, p.coverage) for p in child.string.patterns or []] == [(r"\d{4}-\d{3}", 1.0)]
     strip = re.compile(r'"created_at":\s*"[^"]+"')
     assert strip.sub("", dump_profile(first)) == strip.sub("", dump_profile(second))
+
+
+@pytest.mark.spark
+def test_patterns_are_literal_free_without_pii_detection(spark: SparkSession) -> None:
+    df = spark.createDataFrame([(f"ABC-{i:04d}",) for i in range(100)], "sku string")
+
+    with_detection = profile_dataframe("t", df, privacy=PrivacyPolicy(min_value_count=10))
+    without_detection = profile_dataframe("t", df, privacy=PrivacyPolicy(min_value_count=10), detect_pii=False)
+
+    assert [p.regex for p in _strings(with_detection, "sku")] == [r"[A-Z]{3}-\d{4}"]
+    assert [p.regex for p in _strings(without_detection, "sku")] == [r"[A-Z]{3}[^\w\s]\d{4}"]

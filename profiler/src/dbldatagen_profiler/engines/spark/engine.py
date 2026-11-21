@@ -154,7 +154,9 @@ def _profile_table(
         _column_from_aggregate(field, values, index, row_count, privacy, nested=False, df=df)
         for index, field in enumerate(df.schema.fields)
     ]
-    columns = _with_string_patterns(name, df, columns, row_count, privacy, semantics, pii_policy)
+    columns = _with_string_patterns(
+        name, df, columns, row_count, privacy, semantics if analysis is not None else None, pii_policy
+    )
     protected = [
         _protect_column(column, table=name, path=column.name, semantics=semantics, pii_policy=pii_policy)
         for column in columns
@@ -171,17 +173,21 @@ def _with_string_patterns(
     columns: list[ColumnProfile],
     row_count: int,
     privacy: PrivacyPolicy,
-    semantics: Mapping[str, Any],
+    semantics: Mapping[str, Any] | None,
     pii_policy: PiiPolicy | None,
 ) -> list[ColumnProfile]:
-    """Adds privacy-safe `string.patterns` to string columns reachable through structs, in one Spark job."""
+    """Adds privacy-safe `string.patterns` to string columns reachable through structs, in one Spark job.
+
+    Without PII detection (`semantics` is None) no column is known to be non-sensitive, so every pattern is
+    literal-free.
+    """
     targets = patterns.string_paths(df.schema)
     k = privacy.min_value_count
     shapes = patterns.collect_shapes(df, [expr for _, expr in targets], k)
     found: dict[str, list[Pattern]] = {}
     for index, (path, _) in enumerate(targets):
         column = patterns.column_at(columns, path)
-        literal_free = _literal_free(f"{table}.{path}", semantics.get(path), pii_policy)
+        literal_free = semantics is None or _literal_free(f"{table}.{path}", semantics.get(path), pii_policy)
         emitted = patterns.patterns_for(
             shapes.get(index, []), patterns.non_null_count(column, row_count), k, literal_free=literal_free
         )
