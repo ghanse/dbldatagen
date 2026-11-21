@@ -244,10 +244,12 @@ rejected for now (follow-up). Modes: `noise` (default) adds keyed Gaussian noise
 occurrence counter so duplicate rows still get independent noise; equality is not preserved. Without a primary key the
 perturbed multiset is deterministic across reshuffles, though the row order of exact duplicates may vary. Expected
 Pearson attenuation is stated per column as `1/sqrt(1+noise_ratio²)`. A pairwise correlation between two perturbed
-columns is scaled by the product of those per-column factors (`r/(1+ratio²)` when both use the same ratio). Integer and
-decimal columns compute stddev and apply noise/affine in exact Decimal/int arithmetic (affine `a` is a rational with a
-bounded denominator); values are then rounded or quantized to the column type, with overflow clamped only to the type
-range, never to the observed min/max. Affine on float/double preserves Pearson exactly (sign-preserving); on
+columns is scaled by the product of those per-column factors (`r/(1+ratio²)` when both use the same ratio). Column stddev is computed with Spark aggregates (double; it only scales
+sigma). Integer and decimal columns then apply noise/affine in exact Decimal/int arithmetic without collecting the
+column to the driver (affine `a` is a rational with a bounded denominator). Exact-type Gaussian noise fills digits
+below float precision from extra HMAC bytes so low-order digits cannot pass through when sigma is large. Values are
+then rounded or quantized to the column type, with overflow clamped only to the type range, never to the observed
+min/max. Affine on float/double preserves Pearson exactly (sign-preserving); on
 integer/decimal columns it preserves Pearson only up to rounding. Affine is reversible if two real values are known —
 a weaker mode when exact correlations are required. Dates/timestamps shift in days/seconds; NaN/Inf pass through. For
 example:

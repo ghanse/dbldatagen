@@ -12,6 +12,7 @@ from pathlib import Path
 import jsonschema
 import pytest
 from pyspark.sql import DataFrame, Row, SparkSession
+from pyspark.sql import functions as F
 
 from dbldatagen_profiler.cli import main
 from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
@@ -39,7 +40,15 @@ from dbldatagen_profiler.pii import (
     substitute,
 )
 from dbldatagen_profiler.pii.detect import analyze_table
-from dbldatagen_profiler.pii.substitute import _mapping_surrogate
+from dbldatagen_profiler.pii.substitute import (
+    _digest,
+    _exact_numeric_quantum,
+    _gaussian_noise_decimal,
+    _mapping_surrogate,
+    _perturb_stddev,
+    _perturb_value,
+    _serialize_entity_parts,
+)
 
 
 pytestmark = [pytest.mark.spark, pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")]
@@ -1743,6 +1752,91 @@ def test_perturb_entity_key_serialization_avoids_collisions(spark: SparkSession)
     by_key = {(row.k1, row.k2): row.amount for row in output}
     assert by_key[(f"a{sep}b", None)] != by_key[("a", "b")]
     assert by_key[(None, "x")] != by_key[("None", "x")]
+
+
+def test_perturb_exact_numeric_avoids_column_collect(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    frame = spark.range(1_000_000).select(
+        F.col("id").cast("int").alias("id"),
+        (F.col("id") * F.lit(1_000)).cast("bigint").alias("huge"),
+        (F.col("id").cast("decimal(38,10)") * F.lit(Decimal("1000.0000000001"))).alias("amount"),
+    )
+    profile = profile_dataframe("t", frame.limit(10), detect_pii=False)
+    # Rebuild profile row_count for the full frame without profiling 1M rows.
+    profile = profile.model_copy(update={"tables": [profile.tables[0].model_copy(update={"row_count": 1_000_000})]})
+    qi = Semantic.model_validate(_semantic("other", "quasi_identifier"))
+    profile.tables[0].columns[1] = profile.tables[0].columns[1].model_copy(update={"semantic": qi})
+    profile.tables[0].columns[2] = profile.tables[0].columns[2].model_copy(update={"semantic": qi})
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    policy = _qi_numeric_policy(mode="noise", noise_ratio=0.1)
+    key = b"scale-no-collect-key"
+
+    real_collect = DataFrame.collect
+
+    def guarded_collect(self: DataFrame) -> list[Row]:
+        rows = real_collect(self)
+        if len(rows) > 1_000:
+            raise AssertionError(f"driver collected {len(rows)} rows during exact-numeric perturb")
+        return rows
+
+    monkeypatch.setattr(DataFrame, "collect", guarded_collect)
+    result = substitute({"t": frame}, profile, key=key, policy=policy)
+    assert result.tables["t"].count() == 1_000_000
+
+    # Small-sample exact-arithmetic check against the same Spark stddev + Decimal noise path.
+    monkeypatch.setattr(DataFrame, "collect", real_collect)
+    sample_ids = list(range(25))
+    originals = {row.id: row for row in frame.where(F.col("id").isin(sample_ids)).collect()}
+    outputs = {row.id: row for row in result.tables["t"].where(F.col("id").isin(sample_ids)).collect()}
+    std_huge = _perturb_stddev(frame, "huge", frame.schema["huge"].dataType)
+    std_amount = _perturb_stddev(frame, "amount", frame.schema["amount"].dataType)
+    for row_id in sample_ids:
+        identity = _serialize_entity_parts((row_id,))
+        for name, std, dtype in (
+            ("huge", std_huge, frame.schema["huge"].dataType),
+            ("amount", std_amount, frame.schema["amount"].dataType),
+        ):
+            digest = _digest(key, f"t.{name}:perturb", identity)
+            sigma = Decimal(str(std)) * Decimal("0.1")
+            noise = _gaussian_noise_decimal(digest, sigma, quantum=_exact_numeric_quantum(dtype))
+            expected = _perturb_value(
+                getattr(originals[row_id], name), dtype, noise=noise, scale=1, shift=0, mode="noise"
+            )
+            assert getattr(outputs[row_id], name) == expected
+
+
+def test_perturb_exact_noise_randomizes_low_order_digits(spark: SparkSession) -> None:
+    rows: list[tuple[int, int, Decimal]] = []
+    for index in range(2_000):
+        huge = (2**63 - 1 - (index % 997)) if index % 2 == 0 else (-(2**63) + (index % 997))
+        # Spread ~1e24 so population stddev is ~1e20+; embed unique low digits in the fraction.
+        whole = (10**24 + index) if index % 2 == 0 else -(10**24 + index)
+        frac = f"{(index * 1_000_003) % 10**10:010d}"
+        rows.append((index, huge, Decimal(f"{whole}.{frac}")))
+    frame = spark.createDataFrame(rows, "id int, huge long, amount decimal(38,10)")
+    profile = profile_dataframe("t", frame, detect_pii=False)
+    qi = Semantic.model_validate(_semantic("other", "quasi_identifier"))
+    profile.tables[0].columns[1] = profile.tables[0].columns[1].model_copy(update={"semantic": qi})
+    profile.tables[0].columns[2] = profile.tables[0].columns[2].model_copy(update={"semantic": qi})
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    policy = _qi_numeric_policy(mode="noise", noise_ratio=1.0)
+    output = {
+        row.id: row
+        for row in substitute({"t": frame}, profile, key=b"low-digit-key", policy=policy).tables["t"].collect()
+    }
+    original = {row[0]: row for row in rows}
+
+    def decimal_low12(value: Decimal) -> int:
+        unscaled = int((abs(value) * (Decimal(10) ** 10)).to_integral_value())
+        return unscaled % (10**12)
+
+    decimal_matches = sum(
+        1 for index in original if decimal_low12(original[index][2]) == decimal_low12(output[index].amount)
+    )
+    int_matches = sum(
+        1 for index in original if abs(original[index][1]) % (10**12) == abs(output[index].huge) % (10**12)
+    )
+    assert decimal_matches / len(original) < 0.01
+    assert int_matches / len(original) < 0.01
 
 
 def test_perturb_nopk_repartition_preserves_output_multiset(spark: SparkSession) -> None:
