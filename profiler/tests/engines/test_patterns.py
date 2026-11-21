@@ -175,3 +175,28 @@ def test_patterns_are_literal_free_without_pii_detection(spark: SparkSession) ->
 
     assert [p.regex for p in _strings(with_detection, "sku")] == [r"[A-Z]{3}-\d{4}"]
     assert [p.regex for p in _strings(without_detection, "sku")] == [r"[A-Z]{3}[^\w\s]\d{4}"]
+
+
+@pytest.mark.spark
+def test_dotted_field_names_are_not_read_as_nested_fields(spark: SparkSession) -> None:
+    struct = T.StructType
+    schema = struct(
+        [
+            T.StructField("a.b", T.StringType()),
+            T.StructField("a", struct([T.StructField("b", T.StringType())])),
+            T.StructField("s", struct([T.StructField("x.y", T.StringType())])),
+        ]
+    )
+    rows = [(f"ABC-{i:04d}", (f"{i:04d}-{i % 7:03d}",), (f"abcd-{i:04d}",)) for i in range(100)]
+    df = spark.createDataFrame(rows, schema)
+
+    profile = profile_dataframe("t", df, privacy=PrivacyPolicy(min_value_count=10))
+    dotted, nested, outer = profile.tables[0].columns
+    (nested_b,) = nested.children or []
+    (outer_xy,) = outer.children or []
+
+    assert [p.regex for p in _strings(profile, "a.b")] == [r"[A-Z]{3}[^\w\s]\d{4}"]
+    assert nested_b.string is not None and outer_xy.string is not None
+    assert [p.regex for p in nested_b.string.patterns or []] == [r"\d{4}-\d{3}"]
+    assert [p.regex for p in outer_xy.string.patterns or []] == [r"[a-z]{4}[^\w\s]\d{4}"]
+    assert dotted.name == "a.b" and outer_xy.name == "x.y"

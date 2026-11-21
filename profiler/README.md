@@ -57,10 +57,11 @@ when it covers more rows. A shape is emitted only when it covers at least `min_v
 matches alone number at least max(`min_value_count`, 10^6) strings, so a pattern never singles out a value. Values
 longer than 256 characters or with more than 24 runs are left to the fallback.
 
-On columns detected as direct identifiers, secrets, or free text, or covered by a PII policy rule, patterns carry no
-literal characters: punctuation becomes `[^\w\s]`, `_` becomes `\w`, other non-ASCII characters become `.`, and
-shapes containing whitespace are skipped. Elsewhere, punctuation stays literal (it occurs in every row of a shape
-with at least `min_value_count` rows) and spaces are written `[ ]`. Patterns use only literals, classes, `\d`/`\w`/`\s`
+On columns detected as direct identifiers, secrets, or free text, covered by a PII policy rule, or named with a dot
+(their dotted PII path is ambiguous), and on every column when PII detection is off, patterns carry no literal
+characters: punctuation becomes `[^\w\s]`, `_` becomes `\w`, other non-ASCII characters become `.`, and
+shapes containing whitespace are skipped. Elsewhere, other characters stay literal (each occurs in every row of a
+shape with at least `min_value_count` rows), spaces are written `[ ]`, and other whitespace `\s`. Patterns use only literals, classes, `\d`/`\w`/`\s`
 and their negations, `.`, and `{m}`/`{m,n}` quantifiers. The streaming engine does not emit patterns yet.
 
 ### Streaming

@@ -179,15 +179,21 @@ def _with_string_patterns(
     """Adds privacy-safe `string.patterns` to string columns reachable through structs, in one Spark job.
 
     Without PII detection (`semantics` is None) no column is known to be non-sensitive, so every pattern is
-    literal-free.
+    literal-free. Semantics and PII policy rules are keyed by dotted path, which is ambiguous when a field name
+    contains a dot, so such columns are literal-free too.
     """
     targets = patterns.string_paths(df.schema)
     k = privacy.min_value_count
     shapes = patterns.collect_shapes(df, [expr for _, expr in targets], k)
-    found: dict[str, list[Pattern]] = {}
+    found: dict[tuple[str, ...], list[Pattern]] = {}
     for index, (path, _) in enumerate(targets):
         column = patterns.column_at(columns, path)
-        literal_free = semantics is None or _literal_free(f"{table}.{path}", semantics.get(path), pii_policy)
+        dotted = ".".join(path)
+        literal_free = (
+            semantics is None
+            or any("." in name for name in path)
+            or _literal_free(f"{table}.{dotted}", semantics.get(dotted), pii_policy)
+        )
         emitted = patterns.patterns_for(
             shapes.get(index, []), patterns.non_null_count(column, row_count), k, literal_free=literal_free
         )

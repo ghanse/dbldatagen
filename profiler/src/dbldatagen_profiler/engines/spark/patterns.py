@@ -65,20 +65,20 @@ class Shape:
     flags: frozenset[str] = frozenset()
 
 
-def string_paths(schema: T.StructType) -> list[tuple[str, Column]]:
-    """Returns the dotted path and Spark expression of every string column reachable through structs only."""
-    found: list[tuple[str, Column]] = []
+def string_paths(schema: T.StructType) -> list[tuple[tuple[str, ...], Column]]:
+    """Returns the field-name path and Spark expression of every string column reachable through structs only."""
+    found: list[tuple[tuple[str, ...], Column]] = []
 
-    def walk(fields: Sequence[T.StructField], prefix: str, parent: Column | None) -> None:
+    def walk(fields: Sequence[T.StructField], prefix: tuple[str, ...], parent: Column | None) -> None:
         for field in fields:
             expr = F.col("`" + field.name.replace("`", "``") + "`") if parent is None else parent.getField(field.name)
-            path = f"{prefix}{field.name}"
+            path = (*prefix, field.name)
             if isinstance(field.dataType, T.StringType):
                 found.append((path, expr))
             elif isinstance(field.dataType, T.StructType):
-                walk(field.dataType.fields, f"{path}.", expr)
+                walk(field.dataType.fields, path, expr)
 
-    walk(schema.fields, "", None)
+    walk(schema.fields, (), None)
     return found
 
 
@@ -201,23 +201,23 @@ def patterns_for(shapes: Sequence[Shape], non_null: int, k: int, *, literal_free
     return [Pattern(regex=regex, coverage=count / non_null) for regex, count in best]
 
 
-def with_patterns(columns: Sequence[ColumnProfile], found: dict[str, list[Pattern]]) -> list[ColumnProfile]:
-    """Returns the columns with `string.patterns` set from `found`, keyed by dotted path."""
+def with_patterns(columns: Sequence[ColumnProfile], found: dict[tuple[str, ...], list[Pattern]]) -> list[ColumnProfile]:
+    """Returns the columns with `string.patterns` set from `found`, keyed by field-name path."""
 
-    def apply(column: ColumnProfile, path: str) -> ColumnProfile:
+    def apply(column: ColumnProfile, path: tuple[str, ...]) -> ColumnProfile:
         updates: dict[str, object] = {}
         if path in found and column.string is not None:
             updates["string"] = column.string.model_copy(update={"patterns": found[path]})
         if column.children is not None:
-            updates["children"] = [apply(child, f"{path}.{child.name}") for child in column.children]
+            updates["children"] = [apply(child, (*path, child.name)) for child in column.children]
         return column.model_copy(update=updates) if updates else column
 
-    return [apply(column, column.name) for column in columns]
+    return [apply(column, (column.name,)) for column in columns]
 
 
-def column_at(columns: Sequence[ColumnProfile], path: str) -> ColumnProfile:
-    """Returns the column profile at a dotted struct path."""
-    head, *rest = path.split(".")
+def column_at(columns: Sequence[ColumnProfile], path: tuple[str, ...]) -> ColumnProfile:
+    """Returns the column profile at a field-name struct path."""
+    head, *rest = path
     column = next(c for c in columns if c.name == head)
     for name in rest:
         column = next(c for c in column.children or [] if c.name == name)
