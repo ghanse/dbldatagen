@@ -403,7 +403,7 @@ def test_truncated_normal_mean_stddev_calibration_or_documented_shift(spark: Spa
 
 def test_histogram_path_avoids_exact_endpoints(spark: SparkSession) -> None:
     """Degenerate outer histogram bins must not emit the exact outer edge as a point mass."""
-    stats = NumericStats(histogram=Histogram(edges=[0.0, 0.0, 10.0], counts=[1, 3]))
+    stats = NumericStats(histogram=Histogram(edges=[0.0, 0.0, 10.0], counts=[2_000, 6_000]))
     values = np.asarray(
         [
             row.x

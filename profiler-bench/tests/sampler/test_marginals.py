@@ -31,7 +31,7 @@ from .profiles import column, profile
     [
         (
             "histogram",
-            NumericStats(histogram=Histogram(edges=[0.0, 10.0, 20.0], counts=[1, 3])),
+            NumericStats(histogram=Histogram(edges=[0.0, 10.0, 20.0], counts=[1_250, 3_750])),
             12.5,
             0.35,
             None,
@@ -115,7 +115,7 @@ def test_boolean_default_is_balanced(spark: SparkSession) -> None:
 
 
 def test_integer_histogram_rounds_and_stays_in_range(spark: SparkSession) -> None:
-    stats = NumericStats(histogram=Histogram(edges=[1, 5, 10], counts=[1, 1]))
+    stats = NumericStats(histogram=Histogram(edges=[1, 5, 10], counts=[1_000, 1_000]))
     frame = sample(
         profile(TableProfile(name="t", row_count=2_000, columns=[column("x", LogicalType.INT32, numeric=stats)])),
         spark,
@@ -150,7 +150,7 @@ def test_decimal_preserves_precision_scale_and_distribution(spark: SparkSession)
 
 
 def test_decimal_histogram_uses_half_open_bins_and_closed_last_bin(spark: SparkSession) -> None:
-    stats = NumericStats(histogram=Histogram(edges=["10.00", "10.02", "10.04"], counts=[1, 1]))
+    stats = NumericStats(histogram=Histogram(edges=["10.00", "10.02", "10.04"], counts=[1_000, 1_000]))
     rows = (
         sample(
             profile(
