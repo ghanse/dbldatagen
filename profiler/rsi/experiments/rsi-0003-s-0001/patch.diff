@@ -1,0 +1,222 @@
+diff --git a/profiler/README.md b/profiler/README.md
+index 96f09b2..e3237e1 100644
+--- a/profiler/README.md
++++ b/profiler/README.md
+@@ -136,6 +136,13 @@ A profile contains:
+ - `relationships`: foreign keys from child columns to parent columns, with coverage, confidence, and fan-out. Fan-out
+   counts child rows for every parent key, including keys with none; child keys that match no parent are left out and
+   show up in `coverage` instead.
++- `dependencies`: the Spark engine computes Pearson correlation for at most 64 top-level numeric/temporal pairs in
++  the existing per-table aggregate. Pairs are selected deterministically by increasing distance in schema order, then
++  by the left column's schema position, so adjacent columns are considered first and a 200-column table does not
++  generate every possible pair. A dependency requires at least three paired finite values and a finite correlation.
++  Numeric values are converted to doubles; dates to UTC epoch days; timestamps, timestamp-without-time-zone, and times
++  to UTC epoch seconds. The profile contains only the aggregate coefficient and column names, never source values or
++  row samples.
+ - `semantic`: optional PII class, sensitivity, confidence, and value-free detection evidence. Tables may also record
+   sampled pairs and triples that behave as quasi-identifiers.
+ 
+diff --git a/profiler/src/dbldatagen_profiler/engines/spark/engine.py b/profiler/src/dbldatagen_profiler/engines/spark/engine.py
+index 414deb6..a29a83c 100644
+--- a/profiler/src/dbldatagen_profiler/engines/spark/engine.py
++++ b/profiler/src/dbldatagen_profiler/engines/spark/engine.py
+@@ -18,6 +18,8 @@ from dbldatagen_profiler.model import (
+     SPEC_VERSION,
+     BooleanStats,
+     ColumnProfile,
++    DependenceMethod,
++    Dependency,
+     DistinctCount,
+     EngineInfo,
+     LengthStats,
+@@ -53,6 +55,12 @@ _NUMERIC_TYPES = (
+ )
+ _TEMPORAL_TYPES = (T.DateType, T.TimestampType)
+ 
++# Pearson pairs are selected in increasing schema-index distance, then by the
++# left index. This puts adjacent columns first and caps wide-table aggregate
++# growth deterministically instead of constructing every possible pair.
++_MAX_PEARSON_PAIRS = 64
++_MIN_PEARSON_SUPPORT = 3
++
+ 
+ def profile_tables(
+     tables: Mapping[str, DataFrame],
+@@ -127,6 +135,20 @@ def _profile_table(
+     expressions: list[Column] = [F.count(F.lit(1)).alias("__row_count")]
+     for index, field in enumerate(df.schema.fields):
+         expressions.extend(_aggregate_expressions(df[field.name], field.dataType, index))
++    pairs = _pearson_pairs(df)
++    for pair_index, (_, _, left, right) in enumerate(pairs):
++        paired = left.isNotNull() & right.isNotNull()
++        paired_left = F.when(paired, left)
++        paired_right = F.when(paired, right)
++        denominator = F.stddev_samp(paired_left) * F.stddev_samp(paired_right)
++        expressions.extend(
++            [
++                F.count(F.when(paired, 1)).alias(f"p{pair_index}_support"),
++                F.when(denominator != 0, F.covar_samp(paired_left, paired_right) / denominator).alias(
++                    f"p{pair_index}_correlation"
++                ),
++            ]
++        )
+     values = _collect_aggregate(df, expressions)
+     row_count = int(values["__row_count"])
+     columns = [
+@@ -140,7 +162,69 @@ def _profile_table(
+     quasi = [
+         QuasiIdentifierSet(columns=names, unique_fraction=unique, k_anonymity=k) for names, unique, k in quasi_sets
+     ]
+-    return TableProfile(name=name, row_count=row_count, columns=protected, quasi_identifier_sets=quasi or None)
++    dependencies = _dependencies_from_aggregate(pairs, values)
++    return TableProfile(
++        name=name,
++        row_count=row_count,
++        columns=protected,
++        dependencies=dependencies or None,
++        quasi_identifier_sets=quasi or None,
++    )
++
++
++def _pearson_pairs(df: DataFrame) -> list[tuple[str, str, Column, Column]]:
++    """Returns a deterministic, bounded set of finite numeric/temporal pairs.
++
++    Numeric columns use their double representation. Dates use UTC epoch days;
++    timestamps, timestamp-without-time-zone, and times use UTC epoch seconds.
++    Non-finite inputs are converted to null before support and correlation are
++    computed. Pairs are ordered by schema distance and then left schema index.
++    """
++    eligible = [
++        (index, field.name, _pearson_value(df[field.name], field.dataType))
++        for index, field in enumerate(df.schema.fields)
++        if isinstance(field.dataType, (*_NUMERIC_TYPES, *_temporal_types()))
++    ]
++    ordered = sorted(
++        (
++            (right_index - left_index, left_index, left_name, right_name, left, right)
++            for left_index, left_name, left in eligible
++            for right_index, right_name, right in eligible
++            if left_index < right_index
++        ),
++        key=lambda pair: (pair[0], pair[1]),
++    )
++    return [
++        (left_name, right_name, left, right)
++        for _, _, left_name, right_name, left, right in ordered[:_MAX_PEARSON_PAIRS]
++    ]
++
++
++def _pearson_value(column: Column, data_type: T.DataType) -> Column:
++    if isinstance(data_type, T.DateType):
++        value = F.datediff(column, F.lit("1970-01-01")).cast("double")
++    elif isinstance(data_type, _time_types()):
++        value = (F.hour(column) * 3600 + F.minute(column) * 60 + F.second(column)).cast("double")
++    elif isinstance(data_type, (*_TEMPORAL_TYPES, *_timestamp_ntz_types())):
++        value = column.cast("timestamp").cast("double")
++    else:
++        value = column.cast("double")
++    return F.when(value.isNotNull() & ~F.isnan(value) & (F.abs(value) != float("inf")), value)
++
++
++def _dependencies_from_aggregate(
++    pairs: list[tuple[str, str, Column, Column]], values: Mapping[str, Any]
++) -> list[Dependency]:
++    dependencies = []
++    for index, (left, right, _, _) in enumerate(pairs):
++        correlation = _finite_float(values[f"p{index}_correlation"])
++        if int(values[f"p{index}_support"]) >= _MIN_PEARSON_SUPPORT and correlation is not None:
++            dependencies.append(
++                Dependency(
++                    columns=(left, right), method=DependenceMethod.PEARSON, value=max(-1.0, min(1.0, correlation))
++                )
++            )
++    return dependencies
+ 
+ 
+ def _protect_column(
+diff --git a/profiler/tests/engines/test_spark.py b/profiler/tests/engines/test_spark.py
+index 2dba491..2f88281 100644
+--- a/profiler/tests/engines/test_spark.py
++++ b/profiler/tests/engines/test_spark.py
+@@ -10,7 +10,7 @@ from pyspark.sql import Row, SparkSession
+ from pyspark.sql import types as T
+ 
+ from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
+-from dbldatagen_profiler.engines.spark.engine import _logical_type
++from dbldatagen_profiler.engines.spark.engine import _logical_type, _pearson_pairs
+ from dbldatagen_profiler.model import LogicalType, PrivacyPolicy, ValueTreatment, profile_json_schema
+ 
+ 
+@@ -147,6 +147,57 @@ def test_profiles_flat_statistics(spark: SparkSession) -> None:
+     assert columns["constant"].numeric.stddev == 0.0
+ 
+ 
++def test_profiles_pearson_dependencies_for_numeric_and_temporal_pairs(spark: SparkSession) -> None:
++    rows = [
++        (
++            float(value),
++            value * 2.0,
++            date(2026, 1, value),
++            datetime(2026, 1, value, tzinfo=timezone.utc),
++        )
++        for value in range(1, 5)
++    ]
++    table = profile_dataframe(
++        "dependencies",
++        spark.createDataFrame(rows, "x double, y double, day date, moment timestamp"),
++        detect_pii=False,
++    ).tables[0]
++
++    assert table.dependencies is not None
++    actual = {(dependency.columns, dependency.method.value): dependency.value for dependency in table.dependencies}
++    assert actual[(("x", "y"), "pearson")] == pytest.approx(1.0)
++    assert actual[(("day", "moment"), "pearson")] == pytest.approx(1.0)
++
++
++def test_pearson_dependencies_require_three_finite_paired_values(spark: SparkSession) -> None:
++    frame = spark.createDataFrame(
++        [(1.0, 2.0), (2.0, 4.0), (float("inf"), 6.0), (float("nan"), 8.0), (None, 10.0)],
++        "x double, y double",
++    )
++
++    table = profile_dataframe("private", frame, detect_pii=False).tables[0]
++
++    assert table.dependencies is None
++    assert "dependencies" not in table.model_dump(mode="json", exclude_none=True)
++
++
++def test_pearson_pair_selection_is_deterministic_and_bounded_for_wide_tables(spark: SparkSession) -> None:
++    frame = spark.createDataFrame(
++        [tuple(float(value) for value in range(200))],
++        ", ".join(f"c{index:03d} double" for index in range(200)),
++    )
++
++    pairs = _pearson_pairs(frame)
++
++    assert len(pairs) == 64
++    assert [(left, right) for left, right, _, _ in pairs[:3]] == [
++        ("c000", "c001"),
++        ("c001", "c002"),
++        ("c002", "c003"),
++    ]
++    assert (pairs[-1][0], pairs[-1][1]) == ("c063", "c064")
++
++
+ def test_profiles_empty_table(spark: SparkSession) -> None:
+     table = profile_dataframe("empty", spark.createDataFrame([], "value long")).tables[0]
+     assert table.row_count == 0
+diff --git a/profiler/tests/engines/test_streaming.py b/profiler/tests/engines/test_streaming.py
+index cabfc51..dac67bd 100644
+--- a/profiler/tests/engines/test_streaming.py
++++ b/profiler/tests/engines/test_streaming.py
+@@ -125,6 +125,10 @@ def _comparable(profile: Profile) -> dict[str, Any]:
+     data = profile.model_dump(mode="json")
+     data.pop("created_at")
+     data.pop("engine")
++    # The streaming state does not retain cross-column moments, so dependencies
++    # are intentionally outside the documented batch/stream equivalence set.
++    for table in data["tables"]:
++        table.pop("dependencies")
+     return data
+ 
+ 
