@@ -10,7 +10,7 @@ import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from typing import Any
 
 from pyspark.broadcast import Broadcast
@@ -20,7 +20,12 @@ from pyspark.sql import types as T
 from pyspark.sql.window import Window
 
 from dbldatagen_profiler.model import ColumnProfile, PiiClass, Profile, Semantic, Sensitivity
-from dbldatagen_profiler.pii.policy import PiiAction, PiiPolicy, PiiRule
+from dbldatagen_profiler.pii.policy import (
+    PiiAction,
+    PiiPolicy,
+    PiiRule,
+    expected_correlation_attenuation,
+)
 
 
 MAX_NESTED_BROADCAST_VALUES = 100_000
@@ -69,6 +74,7 @@ def substitute(  # noqa: PLR0912, PLR0915
     domains = _domains(profile, opts)
     decisions = _decisions(profile, handling, opts)
     decisions = _domain_decisions(domains, decisions)
+    _validate_perturb_decisions(profile, tables, domains, decisions)
     domain_semantics: dict[str, Semantic] = {}
     for table_name, path, column in _profile_columns(profile):
         decision = decisions.get(f"{table_name}.{path}")
@@ -108,6 +114,13 @@ def substitute(  # noqa: PLR0912, PLR0915
         entity_keys = _capture_entity_keys(result, entity_columns)
         for entity_column, hidden in entity_keys.items():
             result = result.withColumn(hidden, F.col(entity_column))
+        row_entity = (
+            _capture_row_entity(result, frame.columns)
+            if not entity_columns and _table_has_perturb(table_name, frame.columns, decisions)
+            else {}
+        )
+        for hidden, expression in row_entity.items():
+            result = result.withColumn(hidden, expression)
         ordered_names = sorted(
             frame.columns,
             key=lambda name: _is_drop(decisions.get(f"{table_name}.{name}")),
@@ -146,6 +159,26 @@ def substitute(  # noqa: PLR0912, PLR0915
                 )
             elif rule.action == PiiAction.GENERALIZE:
                 result = result.withColumn(name, _generalize(F.col(name), rule.parameters, frame.schema[name].dataType))
+                count = frame.where(F.col(name).isNotNull()).count()
+                reports.append(
+                    _report(table_name, name, current_semantic, domains[reference], count, 0, rule, rule_source)
+                )
+            elif rule.action == PiiAction.PERTURB:
+                data_type = frame.schema[name].dataType
+                stddev = _perturb_stddev(frame, name, data_type)
+                result = result.withColumn(
+                    name,
+                    _perturb_column(
+                        F.col(name),
+                        data_type=data_type,
+                        domain=domains[reference],
+                        key=key,
+                        rule=rule,
+                        stddev=stddev,
+                        entity_columns=[entity_keys[item] for item in entity_columns],
+                        row_entity_columns=list(row_entity),
+                    ),
+                )
                 count = frame.where(F.col(name).isNotNull()).count()
                 reports.append(
                     _report(table_name, name, current_semantic, domains[reference], count, 0, rule, rule_source)
@@ -252,7 +285,7 @@ def substitute(  # noqa: PLR0912, PLR0915
                         ),
                     }
                 )
-        output[table_name] = result.drop(*entity_keys.values())
+        output[table_name] = result.drop(*entity_keys.values(), *row_entity)
     return SubstitutionResult(tables=output, report={"columns": reports})
 
 
@@ -330,9 +363,10 @@ def _domain_decisions(
     rank = {
         PiiAction.KEEP: 0,
         PiiAction.GENERALIZE: 1,
-        PiiAction.SUBSTITUTE: 2,
-        PiiAction.SUPPRESS: 3,
-        PiiAction.DROP: 4,
+        PiiAction.PERTURB: 2,
+        PiiAction.SUBSTITUTE: 3,
+        PiiAction.SUPPRESS: 4,
+        PiiAction.DROP: 5,
     }
     resolved = dict(decisions)
     for members in by_domain.values():
@@ -784,6 +818,11 @@ def _nested_policy_udf(
                 return None
             if rule.action == PiiAction.GENERALIZE:
                 return _generalize_nested(value, rule.parameters)
+            if rule.action == PiiAction.PERTURB:
+                raise ValueError(
+                    f"perturb is not supported for nested path {'.'.join(path)!r}; "
+                    "perturb only applies to top-level numeric and temporal columns"
+                )
             if semantic is None:
                 raise ValueError(f"substitute rule for nested path {'.'.join(path)!r} has no PII class")
             if str(value) == "":
@@ -1042,6 +1081,11 @@ def _report(
     rule_source: str,
 ) -> dict[str, Any]:
     source, separator, winner = rule_source.partition(":")
+    parameters = dict(rule.parameters)
+    if rule.action == PiiAction.PERTURB:
+        parameters.setdefault("mode", rule.perturb_mode())
+        if rule.perturb_mode() == "noise":
+            parameters.setdefault("noise_ratio", rule.perturb_noise_ratio())
     report: dict[str, Any] = {
         "table": table,
         "column": column,
@@ -1049,9 +1093,10 @@ def _report(
         "domain": domain,
         "rule_source": source,
         "action": rule.action.value,
-        "parameters": rule.parameters,
+        "parameters": parameters,
         "values_affected": count,
         "values_substituted": count if rule.action == PiiAction.SUBSTITUTE else 0,
+        "values_perturbed": count if rule.action == PiiAction.PERTURB else 0,
         "collisions_resolved": collisions,
         "generalizations": (
             [rule.parameters["method"]]
@@ -1059,6 +1104,285 @@ def _report(
             else ([rule.parameters] if rule.action == PiiAction.GENERALIZE else [])
         ),
     }
+    if rule.action == PiiAction.PERTURB:
+        report["mode"] = rule.perturb_mode()
+        report["expected_correlation_attenuation"] = expected_correlation_attenuation(rule)
+        report["equality_preserved"] = False
     if separator:
         report["winning_column"] = winner
     return report
+
+
+def _table_has_perturb(table_name: str, columns: list[str], decisions: dict[str, tuple[PiiRule, str]]) -> bool:
+    return any(
+        decisions.get(f"{table_name}.{name}", (PiiRule(action=PiiAction.KEEP), "default"))[0].action
+        == PiiAction.PERTURB
+        for name in columns
+    )
+
+
+def _capture_row_entity(frame: DataFrame, columns: list[str]) -> dict[str, Column]:
+    """Builds deterministic row-identity columns when no primary key is available."""
+    used = {name.lower() for name in frame.columns}
+    hash_name = "__pii_row_hash"
+    while hash_name.lower() in used:
+        hash_name = f"_{hash_name}"
+    used.add(hash_name.lower())
+    occ_name = "__pii_row_occ"
+    while occ_name.lower() in used:
+        occ_name = f"_{occ_name}"
+    parts = [F.coalesce(F.col(name).cast("string"), F.lit("\0")) for name in columns]
+    row_hash = F.xxhash64(*parts) if parts else F.lit(0)
+    occurrence = F.row_number().over(Window.partitionBy(row_hash).orderBy(F.monotonically_increasing_id()))
+    return {hash_name: row_hash, occ_name: occurrence}
+
+
+def _key_column_names(profile: Profile, table_name: str) -> set[str]:
+    table = next(item for item in profile.tables if item.name == table_name)
+    names = set(table.primary_key.columns if table.primary_key is not None else [])
+    for key in table.unique_keys or []:
+        names.update(key.columns)
+    return names
+
+
+def _validate_perturb_decisions(
+    profile: Profile,
+    tables: dict[str, DataFrame],
+    domains: dict[str, str],
+    decisions: dict[str, tuple[PiiRule, str]],
+) -> None:
+    key_references = {
+        f"{table.name}.{column}" for table in profile.tables for column in _key_column_names(profile, table.name)
+    }
+    domain_members: dict[str, list[str]] = {}
+    for reference, domain in domains.items():
+        domain_members.setdefault(domain, []).append(reference)
+    for reference, (rule, _) in decisions.items():
+        if rule.action != PiiAction.PERTURB:
+            continue
+        table_name, path = reference.split(".", maxsplit=1)
+        if "." in path:
+            raise ValueError(
+                f"perturb is not supported for nested column {reference!r}; "
+                "perturb only applies to top-level numeric and temporal columns"
+            )
+        frame = tables[table_name]
+        if path not in frame.columns:
+            raise ValueError(f"perturb column {reference!r} is absent from the input table")
+        column = next(col for t, p, col in _profile_columns(profile) if t == table_name and p == path)
+        semantic = column.semantic
+        if semantic is not None and semantic.sensitivity in {
+            Sensitivity.DIRECT_IDENTIFIER,
+            Sensitivity.SECRET,
+            Sensitivity.FREE_TEXT,
+        }:
+            raise ValueError(
+                f"perturb is not allowed for {semantic.sensitivity.value} column {reference!r}; "
+                "use it only on quasi_identifier columns or explicit column rules for undetected columns"
+            )
+        members = domain_members[domains[reference]]
+        if reference in key_references or any(member in key_references for member in members):
+            raise ValueError(
+                f"perturb is not allowed on key or FK-linked key column {reference!r}; "
+                "perturb cannot be applied to primary keys, unique keys, or FK groups that contain them"
+            )
+        data_type = frame.schema[path].dataType
+        if not _is_perturbable_type(data_type):
+            raise ValueError(
+                f"perturb is not supported for Spark type {data_type.simpleString()!r} on {reference!r}; "
+                "allowed types are numeric, date, timestamp, and timestamp_ntz"
+            )
+
+
+def _is_perturbable_type(data_type: T.DataType) -> bool:
+    if isinstance(
+        data_type,
+        (
+            T.ByteType,
+            T.ShortType,
+            T.IntegerType,
+            T.LongType,
+            T.FloatType,
+            T.DoubleType,
+            T.DecimalType,
+            T.DateType,
+            T.TimestampType,
+        ),
+    ):
+        return True
+    timestamp_ntz = getattr(T, "TimestampNTZType", None)
+    return timestamp_ntz is not None and isinstance(data_type, timestamp_ntz)
+
+
+def _perturb_numeric_expression(column: Column, data_type: T.DataType) -> Column:
+    if isinstance(data_type, T.DateType):
+        return F.datediff(column, F.lit(date(1970, 1, 1)).cast("date")).cast("double")
+    if isinstance(data_type, T.TimestampType):
+        return column.cast("double")
+    timestamp_ntz = getattr(T, "TimestampNTZType", None)
+    if timestamp_ntz is not None and isinstance(data_type, timestamp_ntz):
+        # TIMESTAMP_NTZ cannot cast directly to double; go through timestamp first.
+        return column.cast("timestamp").cast("double")
+    return column.cast("double")
+
+
+def _perturb_stddev(frame: DataFrame, name: str, data_type: T.DataType) -> float:
+    numeric = _perturb_numeric_expression(F.col(name), data_type)
+    if isinstance(data_type, (T.FloatType, T.DoubleType)):
+        numeric = F.when(F.isnan(name) | (F.abs(F.col(name)) == F.lit(float("inf"))), F.lit(None)).otherwise(numeric)
+    stats = frame.select(F.stddev_pop(numeric).alias("std")).first()
+    if stats is None or stats["std"] is None:
+        return 0.0
+    return float(stats["std"])
+
+
+def _unit_from_digest(digest: bytes, offset: int = 0) -> float:
+    """Maps 8 digest bytes to a uniform open unit interval (0, 1)."""
+    chunk = digest[offset : offset + 8]
+    if len(chunk) < 8:
+        chunk = (chunk + digest)[:8]
+    value = int.from_bytes(chunk, "big") % (2**53 - 1) + 1
+    return value / 2**53
+
+
+def _gaussian_from_digest(digest: bytes) -> float:
+    """Returns a deterministic standard-normal sample via Box-Muller."""
+    u1 = _unit_from_digest(digest, 0)
+    u2 = _unit_from_digest(digest, 8)
+    return math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+
+
+def _affine_coefficients(key: bytes, domain: str, stddev: float) -> tuple[float, float]:
+    digest = _digest(key, f"{domain}:affine", "coefficients")
+    unit = _unit_from_digest(digest, 0)
+    scale = 0.5 + 1.5 * unit
+    shift = _gaussian_from_digest(digest[8:] + digest[:8]) * stddev
+    return scale, shift
+
+
+def _integer_bounds(data_type: T.DataType) -> tuple[int, int] | None:
+    bounds = {
+        T.ByteType: (-(2**7), 2**7 - 1),
+        T.ShortType: (-(2**15), 2**15 - 1),
+        T.IntegerType: (-(2**31), 2**31 - 1),
+        T.LongType: (-(2**63), 2**63 - 1),
+    }
+    for kind, span in bounds.items():
+        if isinstance(data_type, kind):
+            return span
+    return None
+
+
+def _decimal_bounds(data_type: T.DecimalType) -> tuple[Decimal, Decimal]:
+    digits = "9" * data_type.precision
+    if data_type.scale:
+        whole = digits[: data_type.precision - data_type.scale] or "0"
+        fraction = digits[data_type.precision - data_type.scale :]
+        maximum = Decimal(f"{whole}.{fraction}")
+    else:
+        maximum = Decimal(digits)
+    return -maximum, maximum
+
+
+def _clamp_integer(value: int, data_type: T.DataType) -> int:
+    bounds = _integer_bounds(data_type)
+    if bounds is None:
+        return value
+    minimum, maximum = bounds
+    return minimum if value < minimum else maximum if value > maximum else value
+
+
+def _clamp_decimal(value: Decimal, data_type: T.DecimalType) -> Decimal:
+    minimum, maximum = _decimal_bounds(data_type)
+    with localcontext() as context:
+        context.prec = max(data_type.precision + 4, 50)
+        context.rounding = ROUND_HALF_EVEN
+        if value < minimum:
+            value = minimum
+        elif value > maximum:
+            value = maximum
+        return value.quantize(Decimal(1).scaleb(-data_type.scale))
+
+
+def _perturb_value(  # noqa: PLR0911
+    value: object,
+    data_type: T.DataType,
+    *,
+    noise: float,
+    scale: float,
+    shift: float,
+    mode: str,
+) -> object:
+    if value is None:
+        return None
+    if isinstance(data_type, (T.FloatType, T.DoubleType)):
+        number = float(str(value)) if not isinstance(value, (int, float)) else float(value)
+        if math.isnan(number) or math.isinf(number):
+            return number
+        perturbed = scale * number + shift if mode == "affine" else number + noise
+        return float(perturbed)
+    if isinstance(data_type, T.DecimalType):
+        amount = value if isinstance(value, Decimal) else Decimal(str(value))
+        decimal_result = (
+            amount * Decimal(str(scale)) + Decimal(str(shift)) if mode == "affine" else amount + Decimal(str(noise))
+        )
+        return _clamp_decimal(decimal_result, data_type)
+    if isinstance(data_type, (T.ByteType, T.ShortType, T.IntegerType, T.LongType)):
+        number = int(str(value)) if not isinstance(value, int) else value
+        integer_result = round(scale * number + shift) if mode == "affine" else number + round(noise)
+        return _clamp_integer(integer_result, data_type)
+    if isinstance(data_type, T.DateType):
+        current = (
+            value if isinstance(value, date) and not isinstance(value, datetime) else date.fromisoformat(str(value))
+        )
+        epoch = date(1970, 1, 1)
+        days = (current - epoch).days
+        mapped_days = round(scale * days + shift) if mode == "affine" else days + round(noise)
+        return epoch + timedelta(days=mapped_days)
+    timestamp_ntz = getattr(T, "TimestampNTZType", None)
+    if isinstance(data_type, T.TimestampType) or (timestamp_ntz is not None and isinstance(data_type, timestamp_ntz)):
+        current = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+        epoch = datetime(1970, 1, 1, tzinfo=current.tzinfo) if current.tzinfo is not None else datetime(1970, 1, 1)
+        seconds = (current - epoch).total_seconds()
+        mapped_seconds = scale * seconds + shift if mode == "affine" else seconds + noise
+        return epoch + timedelta(seconds=float(mapped_seconds))
+    raise ValueError(f"perturb is not supported for Spark type {data_type.simpleString()!r}")
+
+
+def _perturb_column(
+    column: Column,
+    *,
+    data_type: T.DataType,
+    domain: str,
+    key: bytes,
+    rule: PiiRule,
+    stddev: float,
+    entity_columns: list[str],
+    row_entity_columns: list[str],
+) -> Column:
+    mode = rule.perturb_mode()
+    noise_ratio = rule.perturb_noise_ratio()
+    if mode == "affine":
+        scale, shift = _affine_coefficients(key, domain, stddev)
+
+        def affine_replace(value: object) -> object:
+            return _perturb_value(value, data_type, noise=0.0, scale=scale, shift=shift, mode="affine")
+
+        return F.udf(affine_replace, data_type, useArrow=False)(column)
+
+    sigma = noise_ratio * stddev
+
+    def noise_replace(value: object, *entity: object) -> object:
+        if value is None:
+            return None
+        identity = "\u001f".join(str(item) for item in entity) if entity_columns or row_entity_columns else str(value)
+        digest = _digest(key, f"{domain}:perturb", identity)
+        noise = _gaussian_from_digest(digest) * sigma
+        return _perturb_value(value, data_type, noise=noise, scale=1.0, shift=0.0, mode="noise")
+
+    extras = [F.col(name) for name in (entity_columns or row_entity_columns)]
+    return (
+        F.udf(noise_replace, data_type, useArrow=False)(column, *extras)
+        if extras
+        else F.udf(noise_replace, data_type, useArrow=False)(column)
+    )
