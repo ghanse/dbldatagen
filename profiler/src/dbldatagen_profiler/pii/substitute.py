@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import json
 import math
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
@@ -1181,10 +1182,15 @@ def _validate_perturb_decisions(
                 "use it only on quasi_identifier columns or explicit column rules for undetected columns"
             )
         members = domain_members[domains[reference]]
-        if reference in key_references or any(member in key_references for member in members):
+        if len(members) > 1:
             raise ValueError(
-                f"perturb is not allowed on key or FK-linked key column {reference!r}; "
-                "perturb cannot be applied to primary keys, unique keys, or FK groups that contain them"
+                f"perturb is not allowed on FK-linked column {reference!r}; "
+                "perturb cannot be applied to any column in an FK-linked substitution domain"
+            )
+        if reference in key_references:
+            raise ValueError(
+                f"perturb is not allowed on key column {reference!r}; "
+                "perturb cannot be applied to primary keys or unique keys"
             )
         data_type = frame.schema[path].dataType
         if not _is_perturbable_type(data_type):
@@ -1214,6 +1220,10 @@ def _is_perturbable_type(data_type: T.DataType) -> bool:
     return timestamp_ntz is not None and isinstance(data_type, timestamp_ntz)
 
 
+def _is_exact_numeric_type(data_type: T.DataType) -> bool:
+    return isinstance(data_type, (T.ByteType, T.ShortType, T.IntegerType, T.LongType, T.DecimalType))
+
+
 def _perturb_numeric_expression(column: Column, data_type: T.DataType) -> Column:
     if isinstance(data_type, T.DateType):
         return F.datediff(column, F.lit(date(1970, 1, 1)).cast("date")).cast("double")
@@ -1226,7 +1236,22 @@ def _perturb_numeric_expression(column: Column, data_type: T.DataType) -> Column
     return column.cast("double")
 
 
-def _perturb_stddev(frame: DataFrame, name: str, data_type: T.DataType) -> float:
+def _population_stddev_decimal(values: Sequence[Decimal]) -> Decimal:
+    if len(values) < 2:
+        return Decimal(0)
+    with localcontext() as context:
+        context.prec = max(50, max(len(str(value)) for value in values) + 10)
+        context.rounding = ROUND_HALF_EVEN
+        mean = sum(values, Decimal(0)) / Decimal(len(values))
+        variance = sum((value - mean) ** 2 for value in values) / Decimal(len(values))
+        return variance.sqrt() if variance > 0 else Decimal(0)
+
+
+def _perturb_stddev(frame: DataFrame, name: str, data_type: T.DataType) -> float | Decimal:
+    if _is_exact_numeric_type(data_type):
+        rows = frame.select(name).where(F.col(name).isNotNull()).collect()
+        values = [Decimal(str(row[0])) for row in rows]
+        return _population_stddev_decimal(values)
     numeric = _perturb_numeric_expression(F.col(name), data_type)
     if isinstance(data_type, (T.FloatType, T.DoubleType)):
         numeric = F.when(F.isnan(name) | (F.abs(F.col(name)) == F.lit(float("inf"))), F.lit(None)).otherwise(numeric)
@@ -1252,12 +1277,25 @@ def _gaussian_from_digest(digest: bytes) -> float:
     return math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
 
 
-def _affine_coefficients(key: bytes, domain: str, stddev: float) -> tuple[float, float]:
+_AFFINE_SCALE_DENOMINATOR = 1000
+
+
+def _affine_coefficients_float(key: bytes, domain: str, stddev: float) -> tuple[float, float]:
     digest = _digest(key, f"{domain}:affine", "coefficients")
     unit = _unit_from_digest(digest, 0)
     scale = 0.5 + 1.5 * unit
     shift = _gaussian_from_digest(digest[8:] + digest[:8]) * stddev
     return scale, shift
+
+
+def _affine_coefficients_decimal(key: bytes, domain: str, stddev: Decimal) -> tuple[Decimal, Decimal]:
+    """Returns (a, b) with a = p/1000 in [0.5, 2.0] and b = z * stddev in Decimal."""
+    digest = _digest(key, f"{domain}:affine", "coefficients")
+    # Inclusive range 500/1000 .. 2000/1000 => 1501 distinct rationals.
+    index = int.from_bytes(digest[:8], "big") % 1501
+    scale = (Decimal(500) + Decimal(index)) / Decimal(_AFFINE_SCALE_DENOMINATOR)
+    z = Decimal(str(_gaussian_from_digest(digest[8:] + digest[:8])))
+    return scale, z * stddev
 
 
 def _integer_bounds(data_type: T.DataType) -> tuple[int, int] | None:
@@ -1274,14 +1312,11 @@ def _integer_bounds(data_type: T.DataType) -> tuple[int, int] | None:
 
 
 def _decimal_bounds(data_type: T.DecimalType) -> tuple[Decimal, Decimal]:
-    digits = "9" * data_type.precision
-    if data_type.scale:
-        whole = digits[: data_type.precision - data_type.scale] or "0"
-        fraction = digits[data_type.precision - data_type.scale :]
-        maximum = Decimal(f"{whole}.{fraction}")
-    else:
-        maximum = Decimal(digits)
-    return -maximum, maximum
+    with localcontext() as context:
+        context.prec = max(data_type.precision + 8, 50)
+        quantum = Decimal(1).scaleb(-data_type.scale)
+        maximum = (Decimal(10) ** (data_type.precision - data_type.scale)) - quantum
+        return -maximum, maximum
 
 
 def _clamp_integer(value: int, data_type: T.DataType) -> int:
@@ -1293,24 +1328,60 @@ def _clamp_integer(value: int, data_type: T.DataType) -> int:
 
 
 def _clamp_decimal(value: Decimal, data_type: T.DecimalType) -> Decimal:
+    """Clamps via the unscaled integer domain so Spark accepts the Decimal(p,s) encoding."""
     minimum, maximum = _decimal_bounds(data_type)
     with localcontext() as context:
-        context.prec = max(data_type.precision + 4, 50)
+        context.prec = max(data_type.precision + 8, 50)
         context.rounding = ROUND_HALF_EVEN
-        if value < minimum:
-            value = minimum
-        elif value > maximum:
+        if value > maximum:
             value = maximum
-        return value.quantize(Decimal(1).scaleb(-data_type.scale))
+        elif value < minimum:
+            value = minimum
+        scale_factor = Decimal(10) ** data_type.scale
+        unscaled = int((value * scale_factor).to_integral_value(rounding=ROUND_HALF_EVEN))
+        limit = 10**data_type.precision - 1
+        if unscaled > limit:
+            unscaled = limit
+        elif unscaled < -limit:
+            unscaled = -limit
+        # scaleb avoids Decimal division rounding at default/low precision.
+        return Decimal(unscaled).scaleb(-data_type.scale)
+
+
+def _serialize_entity_parts(parts: Sequence[object]) -> str:
+    """Serializes entity-key parts so nulls and embedded separators cannot collide."""
+
+    def encode(value: object) -> object:  # noqa: PLR0911
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, float):
+            if math.isnan(value) or math.isinf(value):
+                return {"float": str(value)}
+            return value
+        if isinstance(value, Decimal):
+            return {"decimal": str(value)}
+        if isinstance(value, datetime):
+            return {"datetime": value.isoformat()}
+        if isinstance(value, date):
+            return {"date": value.isoformat()}
+        if isinstance(value, (bytes, bytearray)):
+            return {"bytes": bytes(value).hex()}
+        return {"string": str(value)}
+
+    return json.dumps([encode(part) for part in parts], separators=(",", ":"), ensure_ascii=False)
 
 
 def _perturb_value(  # noqa: PLR0911
     value: object,
     data_type: T.DataType,
     *,
-    noise: float,
-    scale: float,
-    shift: float,
+    noise: float | Decimal,
+    scale: float | Decimal,
+    shift: float | Decimal,
     mode: str,
 ) -> object:
     if value is None:
@@ -1319,17 +1390,29 @@ def _perturb_value(  # noqa: PLR0911
         number = float(str(value)) if not isinstance(value, (int, float)) else float(value)
         if math.isnan(number) or math.isinf(number):
             return number
-        perturbed = scale * number + shift if mode == "affine" else number + noise
+        scale_f, shift_f, noise_f = float(scale), float(shift), float(noise)
+        perturbed = scale_f * number + shift_f if mode == "affine" else number + noise_f
         return float(perturbed)
     if isinstance(data_type, T.DecimalType):
         amount = value if isinstance(value, Decimal) else Decimal(str(value))
-        decimal_result = (
-            amount * Decimal(str(scale)) + Decimal(str(shift)) if mode == "affine" else amount + Decimal(str(noise))
-        )
+        scale_d = scale if isinstance(scale, Decimal) else Decimal(str(scale))
+        shift_d = shift if isinstance(shift, Decimal) else Decimal(str(shift))
+        noise_d = noise if isinstance(noise, Decimal) else Decimal(str(noise))
+        with localcontext() as context:
+            context.prec = max(data_type.precision + 16, 50)
+            context.rounding = ROUND_HALF_EVEN
+            decimal_result = amount * scale_d + shift_d if mode == "affine" else amount + noise_d
         return _clamp_decimal(decimal_result, data_type)
     if isinstance(data_type, (T.ByteType, T.ShortType, T.IntegerType, T.LongType)):
         number = int(str(value)) if not isinstance(value, int) else value
-        integer_result = round(scale * number + shift) if mode == "affine" else number + round(noise)
+        scale_d = scale if isinstance(scale, Decimal) else Decimal(str(scale))
+        shift_d = shift if isinstance(shift, Decimal) else Decimal(str(shift))
+        noise_d = noise if isinstance(noise, Decimal) else Decimal(str(noise))
+        with localcontext() as context:
+            context.prec = 50
+            context.rounding = ROUND_HALF_EVEN
+            exact = Decimal(number) * scale_d + shift_d if mode == "affine" else Decimal(number) + noise_d
+            integer_result = int(exact.to_integral_value(rounding=ROUND_HALF_EVEN))
         return _clamp_integer(integer_result, data_type)
     if isinstance(data_type, T.DateType):
         current = (
@@ -1337,14 +1420,16 @@ def _perturb_value(  # noqa: PLR0911
         )
         epoch = date(1970, 1, 1)
         days = (current - epoch).days
-        mapped_days = round(scale * days + shift) if mode == "affine" else days + round(noise)
+        scale_f, shift_f, noise_f = float(scale), float(shift), float(noise)
+        mapped_days = round(scale_f * days + shift_f) if mode == "affine" else days + round(noise_f)
         return epoch + timedelta(days=mapped_days)
     timestamp_ntz = getattr(T, "TimestampNTZType", None)
     if isinstance(data_type, T.TimestampType) or (timestamp_ntz is not None and isinstance(data_type, timestamp_ntz)):
         current = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
         epoch = datetime(1970, 1, 1, tzinfo=current.tzinfo) if current.tzinfo is not None else datetime(1970, 1, 1)
         seconds = (current - epoch).total_seconds()
-        mapped_seconds = scale * seconds + shift if mode == "affine" else seconds + noise
+        scale_f, shift_f, noise_f = float(scale), float(shift), float(noise)
+        mapped_seconds = scale_f * seconds + shift_f if mode == "affine" else seconds + noise_f
         return epoch + timedelta(seconds=float(mapped_seconds))
     raise ValueError(f"perturb is not supported for Spark type {data_type.simpleString()!r}")
 
@@ -1356,29 +1441,52 @@ def _perturb_column(
     domain: str,
     key: bytes,
     rule: PiiRule,
-    stddev: float,
+    stddev: float | Decimal,
     entity_columns: list[str],
     row_entity_columns: list[str],
 ) -> Column:
     mode = rule.perturb_mode()
     noise_ratio = rule.perturb_noise_ratio()
+    exact = _is_exact_numeric_type(data_type)
     if mode == "affine":
-        scale, shift = _affine_coefficients(key, domain, stddev)
+        if exact:
+            if not isinstance(stddev, Decimal):
+                raise TypeError("exact numeric affine perturbation requires a Decimal stddev")
+            affine_scale: float | Decimal
+            affine_shift: float | Decimal
+            affine_scale, affine_shift = _affine_coefficients_decimal(key, domain, stddev)
+        else:
+            affine_scale, affine_shift = _affine_coefficients_float(key, domain, float(stddev))
 
         def affine_replace(value: object) -> object:
-            return _perturb_value(value, data_type, noise=0.0, scale=scale, shift=shift, mode="affine")
+            return _perturb_value(value, data_type, noise=0, scale=affine_scale, shift=affine_shift, mode="affine")
 
         return F.udf(affine_replace, data_type, useArrow=False)(column)
 
-    sigma = noise_ratio * stddev
+    sigma_exact: Decimal | None = None
+    sigma_float: float | None = None
+    if exact:
+        if not isinstance(stddev, Decimal):
+            raise TypeError("exact numeric noise perturbation requires a Decimal stddev")
+        sigma_exact = stddev * Decimal(str(noise_ratio))
+    else:
+        sigma_float = float(stddev) * noise_ratio
 
     def noise_replace(value: object, *entity: object) -> object:
         if value is None:
             return None
-        identity = "\u001f".join(str(item) for item in entity) if entity_columns or row_entity_columns else str(value)
+        identity = (
+            _serialize_entity_parts(entity)
+            if entity_columns or row_entity_columns
+            else _serialize_entity_parts((value,))
+        )
         digest = _digest(key, f"{domain}:perturb", identity)
-        noise = _gaussian_from_digest(digest) * sigma
-        return _perturb_value(value, data_type, noise=noise, scale=1.0, shift=0.0, mode="noise")
+        z = _gaussian_from_digest(digest)
+        if sigma_exact is not None:
+            noise: float | Decimal = Decimal(str(z)) * sigma_exact
+        else:
+            noise = z * float(sigma_float or 0.0)
+        return _perturb_value(value, data_type, noise=noise, scale=1, shift=0, mode="noise")
 
     extras = [F.col(name) for name in (entity_columns or row_entity_columns)]
     return (

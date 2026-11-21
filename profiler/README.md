@@ -236,16 +236,21 @@ preserve join consistency. Available actions are `substitute`, `perturb`, `gener
 `perturb` is opt-in only (absent from the default policy) and keeps Pearson correlations on sensitive numeric and
 temporal columns. It is allowed on quasi-identifiers, or via an explicit column rule when detection missed a column,
 for int/long/short/byte/float/double/decimal and date/timestamp/timestamp_ntz types. It is rejected on direct
-identifiers, secrets, free text, primary/unique/FK-linked key columns, and on strings, booleans, binary, or nested
-containers. Modes: `noise` (default) adds keyed Gaussian noise with
+identifiers, secrets, free text, primary/unique keys, any column in an FK-linked substitution domain (perturbing either
+side would break joins), and on strings, booleans, binary, or nested containers. Nested numeric/temporal leaves stay
+rejected for now (follow-up). Modes: `noise` (default) adds keyed Gaussian noise with
 `sigma = noise_ratio × population_stddev` (`0 < noise_ratio ≤ 1`, default `0.1`), drawn from
 `HMAC(key, domain, entity)` where `entity` is the table primary key when present, otherwise a row content hash plus an
-occurrence counter so duplicate rows still get independent noise; equality is not preserved. Expected Pearson
-attenuation is `1/sqrt(1+noise_ratio²)` and is stated per column in the report. Integers are rounded back to the type;
-decimals keep precision/scale with exact arithmetic; dates/timestamps shift in days/seconds; NaN/Inf pass through;
-overflow clamps only to the type range, never to the observed min/max. Mode `affine` applies a keyed `a·x+b` per
-column (`a ∈ [0.5, 2]`, `b` scaled to the column stddev), which preserves Pearson exactly (sign-preserving) but is
-reversible if two real values are known — a weaker mode when exact correlations are required. For example:
+occurrence counter so duplicate rows still get independent noise; equality is not preserved. Without a primary key the
+perturbed multiset is deterministic across reshuffles, though the row order of exact duplicates may vary. Expected
+Pearson attenuation is stated per column as `1/sqrt(1+noise_ratio²)`. A pairwise correlation between two perturbed
+columns is scaled by the product of those per-column factors (`r/(1+ratio²)` when both use the same ratio). Integer and
+decimal columns compute stddev and apply noise/affine in exact Decimal/int arithmetic (affine `a` is a rational with a
+bounded denominator); values are then rounded or quantized to the column type, with overflow clamped only to the type
+range, never to the observed min/max. Affine on float/double preserves Pearson exactly (sign-preserving); on
+integer/decimal columns it preserves Pearson only up to rounding. Affine is reversible if two real values are known —
+a weaker mode when exact correlations are required. Dates/timestamps shift in days/seconds; NaN/Inf pass through. For
+example:
 
 ```yaml
 min_confidence: 0.25
