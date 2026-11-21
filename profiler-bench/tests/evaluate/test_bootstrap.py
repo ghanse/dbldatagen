@@ -10,7 +10,8 @@ import pytest
 
 from profiler_bench.evaluate.bootstrap import paired_bootstrap_ci, stratified_dataset_mean_ci
 from profiler_bench.evaluate.evaluate import evaluate_experiment
-from profiler_bench.evaluate.gates import evaluate_gates
+from profiler_bench.evaluate.gates import evaluate_gates, expected_sample_keys
+from profiler_bench.runner.policy import DEFAULT_POLICY, load_policy
 
 
 def test_known_positive_effect_accepted() -> None:
@@ -275,6 +276,16 @@ def test_verdict_deterministic_for_same_inputs() -> None:
         run=run,
     )
     assert first == second
+
+
+def test_expected_matrix_uses_default_policy_speed_samples() -> None:
+    policy = load_policy(DEFAULT_POLICY)
+    expected = expected_sample_keys({"policy": policy, "datasets": ["retail", "numeric"]})
+    speed_n = policy["speed_samples"]["m"]
+    assert len(expected["speed"]) == 2 * 2 * sum(policy["speed_samples"][tier] for tier in ("s", "m"))
+    assert f"speed/candidate/numeric/m/{speed_n - 1}" in expected["speed"]
+    assert f"speed/candidate/numeric/m/{speed_n}" not in expected["speed"]
+    assert len(expected["fidelity"]) == 2 * 2 * policy["fidelity_seeds"]
 
 
 def _policy(*, n_speed: int, n_fid: int) -> dict[str, Any]:

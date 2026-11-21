@@ -43,7 +43,7 @@ def run_speed_samples(
         policy_path.write_text(json.dumps(policy, sort_keys=True))
         for dataset in datasets:
             for tier in tiers:
-                n = int(speed_n.get(tier, speed_n.get("s", 5)))
+                n = int(speed_n[tier])
                 for sample_index in range(n):
                     order = rotate_order(sample_index, case_index)
                     for role in order:
