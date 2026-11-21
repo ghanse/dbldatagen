@@ -1,0 +1,443 @@
+diff --git a/profiler/README.md b/profiler/README.md
+index 96f09b2..6daa553 100644
+--- a/profiler/README.md
++++ b/profiler/README.md
+@@ -76,6 +76,7 @@ With an interval trigger the command runs until interrupted and rewrites `profil
+ 
+ The streaming engine requires pyspark 3.5 or later (for Spark's `hll_sketch_agg`); `StreamingProfiler` and
+ `dbldatagen-profile stream` fail with a clear error on older versions. The batch engine still supports pyspark 3.4.1.
++Quantiles are batch-only because streaming checkpoints do not retain a mergeable percentile sketch.
+ 
+ A snapshot equals the batch profile of the same rows on these statistics: row count, null fraction, nested
+ `value_count`, numeric and temporal min/max (lossless for decimal and int64), string and collection length
+@@ -155,12 +156,18 @@ Literal values (min, max, quantiles, histogram edges, range bounds, enumeration
+ | `time` | `HH:MM:SS[.fffffffff]` | `"08:30:00"` |
+ | `timestamp` | `YYYY-MM-DDTHH:MM:SS[.f]` with `Z` or `±HH:MM` | `"2026-11-06T08:30:00Z"` |
+ | `timestamp_ntz` | the same without an offset | `"2026-11-06T08:30:00"` |
++| `string` | JSON string | `"gold"` |
++| `boolean` | JSON boolean | `true` |
+ 
+ Producers emit exactly six fractional digits when a temporal value has a non-zero sub-second
+ component (e.g. `"2024-02-04T16:27:43.791440Z"`) and omit the fraction otherwise. Consumers parse
+ 1–9 fractional digits via `parse_temporal` so odd lengths from older profiles still load on Python 3.10.
+-| `string` | JSON string | `"gold"` |
+-| `boolean` | JSON boolean | `true` |
++
++The Spark profiler emits numeric and temporal quantiles on the fixed grid
++`[0, 0.1, 0.25, 0.5, 0.75, 0.9, 1]` using `percentile_approx` accuracy 10,000. When
++`privacy.extremes` is `suppressed`, it omits the `q=0` and `q=1` points along with min and max.
++Quantiles require at least six times `privacy.min_value_count` non-null values, one k-sized support interval per grid
++step.
+ 
+ `mean` and `stddev` are always approximate JSON numbers. Histogram bins are `[lo, hi)` except the last, which is
+ `[lo, hi]`. The edges span every profiled value, and `counts` are row counts, with `sampled: true` when they come from
+diff --git a/profiler/src/dbldatagen_profiler/engines/spark/engine.py b/profiler/src/dbldatagen_profiler/engines/spark/engine.py
+index 414deb6..6419d61 100644
+--- a/profiler/src/dbldatagen_profiler/engines/spark/engine.py
++++ b/profiler/src/dbldatagen_profiler/engines/spark/engine.py
+@@ -4,7 +4,7 @@ from __future__ import annotations
+ 
+ from collections.abc import Iterable, Iterator, Mapping
+ from contextlib import contextmanager
+-from datetime import date, datetime, time, timezone
++from datetime import date, datetime, time, timedelta, timezone
+ from decimal import Decimal
+ from math import isfinite
+ from typing import Any
+@@ -25,6 +25,7 @@ from dbldatagen_profiler.model import (
+     NumericStats,
+     PrivacyPolicy,
+     Profile,
++    Quantile,
+     QuasiIdentifierSet,
+     StringStats,
+     TableProfile,
+@@ -53,6 +54,12 @@ _NUMERIC_TYPES = (
+ )
+ _TEMPORAL_TYPES = (T.DateType, T.TimestampType)
+ 
++# A fixed, deterministic grid gives the sampler useful tail and quartile shape without
++# making each aggregate sketch unnecessarily large. Spark documents accuracy as an
++# inverse relative-error bound; 10,000 therefore targets 1e-4 rank error.
++_QUANTILE_GRID = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
++_QUANTILE_ACCURACY = 10_000
++
+ 
+ def profile_tables(
+     tables: Mapping[str, DataFrame],
+@@ -264,6 +271,7 @@ def _aggregate_expressions(column: Column, data_type: T.DataType, index: int) ->
+                 F.max(column).alias(f"{prefix}_max"),
+                 F.avg(approximate).alias(f"{prefix}_mean"),
+                 F.stddev_samp(approximate).alias(f"{prefix}_stddev"),
++                F.percentile_approx(column, list(_QUANTILE_GRID), _QUANTILE_ACCURACY).alias(f"{prefix}_quantiles"),
+             ]
+         )
+     elif isinstance(data_type, _string_types()):
+@@ -280,6 +288,9 @@ def _aggregate_expressions(column: Column, data_type: T.DataType, index: int) ->
+             [
+                 _temporal_extreme_literal(F.min(column), data_type).alias(f"{prefix}_min"),
+                 _temporal_extreme_literal(F.max(column), data_type).alias(f"{prefix}_max"),
++                F.percentile_approx(
++                    _temporal_quantile_key(column, data_type), list(_QUANTILE_GRID), _QUANTILE_ACCURACY
++                ).alias(f"{prefix}_quantiles"),
+             ]
+         )
+     elif isinstance(data_type, T.BooleanType):
+@@ -391,14 +402,58 @@ def _numeric_stats(
+     data_type: T.DataType, values: Mapping[str, Any], prefix: str, privacy: PrivacyPolicy
+ ) -> NumericStats:
+     include_extremes = privacy.extremes != ValueTreatment.SUPPRESSED
++    raw_quantiles = _supported_quantile_values(values, prefix, privacy)
++    if not _exact_quantile_types(raw_quantiles, data_type):
++        raw_quantiles = None
+     return NumericStats(
+         min=_encode_numeric(values.get(f"{prefix}_min"), data_type) if include_extremes else None,
+         max=_encode_numeric(values.get(f"{prefix}_max"), data_type) if include_extremes else None,
+         mean=_finite_float(values.get(f"{prefix}_mean")),
+         stddev=_finite_float(values.get(f"{prefix}_stddev")),
++        quantiles=_quantiles(
++            raw_quantiles,
++            data_type,
++            include_extremes,
++            values.get(f"{prefix}_min"),
++            values.get(f"{prefix}_max"),
++        ),
+     )
+ 
+ 
++def _supported_quantile_values(values: Mapping[str, Any], prefix: str, privacy: PrivacyPolicy) -> list[Any] | None:
++    raw = values.get(f"{prefix}_quantiles")
++    support = values.get(f"{prefix}_non_null")
++    if not isinstance(raw, list) or not isinstance(support, int):
++        return None
++    return raw if support >= privacy.min_value_count * (len(_QUANTILE_GRID) - 1) else None
++
++
++def _exact_quantile_types(values: list[Any] | None, data_type: T.DataType) -> bool:
++    if values is None:
++        return True
++    if isinstance(data_type, T.DecimalType):
++        return all(isinstance(value, Decimal) and value.as_tuple().exponent == -data_type.scale for value in values)
++    if isinstance(data_type, T.LongType):
++        return all(isinstance(value, int) and not isinstance(value, bool) for value in values)
++    return True
++
++
++def _quantiles(
++    values: object,
++    data_type: T.DataType,
++    include_extremes: bool,
++    minimum: object,
++    maximum: object,
++) -> list[Quantile] | None:
++    if not isinstance(values, list):
++        return None
++    pairs = list(zip(_QUANTILE_GRID, values, strict=True))
++    if not include_extremes:
++        pairs = [(q, value) for q, value in pairs if q not in (0.0, 1.0) and value not in (minimum, maximum)]
++    encoded = [Quantile(q=q, value=value) for q, raw in pairs if (value := _encode_numeric(raw, data_type)) is not None]
++    return encoded or None
++
++
+ def _encode_numeric(value: object, data_type: T.DataType) -> int | float | str | None:
+     if value is None:
+         return None
+@@ -430,14 +485,57 @@ def _length_stats(values: Mapping[str, Any], prefix: str, *, include_stddev: boo
+ def _temporal_stats(
+     data_type: T.DataType, values: Mapping[str, Any], prefix: str, privacy: PrivacyPolicy
+ ) -> TemporalStats:
+-    if privacy.extremes == ValueTreatment.SUPPRESSED:
+-        return TemporalStats()
++    include_extremes = privacy.extremes != ValueTreatment.SUPPRESSED
++    raw_quantiles = _supported_quantile_values(values, prefix, privacy)
++    minimum = _encode_temporal(values.get(f"{prefix}_min"), data_type)
++    maximum = _encode_temporal(values.get(f"{prefix}_max"), data_type)
+     return TemporalStats(
+-        min=_encode_temporal(values.get(f"{prefix}_min"), data_type),
+-        max=_encode_temporal(values.get(f"{prefix}_max"), data_type),
++        min=minimum if include_extremes else None,
++        max=maximum if include_extremes else None,
++        quantiles=_temporal_quantiles(raw_quantiles, data_type, include_extremes, minimum, maximum),
+     )
+ 
+ 
++def _temporal_quantile_key(column: Column, data_type: T.DataType) -> Column:
++    """Maps temporal values to exact ordered integer keys for percentile_approx."""
++    if isinstance(data_type, T.DateType):
++        return F.unix_date(column)
++    if isinstance(data_type, _time_types()):
++        seconds = F.second(column).cast("decimal(16,6)")
++        return (F.hour(column) * 3_600_000_000 + F.minute(column) * 60_000_000 + seconds * 1_000_000).cast("long")
++    return F.unix_micros(column.cast("timestamp"))
++
++
++def _temporal_quantiles(
++    values: object,
++    data_type: T.DataType,
++    include_extremes: bool,
++    minimum: str | None,
++    maximum: str | None,
++) -> list[Quantile] | None:
++    if not isinstance(values, list):
++        return None
++    pairs = list(zip(_QUANTILE_GRID, values, strict=True))
++    encoded = [(q, _encode_temporal_key(int(value), data_type)) for q, value in pairs]
++    if not include_extremes:
++        encoded = [(q, value) for q, value in encoded if q not in (0.0, 1.0) and value not in (minimum, maximum)]
++    return [Quantile(q=q, value=value) for q, value in encoded] or None
++
++
++def _encode_temporal_key(value: int, data_type: T.DataType) -> str:
++    if isinstance(data_type, T.DateType):
++        return (date(1970, 1, 1) + timedelta(days=value)).isoformat()
++    if isinstance(data_type, _time_types()):
++        hours, remainder = divmod(value, 3_600_000_000)
++        minutes, remainder = divmod(remainder, 60_000_000)
++        seconds, micros = divmod(remainder, 1_000_000)
++        return canonicalize_iso_fraction(time(hours, minutes, seconds, micros).isoformat())
++    moment = datetime(1970, 1, 1) + timedelta(microseconds=value)
++    timespec = "microseconds" if moment.microsecond else "seconds"
++    rendered = canonicalize_iso_fraction(moment.isoformat(timespec=timespec))
++    return rendered if isinstance(data_type, _timestamp_ntz_types()) else f"{rendered}Z"
++
++
+ def _temporal_extreme_literal(extreme: Column, data_type: T.DataType) -> Column:
+     """Formats a min/max temporal aggregate as a canonical ISO string in the UTC session."""
+     if isinstance(data_type, (T.DateType, *_time_types())):
+diff --git a/profiler/src/dbldatagen_profiler/model/profile.py b/profiler/src/dbldatagen_profiler/model/profile.py
+index 7867d60..565344f 100644
+--- a/profiler/src/dbldatagen_profiler/model/profile.py
++++ b/profiler/src/dbldatagen_profiler/model/profile.py
+@@ -30,6 +30,7 @@ SPEC_VERSION = "0.2.0"
+ SUPPORTED_MAJOR_VERSION = int(SPEC_VERSION.split(".", maxsplit=1)[0])
+ STRICT_CONTEXT_KEY = "strict"
+ DEFAULT_MIN_VALUE_COUNT = 10
++QUANTILE_INTERVALS = 6
+ 
+ Fraction = Annotated[float, Field(ge=0.0, le=1.0)]
+ Count = Annotated[int, Field(ge=0)]
+@@ -1057,6 +1058,8 @@ def _check_column_privacy(column: ColumnProfile, value_count: int | None, policy
+             raise ValueError(f"column {column.name!r}: nested patterns or top_values require value_count")
+         return
+     non_null_rows = value_count * (1.0 - column.null_fraction)
++    if stats is not None and stats.quantiles and non_null_rows < k * QUANTILE_INTERVALS:
++        raise ValueError(f"column {column.name!r}: quantiles require at least {k * QUANTILE_INTERVALS} non-null values")
+     rare = [entry.value for entry in string.top_values or [] if round(entry.frequency * non_null_rows) < k]
+     rare += [pattern.regex for pattern in string.patterns or [] if round(pattern.coverage * non_null_rows) < k]
+     if rare:
+diff --git a/profiler/tests/engines/test_spark.py b/profiler/tests/engines/test_spark.py
+index 2dba491..8e73294 100644
+--- a/profiler/tests/engines/test_spark.py
++++ b/profiler/tests/engines/test_spark.py
+@@ -10,7 +10,7 @@ from pyspark.sql import Row, SparkSession
+ from pyspark.sql import types as T
+ 
+ from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
+-from dbldatagen_profiler.engines.spark.engine import _logical_type
++from dbldatagen_profiler.engines.spark.engine import _logical_type, _numeric_stats
+ from dbldatagen_profiler.model import LogicalType, PrivacyPolicy, ValueTreatment, profile_json_schema
+ 
+ 
+@@ -140,8 +140,10 @@ def test_profiles_flat_statistics(spark: SparkSession) -> None:
+     assert number.numeric.max == "2"
+     assert number.numeric.mean == pytest.approx(1.5)
+     assert number.numeric.stddev == pytest.approx(2**-0.5)
++    assert number.numeric.quantiles is None
+     assert text.string.length.model_dump(exclude_none=True) == {"min": 1, "max": 4, "mean": 2.5}
+     assert moment.temporal.min == "2026-01-01T00:00:00Z"
++    assert moment.temporal.quantiles is None
+     assert flag.boolean.true_fraction == 0.5
+     assert columns["all_null"].numeric.model_dump(exclude_none=True) == {}
+     assert columns["constant"].numeric.stddev == 0.0
+@@ -155,6 +157,15 @@ def test_profiles_empty_table(spark: SparkSession) -> None:
+     assert table.columns[0].distinct_count.value == 0
+ 
+ 
++def test_profiles_numeric_and_temporal_quantiles_with_sufficient_support(spark: SparkSession) -> None:
++    frame = spark.range(60).selectExpr("id AS number", "date_add(DATE '2026-01-01', CAST(id AS INT)) AS day")
++    columns = profile_dataframe("quantiles", frame).tables[0].columns
++
++    assert columns[0].numeric is not None and columns[1].temporal is not None
++    assert [item.q for item in columns[0].numeric.quantiles or []] == [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
++    assert [item.q for item in columns[1].temporal.quantiles or []] == [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
++
++
+ def test_timestamp_fraction_is_canonical_six_digits(spark: SparkSession) -> None:
+     """Spark cast-to-string drops trailing zeros (5 digits here); the engine must pad to micros."""
+     frame = spark.sql(
+@@ -220,18 +231,99 @@ def test_non_finite_float_extremes_are_omitted(spark: SparkSession) -> None:
+     assert "max" not in column.numeric.model_dump(exclude_none=True)
+ 
+ 
+-def test_lossless_decimal_and_int64_extremes(spark: SparkSession) -> None:
++def test_lossless_decimal_and_int64_extremes_and_quantiles(spark: SparkSession) -> None:
+     schema = T.StructType([T.StructField("integer", T.LongType()), T.StructField("decimal", T.DecimalType(38, 18))])
+     rows = [
+         (-(2**63), Decimal("-99999999999999999999.999999999999999999")),
+         (2**63 - 1, Decimal("99999999999999999999.999999999999999999")),
+-    ]
++    ] * 30
+     columns = profile_dataframe("lossless", spark.createDataFrame(rows, schema)).tables[0].columns
+     assert columns[0].numeric is not None and columns[1].numeric is not None
+     assert columns[0].numeric.min == "-9223372036854775808"
+     assert columns[0].numeric.max == "9223372036854775807"
+     assert columns[1].numeric.min == "-99999999999999999999.999999999999999999"
+     assert columns[1].numeric.max == "99999999999999999999.999999999999999999"
++    assert [item.value for item in columns[0].numeric.quantiles or []] == [
++        "-9223372036854775808",
++        "-9223372036854775808",
++        "-9223372036854775808",
++        "-9223372036854775808",
++        "9223372036854775807",
++        "9223372036854775807",
++        "9223372036854775807",
++    ]
++
++
++def test_lossless_decimal_quantiles(spark: SparkSession) -> None:
++    values = [Decimal("1.250000000000000000"), Decimal("9.750000000000000000")]
++    frame = spark.createDataFrame([(value,) for value in values] * 30, "value decimal(38,18)")
++    stats = profile_dataframe("lossless", frame).tables[0].columns[0].numeric
++
++    assert stats is not None
++    quantiles = stats.quantiles or []
++    assert [type(item.value) for item in quantiles] == [str] * 7
++    assert [item.value for item in quantiles] == [
++        "1.250000000000000000",
++        "1.250000000000000000",
++        "1.250000000000000000",
++        "1.250000000000000000",
++        "9.750000000000000000",
++        "9.750000000000000000",
++        "9.750000000000000000",
++    ]
++
++
++def test_decimal_quantile_interiors_never_round_trip_through_float(spark: SparkSession) -> None:
++    values = [
++        Decimal("1.0000000000"),
++        Decimal("2.0000000001"),
++        Decimal("3.0000000001"),
++        Decimal("4.0000000001"),
++        Decimal("5.0000000001"),
++        Decimal("6.0000000001"),
++        Decimal("9.0000000000"),
++    ]
++    frame = spark.createDataFrame([(value,) for value in values for _ in range(10)], "value decimal(38,10)")
++    stats = profile_dataframe("lossless", frame).tables[0].columns[0].numeric
++
++    assert stats is not None
++    assert [item.value for item in stats.quantiles or []] == [
++        "1.0000000000",
++        "1.0000000000",
++        "2.0000000001",
++        "4.0000000001",
++        "6.0000000001",
++        "9.0000000000",
++        "9.0000000000",
++    ]
++
++
++def test_non_decimal_quantile_result_omits_all_decimal_quantiles() -> None:
++    low = Decimal("1.0000000000")
++    high = Decimal("9.0000000000")
++    values = {
++        "c0_non_null": 60,
++        "c0_min": low,
++        "c0_max": high,
++        "c0_quantiles": [low, low, 3.0000000001, Decimal("5.0000000000"), high, high, high],
++    }
++
++    assert _numeric_stats(T.DecimalType(38, 10), values, "c0", PrivacyPolicy()).quantiles is None
++    values["c0_quantiles"] = [low, low, Decimal("3.000000001"), low, high, high, high]
++    assert _numeric_stats(T.DecimalType(38, 10), values, "c0", PrivacyPolicy()).quantiles is None
++
++
++def test_non_integral_quantile_result_omits_all_int64_quantiles() -> None:
++    low = 2**63 - 100
++    high = 2**63 - 1
++    values = {
++        "c0_non_null": 60,
++        "c0_min": low,
++        "c0_max": high,
++        "c0_quantiles": [low, low, float(low + 25), low + 50, high, high, high],
++    }
++
++    assert _numeric_stats(T.LongType(), values, "c0", PrivacyPolicy()).quantiles is None
+ 
+ 
+ def test_large_numeric_aggregates_do_not_overflow_in_ansi_mode(spark: SparkSession) -> None:
+@@ -273,15 +365,20 @@ def test_large_numeric_aggregates_do_not_overflow_in_ansi_mode(spark: SparkSessi
+             spark.conf.set(key, previous)
+ 
+ 
+-def test_suppressed_extremes_produce_valid_profile(spark: SparkSession) -> None:
++@pytest.mark.parametrize("row_count", [1, 59, 60])
++def test_suppressed_extremes_never_appear_as_quantiles(spark: SparkSession, row_count: int) -> None:
+     policy = PrivacyPolicy(extremes=ValueTreatment.SUPPRESSED)
+     profile = profile_dataframe(
+-        "private", spark.createDataFrame([(1, date(2026, 1, 1))], "n int, d date"), privacy=policy
++        "private",
++        spark.createDataFrame([(1, date(2026, 1, 1))] * row_count, "n int, d date"),
++        privacy=policy,
+     )
+     assert profile.tables[0].columns[0].numeric is not None
+     assert profile.tables[0].columns[1].temporal is not None
+     assert profile.tables[0].columns[0].numeric.min is None
+     assert profile.tables[0].columns[1].temporal.min is None
++    assert profile.tables[0].columns[0].numeric.quantiles is None
++    assert profile.tables[0].columns[1].temporal.quantiles is None
+ 
+ 
+ def test_nested_columns_have_value_counts(spark: SparkSession) -> None:
+diff --git a/profiler/tests/engines/test_streaming.py b/profiler/tests/engines/test_streaming.py
+index cabfc51..3bc5865 100644
+--- a/profiler/tests/engines/test_streaming.py
++++ b/profiler/tests/engines/test_streaming.py
+@@ -130,6 +130,11 @@ def _comparable(profile: Profile) -> dict[str, Any]:
+ 
+ def _assert_equivalent(batch: object, stream: object, path: str = "") -> None:
+     """Asserts exact equality except for float moments (rounding) and distinct counts (sketch bound)."""
++    # Streaming checkpoints do not retain a mergeable percentile sketch. Quantiles are a
++    # batch-profiler field; all statistics supported by both engines remain equivalent.
++    if path.endswith(("numeric.quantiles", "temporal.quantiles")):
++        assert stream is None
++        return
+     if isinstance(batch, dict):
+         assert isinstance(stream, dict), path
+         assert set(batch) == set(stream), path
+diff --git a/profiler/tests/test_privacy.py b/profiler/tests/test_privacy.py
+index 495e00c..550fc8c 100644
+--- a/profiler/tests/test_privacy.py
++++ b/profiler/tests/test_privacy.py
+@@ -202,6 +202,7 @@ def numeric_column(**numeric: object) -> dict[str, Any]:
+ def test_suppressed_extremes_cover_quantiles_and_histogram_edges(
+     minimal_profile: dict[str, Any], numeric: dict[str, Any], ok: bool
+ ) -> None:
++    minimal_profile["tables"][0]["row_count"] = 60
+     minimal_profile["privacy"] = {"extremes": "suppressed"}
+     minimal_profile["tables"][0]["columns"].append(numeric_column(**numeric))
+     if ok:
+@@ -212,12 +213,22 @@ def test_suppressed_extremes_cover_quantiles_and_histogram_edges(
+ 
+ 
+ def test_extreme_quantiles_and_exact_edges_are_allowed_by_default(minimal_profile: dict[str, Any]) -> None:
++    minimal_profile["tables"][0]["row_count"] = 60
+     histogram = {"edges": [0.3, 9.7], "counts": [2]}
+     quantiles = [{"q": 0.0, "value": 0.3}, {"q": 1.0, "value": 9.7}]
+     minimal_profile["tables"][0]["columns"].append(numeric_column(quantiles=quantiles, histogram=histogram))
+     load_profile(minimal_profile)
+ 
+ 
++def test_quantiles_require_k_rows_per_grid_interval(minimal_profile: dict[str, Any]) -> None:
++    minimal_profile["privacy"] = {"min_value_count": 10, "extremes": "suppressed"}
++    minimal_profile["tables"][0]["row_count"] = 59
++    minimal_profile["tables"][0]["columns"].append(numeric_column(quantiles=[{"q": 0.5, "value": 5.0}]))
++
++    with pytest.raises(ValidationError, match="quantiles require at least 60 non-null values"):
++        load_profile(minimal_profile, strict=True)
++
++
+ @pytest.mark.parametrize(("coverage", "ok"), [(0.02, True), (0.018, False)])
+ def test_patterns_must_cover_k_rows(minimal_profile: dict[str, Any], coverage: float, ok: bool) -> None:
+     patterns = {"patterns": [{"regex": "[a-z]+", "coverage": 0.9}, {"regex": "ACME-[0-9]{4}", "coverage": coverage}]}

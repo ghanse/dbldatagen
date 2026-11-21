@@ -223,7 +223,9 @@ def _table_checks(
                 limits.noise_z,
             )
         )
-        checks.append(_dcr(truth, real, synth.select(*(identifier(n) for n in shared)), holdout, seed, config))
+        # Sample full synth rows inside `_dcr` (not a projection of `shared`) so low-cardinality shared
+        # columns do not collapse the bounded sample to distinct value tuples.
+        checks.append(_dcr(truth, real, synth, holdout, seed, config, shared=shared))
         values = [c for c in shared if c not in keys]
         checks += _partial_copy(truth.name, real, synth, holdout, values, seed, config)
     for path, category in sensitive_columns(truth).items():
@@ -357,17 +359,24 @@ def _value_leak_rate(rows: DataFrame, reference: DataFrame, path: str) -> tuple[
 
 
 def _dcr(
-    truth: Table, real: DataFrame, synth: DataFrame, holdout: DataFrame, seed: int, config: MetricsConfig
+    truth: Table,
+    real: DataFrame,
+    synth: DataFrame,
+    holdout: DataFrame,
+    seed: int,
+    config: MetricsConfig,
+    shared: Sequence[str] | None = None,
 ) -> GuardCheck:
     cap = config.sampling.privacy_rows
     real_leaves, real_frames = collect(real, truth, real.count(), cap, seed)
     synth_frame = collect(synth, truth, synth.count(), cap, seed)[1][ROW_FRAME]
     holdout_frame = collect(holdout, truth, holdout.count(), cap, seed)[1][ROW_FRAME]
     reference = real_frames[ROW_FRAME]
+    roots = set(shared) if shared is not None else None
     kinds = {
         leaf.path: _encoder_kind(leaf_kind(leaf, reference[leaf.path], config.marginal.categorical_max_distinct))
         for leaf in real_leaves
-        if leaf.frame == ROW_FRAME and leaf.path in synth_frame.columns
+        if leaf.frame == ROW_FRAME and leaf.path in synth_frame.columns and (roots is None or leaf.root in roots)
     }
     name = f"{truth.name}.dcr_ratio"
     if not kinds or min(len(reference), len(synth_frame), len(holdout_frame)) == 0:

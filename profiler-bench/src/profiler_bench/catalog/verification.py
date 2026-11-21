@@ -59,6 +59,8 @@ BOOTSTRAP_SEED = 20_261_106
 def verify(truth: Manifest, frames: Mapping[str, DataFrame], tables: Collection[str] | None = None) -> list[str]:
     """Returns every claim of `truth` that the data in `frames` does not satisfy.
 
+    A manifest with `ground_truth == "none"` claims only row counts, schemas, keys, and foreign keys.
+
     Args:
         truth: Ground-truth manifest.
         frames: DataFrames by table name, as returned by `load`.
@@ -74,7 +76,8 @@ def verify(truth: Manifest, frames: Mapping[str, DataFrame], tables: Collection[
     if session.conf.get("spark.sql.session.timeZone") not in ("UTC", "Etc/UTC", "Z"):
         raise ValueError("verify needs spark.sql.session.timeZone=UTC")
     selected = {t.name for t in truth.tables} if tables is None else set(tables)
-    failures = [f"{t.name}: {m}" for t in truth.tables if t.name in selected for m in _verify_table(t, frames[t.name])]
+    check = _verify_table if truth.ground_truth == "planted" else _verify_structure
+    failures = [f"{t.name}: {m}" for t in truth.tables if t.name in selected for m in check(t, frames[t.name])]
     for fk in (fk for fk in truth.foreign_keys if {fk.child_table, fk.parent_table} <= selected):
         label = f"{fk.child_table}{list(fk.child_columns)} -> {fk.parent_table}{list(fk.parent_columns)}"
         failures += [f"{label}: {m}" for m in _verify_foreign_key(fk, frames)]
@@ -112,6 +115,16 @@ def _verify_table(table: Table, df: DataFrame) -> list[str]:
         unique_rows = df.groupBy(*qi.columns).count().where("count = 1").count()
         failures += share(f"unique share of {list(qi.columns)}", unique_rows / max(rows, 1), qi.unique_fraction, rows)
     return failures
+
+
+def _verify_structure(table: Table, df: DataFrame) -> list[str]:
+    rows = df.count()
+    failures = [] if rows == table.row_count else [f"row count {rows} != {table.row_count}"]
+    actual = [(f.name, f.dataType.simpleString()) for f in df.schema.fields]
+    expected = [(c.name, c.type) for c in table.columns]
+    if actual != expected:
+        return [*failures, f"schema {actual} != {expected}"]
+    return failures + _verify_keys(table, df, rows)
 
 
 def storage_ordered(df: DataFrame) -> DataFrame:

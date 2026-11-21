@@ -1,0 +1,15 @@
+{
+  "targets": {
+    "datasets": [
+      "numeric",
+      "temporal",
+      "nested",
+      "edge"
+    ],
+    "metrics": [
+      "marginal",
+      "discriminator"
+    ]
+  },
+  "type": "accuracy"
+}

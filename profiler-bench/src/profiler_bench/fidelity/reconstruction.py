@@ -157,17 +157,19 @@ def _score_table(
             weights=dict(config.reconstruction_weights),
             score=0.0,
         )
-    synth_df = synth[truth.name]
+    synth_full = synth[truth.name]
     real_types = {f.name: f.dataType.simpleString() for f in real_df.schema.fields}
-    synth_types = {f.name: f.dataType.simpleString() for f in synth_df.schema.fields}
+    synth_types = {f.name: f.dataType.simpleString() for f in synth_full.schema.fields}
     good = [name for name, dtype in real_types.items() if synth_types.get(name) == dtype]
     names = set(real_types) | set(synth_types)
     schema_match = len(good) / len(names) if names else 1.0
-    synth_df = synth_df.select(*(quoted(n) for n in good))
+    # Stats/constraints need matching columns only; collect hashes full synth rows first so a partial schema
+    # match does not collapse the sample to distinct values of the surviving columns.
+    synth_df = synth_full.select(*(quoted(n) for n in good))
     synth_rows, synth_columns = _column_stats(synth_df)
     cap = config.sampling.max_rows
     real_leaves, real_frames = collect(real_df, truth, real_rows, cap, seed)
-    _, synth_frames = collect(synth_df, truth, synth_rows, cap, seed)
+    _, synth_frames = collect(synth_full, truth, synth_rows, cap, seed)
     kinds = {
         leaf.path: leaf_kind(leaf, real_frames[leaf.frame][leaf.path], config.marginal.categorical_max_distinct)
         for leaf in real_leaves

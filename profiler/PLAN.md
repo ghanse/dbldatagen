@@ -91,6 +91,9 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P1.4b | Fix sampler privacy leak: clipped-normal draws land on exact observed min/max, recreating real-unique pairs (numeric fails partial_copy_rate_excess) | P1.4, P1.6a | merged (PR #15) |
 | P1.4c | Fix sampler leak: integer discretization over-weights exact profiled extrema (nested/wide privacy fail) | P1.4b | merged (PR #19) |
 | P1.4d | Follow-ups from P1.4c review: tests should use calibrated mu/sigma for endpoint mass and discrete moments in property test | P1.4c | todo |
+| rsi-0003a | Follow-ups to rsi-0003 (after its disposition, so the benchmarked commit stays the merged one): tie the Pearson support floor to privacy.min_value_count/k instead of 3; README streaming-equivalence list names the dependency gap | rsi-0003 | todo |
+| rsi-0002b | Quantile tails + k-anonymous int histograms | rsi-0002 | ACCEPTED, merged (PR #31) |
+| rsi-0002c | Speed follow-up: rsi-0002b slowed nested@s profiling 197s -> 334s (extra histogram value-count job); fold histogram counts into the existing aggregate | rsi-0002b | todo |
 | P1.7 | RSI log tooling: append-only `log.jsonl` writer/validator + `LOG.md` renderer; `rsi/RSI.md` | P1.1 | merged (PR #4) |
 | P1.7a | Fix: `rsi_log.py append --kind` flag is dropped; add CLI-flag tests | P1.7 | merged (PR #5) |
 | P1.8 | Baseline run: freeze the harness, record the baseline + ceiling for every dataset | P1.2–P1.7 | merged (PR #25): frozen baseline; see profiler/rsi/BASELINE.md |
@@ -112,6 +115,7 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P2.3 | Configurable PII handling policy: QIs substituted by default; per sensitivity / pii_class / column actions (substitute, generalize, suppress, drop, keep) (human decision 2026-11-18; contract `.polly/contracts/p2-3-pii-policy.md`) | P2.1 | merged (PR #21) |
 
 | P2.3a | PII policy follow-ups part 1: FK full-drop with undetected side, DOB shift on original entity keys, NaN/Inf error, small-space capacity pre-check, docs | P2.3 | merged (PR #23) |
+| P2.4 | Opt-in `perturb` PII action (noise / affine) to keep Pearson correlations on sensitive numeric and temporal columns (human decision 2026-11-21) | P2.3 | in-progress (cursor) |
 | P2.3b | PII follow-ups: hidden entity-key column names must be checked case-insensitively (substitute.py ~L376-379; silent user-column loss); replace the _protect_column argument shim by updating the streaming call site | P2.3a, P3.1 | merged (PR #24) |
 
 ### Phase 3 — Streaming and data volume (human request 2026-11-18)
@@ -122,7 +126,10 @@ Status: `todo` · `in-progress` · `review` · `ready` (PR passed review, awaiti
 | P3.1a | Streaming follow-ups: wire pii_policy after P2.3; replace private imports from engines/spark and pii/detect with public helpers; cloud/DBFS checkpoint paths; avoid raw warmup rows on disk (encrypt or non-raw form) | P3.1, P2.3 | todo |
 | P3.2 | Data-volume RSI objective: least input fraction reaching a frozen accuracy target per dataset; harness-controlled FK-preserving subsets; new policy `data_volume.json` (contract `.polly/contracts/p3-2-data-volume.md`) | P1.6a, P1.8 | merged (PR #22) |
 | P3.3 | Calibrate data-volume targets T_d from the frozen baseline and run the first data-volume baseline | P1.8, P3.2 | todo |
-| P3.4 | Real public datasets, exported via the Statement Execution API (chunked ARROW_STREAM) into the gitignored cache, never committed. Measured shortlist: samples.tpcds_sf1 (~180 MB: relational, real fan-out skew, decimals, QIs), samples.wanderbricks (~20 MB: map/struct/array, emails/phones, skewed hosts->properties), Marketplace Simulated Retail (CC BY 4.0, nested + CDC; needs install), samples.nyctaxi.trips (heavy tails, dirty values), TPC-H generated locally. Skip bakehouse. Export after the P1.8 baseline finishes | P1.3 | approved: tpcds_sf1, wanderbricks, nyctaxi.trips, Simulated Retail (install); starts after P1.8 |
+| P1.5b | Benchmark change: fix project-then-sample bias in fidelity verifiers (metrics 1.9.0) | P1.5 | merged (PR #30) |
+| P1.8e | Refresh BASELINE.md under the fixed harness (metrics 1.9.0); serial run on a quiet machine | P1.5b | todo |
+| P3.4a | Benchmark change (logged as benchmark_change, never mixed with a profiler proposal): wire real datasets into fidelity/evaluate as a separate HOLDOUT suite: skip structure scoring for ground_truth none; split each export into disjoint PK-hash halves for profiled sample vs privacy holdout, and use them for the real-vs-real ceiling | P3.4 | todo |
+| P3.4 | Real public datasets, exported via the Statement Execution API (chunked ARROW_STREAM) into the gitignored cache, never committed. Measured shortlist: samples.tpcds_sf1 (~180 MB: relational, real fan-out skew, decimals, QIs), samples.wanderbricks (~20 MB: map/struct/array, emails/phones, skewed hosts->properties), Marketplace Simulated Retail (CC BY 4.0, nested + CDC; needs install), samples.nyctaxi.trips (heavy tails, dirty values), TPC-H generated locally. Skip bakehouse. Export after the P1.8 baseline finishes | P1.3 | merged (PR #27) |
 
 ### Phase 4 — Queued features (human request 2026-11-18; start after Phase 1 baseline, P2.3, P3.1, P3.2)
 

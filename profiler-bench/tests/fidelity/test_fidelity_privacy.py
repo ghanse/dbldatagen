@@ -3,6 +3,7 @@ import re
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 from pyspark.sql import DataFrame, SparkSession, Window
@@ -11,6 +12,7 @@ from pyspark.sql import functions as F
 from dbldatagen_profiler.engines.spark import profile_tables
 from dbldatagen_profiler.model import Profile
 from profiler_bench.catalog import DATASETS, load, materialize
+from profiler_bench.catalog.manifest import Column, Table
 from profiler_bench.fidelity import PrivacyScore, privacy, regex, score_privacy, stats
 from profiler_bench.fidelity.config import load_config
 
@@ -533,3 +535,37 @@ def test_generalized_sensitive_pattern_and_shared_sku_literal_pass(
     broad = _with_patterns(broad, "products", "sku", [r"[A-Z]{3}-\d{4}"])
     score = score_privacy(real, _independent(spark), broad, materialize("retail", "xs", 0).manifest)
     assert score.passed, [c for c in score.checks if not c.passed]
+
+
+def test_dcr_collects_full_synth_rows_before_projecting(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    """DCR must hash full synth rows; projecting to shared columns first reintroduces the sampling bias."""
+    n = 400
+    real_pdf = pd.DataFrame({"id": np.arange(n), "group": np.arange(n) % 4, "value": np.linspace(0, 1, n)})
+    synth_pdf = real_pdf.assign(noise=np.arange(n) * 0.01)
+    holdout_pdf = real_pdf.iloc[::-1].reset_index(drop=True)
+    truth = Table(
+        name="t",
+        row_count=n,
+        columns=(
+            Column(name="id", type="bigint", unique=True),
+            Column(name="group", type="bigint"),
+            Column(name="value", type="double"),
+        ),
+    )
+    seen: list[list[str]] = []
+    real_collect = privacy.collect
+
+    def wrapped(df: DataFrame, truth: Table | None, rows: int, cap: int, seed: int) -> object:
+        seen.append(list(df.columns))
+        return real_collect(df, truth, rows, cap, seed)
+
+    monkeypatch.setattr(privacy, "collect", wrapped)
+    real_df = spark.createDataFrame(real_pdf)
+    synth_df = spark.createDataFrame(synth_pdf)
+    holdout_df = spark.createDataFrame(holdout_pdf)
+    check = privacy._dcr(
+        truth, real_df, synth_df, holdout_df, seed=0, config=load_config(), shared=["id", "group", "value"]
+    )
+    assert check.name.endswith(".dcr_ratio")
+    # collect order: real, synth, holdout — synth must still include the non-shared column.
+    assert any("noise" in cols for cols in seen), seen

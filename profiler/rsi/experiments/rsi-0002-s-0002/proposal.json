@@ -1,0 +1,10 @@
+{
+  "proposal_id": "rsi-0002",
+  "targets": [
+    "numeric",
+    "temporal",
+    "nested",
+    "edge"
+  ],
+  "type": "accuracy"
+}

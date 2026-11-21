@@ -106,25 +106,26 @@ def materialize(
     sample = seed if sample_seed is None else sample_seed
     target = instance_dir(name, tier, seed, root, sample)
     if (target / META_FILE).exists():
-        if _is_intact(target, check_hash):
-            return _read(target)
+        if is_intact(target, check_hash):
+            return read_instance(target)
         shutil.rmtree(target)
     tables, truth = generate(get(name), tier, seed, sample)
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(dir=target.parent, prefix=".tmp-"))
     try:
-        _write(staging, tables, truth, sample)
+        write_instance(staging, tables, truth, sample)
         staging.rename(target)
     except OSError:
         shutil.rmtree(staging, ignore_errors=True)
         if not (target / META_FILE).exists():
             raise
-    return _read(target)
+    return read_instance(target)
 
 
-def _is_intact(path: Path, check_files: bool) -> bool:
+def is_intact(path: Path, check_files: bool) -> bool:
+    """Returns whether a cached instance reads back with its content hash and, with `check_files`, its table hashes."""
     try:
-        cached = _read(path)
+        cached = read_instance(path)
     except (OSError, ValueError, KeyError):
         return False
     seeds = (cached.structure_seed, cached.sample_seed)
@@ -138,7 +139,8 @@ def file_hashes(instance: Materialized) -> dict[str, str]:
     return {t.name: table_hash(instance.read_table(t.name)) for t in instance.manifest.tables}
 
 
-def _write(path: Path, tables: dict[str, pa.Table], truth: Manifest, sample_seed: int) -> None:
+def write_instance(path: Path, tables: dict[str, pa.Table], truth: Manifest, sample_seed: int) -> None:
+    """Writes `tables` as `Table.files` parquet parts each, with the manifest and the hash metadata, under `path`."""
     for spec in truth.tables:
         table, directory = tables[spec.name], path / f"{spec.name}.parquet"
         directory.mkdir()
@@ -150,12 +152,13 @@ def _write(path: Path, tables: dict[str, pa.Table], truth: Manifest, sample_seed
     seeds = {"structure_seed": truth.structure_seed, "sample_seed": sample_seed}
     meta = {"content_hash": content_hash(hashes, path / MANIFEST_FILE, *seeds.values()), **seeds, "tables": hashes}
     (path / META_FILE).write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-    written = file_hashes(_read(path))
+    written = file_hashes(read_instance(path))
     if written != hashes:
         raise RuntimeError(f"logical hashes changed on write: {sorted(t for t in hashes if hashes[t] != written[t])}")
 
 
-def _read(path: Path) -> Materialized:
+def read_instance(path: Path) -> Materialized:
+    """Returns the cached instance at `path`."""
     meta = json.loads((path / META_FILE).read_text(encoding="utf-8"))
     truth = Manifest.model_validate_json((path / MANIFEST_FILE).read_text(encoding="utf-8"))
     return Materialized(

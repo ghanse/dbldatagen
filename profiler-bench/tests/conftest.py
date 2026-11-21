@@ -31,3 +31,18 @@ def spark() -> SparkSession:
         .config("spark.ui.enabled", "false")
         .getOrCreate()
     )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers", "network: exports real data from a Databricks SQL warehouse (opt in: -m network)"
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if "network" in (config.getoption("markexpr") or ""):
+        return
+    skip = pytest.mark.skip(reason="needs a Databricks SQL warehouse; opt in with -m network")
+    for item in items:
+        if "network" in item.keywords:
+            item.add_marker(skip)
