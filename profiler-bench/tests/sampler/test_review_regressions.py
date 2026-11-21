@@ -33,7 +33,7 @@ def test_large_exact_marginals_do_not_round_through_float(spark: SparkSession) -
     integer = column(
         "big",
         LogicalType.INT64,
-        numeric=NumericStats(histogram=Histogram(edges=[str(low), str(low + 5), str(low + 10)], counts=[1, 1])),
+        numeric=NumericStats(histogram=Histogram(edges=[str(low), str(low + 5), str(low + 10)], counts=[1_500, 1_500])),
     )
     decimal = column(
         "amount",
@@ -63,7 +63,7 @@ def test_large_exact_marginals_do_not_round_through_float(spark: SparkSession) -
 
 def test_histogram_clamps_copula_probability_one(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sampler_core, "_normal_cdf", lambda values: np.ones(len(values)))
-    stats = NumericStats(histogram=Histogram(edges=[0.0, 1.0, 2.0], counts=[1, 1]))
+    stats = NumericStats(histogram=Histogram(edges=[0.0, 1.0, 2.0], counts=[50, 50]))
     table = TableProfile(
         name="t",
         row_count=100,

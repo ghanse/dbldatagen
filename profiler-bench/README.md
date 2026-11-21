@@ -330,8 +330,11 @@ The reference sampler is designed for benchmark tiers up to `s` (about 100,000 r
 harness. Each build is a git worktree plus commit; the **speed** worker imports that worktree's `profiler/src` via
 `PYTHONPATH` in a **fresh subprocess**. Speed samples time `profile_tables` (driver wall, process CPU, peak RSS)
 after an untimed warmup, rotate baseline/candidate order across cases, and record profile hashes under the policy's
-timed Spark config (unchanged by fidelity settings). Fidelity samples take one profile per build/dataset at the
-fidelity tier and score it with the reference sampler and fidelity metrics for K **paired** sampler seeds. Each
+timed Spark config (unchanged by fidelity settings). The default policy (version 1.1.0) takes N=15 speed samples per
+build and case for tiers `s` and `m`, up from N=5; this triples speed-run time. The speed baselines in
+`profiler/rsi/BASELINE.md` were measured at N=5 and must be re-measured under this policy. Fidelity samples take one
+profile per build/dataset at the fidelity tier and score it with the reference sampler and fidelity metrics for K
+**paired** sampler seeds. Each
 `(build, dataset)` cell runs in its own fidelity worker subprocess with a fresh SparkSession (profile in via file,
 score JSON out via file; all K seeds share that process; default per-cell timeout 45 minutes via
 `ExperimentConfig.fidelity_cell_timeout_s`, recorded as `fidelity_cell_timeout_s`). On timeout the parent SIGTERMs

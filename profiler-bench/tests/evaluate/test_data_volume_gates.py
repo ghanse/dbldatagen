@@ -252,6 +252,7 @@ def test_default_policy_gates_and_worker_timing_unchanged() -> None:
     assert policy["accuracy"]["min_mean_improvement"] == 0.005
     assert policy["speed"]["min_target_improvement"] == 0.05
     assert policy["fidelity_seeds"] == 5
+    assert policy["speed_samples"] == {"xs": 2, "s": 15, "m": 15}
     assert DEFAULT_FIDELITY_CELL_TIMEOUT_S == 2700.0
     bound, digest = load_f1_regression_bound()
     assert bound == 0.01
