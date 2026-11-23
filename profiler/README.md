@@ -47,6 +47,23 @@ uv run --package dbldatagen-profiler --all-extras dbldatagen-profile profile \
 The input format may be `parquet`, `csv`, or `delta`. PySpark is an optional extra; install
 `dbldatagen-profiler[spark]` when using the engine as a library.
 
+### String patterns
+
+The batch engine emits up to five `string.patterns` per string column (top-level or under structs only), with
+coverage, from one extra Spark job per table. Each value maps to a character-class signature: runs of upper case,
+lower case, and digits become `[A-Z]`, `[a-z]`, and `\d` with the shortest and longest run seen, so `ABC-1234`
+becomes `[A-Z]{3}-\d{4}`. A coarse signature that merges letters and digits (for example `[0-9a-f]{32}`) is used
+when it covers more rows. A shape is emitted only when it covers at least `min_value_count` rows and its shortest
+matches alone number at least max(`min_value_count`, 10^6) strings, so a pattern never singles out a value. Values
+longer than 256 characters or with more than 24 runs are left to the fallback.
+
+On columns detected as direct identifiers, secrets, or free text, covered by a PII policy rule, or named with a dot
+(their dotted PII path is ambiguous), and on every column when PII detection is off, patterns carry no literal
+characters: punctuation becomes `[^\w\s]`, `_` becomes `\w`, other non-ASCII characters become `.`, and
+shapes containing whitespace are skipped. Elsewhere, other characters stay literal (each occurs in every row of a
+shape with at least `min_value_count` rows), spaces are written `[ ]`, and other whitespace `\s`. Patterns use only literals, classes, `\d`/`\w`/`\s`
+and their negations, `.`, and `{m}`/`{m,n}` quantifiers. The streaming engine does not emit patterns yet.
+
 ### Streaming
 
 `dbldatagen_profiler.engines.streaming` profiles data as it arrives. Each micro-batch is reduced to a mergeable
