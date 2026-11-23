@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import ipaddress
 import json
 import math
@@ -14,7 +15,7 @@ from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from typing import Any, cast
 
-import pyarrow as pa
+import pandas as pd
 from pyspark.broadcast import Broadcast
 from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
@@ -1481,32 +1482,187 @@ def _perturb_value(  # noqa: PLR0911
     raise ValueError(f"perturb is not supported for Spark type {data_type.simpleString()!r}")
 
 
-def _arrow_type_for_spark(data_type: T.DataType) -> pa.DataType:
-    """Maps a Spark type to the Arrow type used by vectorized perturb UDFs."""
-    integral = {
-        T.ByteType: pa.int8(),
-        T.ShortType: pa.int16(),
-        T.IntegerType: pa.int32(),
-        T.LongType: pa.int64(),
-        T.FloatType: pa.float32(),
-        T.DoubleType: pa.float64(),
-        T.DateType: pa.date32(),
-        T.TimestampType: pa.timestamp("us", tz="UTC"),
+_FLOAT_NULL = "__NULL__"
+_FLOAT_NAN = "__NAN__"
+_FLOAT_INF = "__INF__"
+_FLOAT_NINF = "__NINF__"
+
+
+def _is_integral_spark_type(data_type: T.DataType) -> bool:
+    return isinstance(data_type, (T.ByteType, T.ShortType, T.IntegerType, T.LongType))
+
+
+def _is_float_spark_type(data_type: T.DataType) -> bool:
+    return isinstance(data_type, (T.FloatType, T.DoubleType))
+
+
+def _integral_bridge_type(data_type: T.DataType) -> T.DecimalType:
+    """Decimal bridge so nullable integral columns survive pandas_udf without float64 promotion."""
+    precision = {
+        T.ByteType: 3,
+        T.ShortType: 5,
+        T.IntegerType: 10,
+        T.LongType: 20,
     }
-    for kind, arrow_type in integral.items():
+    for kind, digits in precision.items():
         if isinstance(data_type, kind):
-            return arrow_type
+            return T.DecimalType(digits, 0)
+    raise ValueError(f"no integral bridge for {data_type.simpleString()!r}")
+
+
+def _pandas_cell_null(value: object) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _flag_true(value: object) -> bool:
+    """True only for an explicit boolean true (SQL null/NaN flags stay false)."""
+    if _pandas_cell_null(value):
+        return False
+    return bool(value)
+
+
+def _entity_from_pandas(value: object) -> object:
+    """Normalizes a pandas/NumPy cell back to a Python value for entity keying."""
+    if _pandas_cell_null(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    item = getattr(value, "item", None)
+    if callable(item) and not isinstance(value, (bytes, bytearray, str, Decimal)):
+        try:
+            return item()
+        except (ValueError, TypeError):
+            pass
+    return value
+
+
+def _value_from_pandas(  # noqa: PLR0911
+    value: object,
+    data_type: T.DataType,
+    *,
+    sql_null: bool | None = None,
+    sql_nan: bool | None = None,
+) -> object:
+    """Normalizes a pandas batch cell to the Python type used by scalar perturb helpers."""
+    if sql_null is True:
+        return None
+    if sql_nan is True:
+        return float("nan")
+    if _pandas_cell_null(value):
+        return None
+    if _is_integral_spark_type(data_type):
+        return int(cast(Any, value))
     if isinstance(data_type, T.DecimalType):
-        return pa.decimal128(data_type.precision, data_type.scale)
-    timestamp_ntz = getattr(T, "TimestampNTZType", None)
-    if timestamp_ntz is not None and isinstance(data_type, timestamp_ntz):
-        return pa.timestamp("us", tz=None)
-    raise ValueError(f"perturb is not supported for Spark type {data_type.simpleString()!r}")
+        return value if isinstance(value, Decimal) else Decimal(str(value))
+    if _is_float_spark_type(data_type):
+        return float(cast(Any, value))
+    if isinstance(data_type, T.DateType):
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, pd.Timestamp):
+            return value.date()
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        return date.fromisoformat(str(value))
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    return value
 
 
-def _values_to_arrow(values: list[object], data_type: T.DataType, *, template: pa.DataType | None = None) -> pa.Array:
-    """Builds an Arrow array that round-trips through a vectorized Spark UDF."""
-    return pa.array(values, type=template or _arrow_type_for_spark(data_type))
+def _encode_pandas_out(result: object, data_type: T.DataType) -> object:  # noqa: PLR0911
+    """Encodes a Python perturb result for the pandas_udf return series."""
+    if _is_float_spark_type(data_type):
+        if result is None:
+            return _FLOAT_NULL
+        number = float(cast(Any, result))
+        if math.isnan(number):
+            return _FLOAT_NAN
+        if number == float("inf"):
+            return _FLOAT_INF
+        if number == float("-inf"):
+            return _FLOAT_NINF
+        return repr(number)
+    if result is None:
+        return None
+    if _is_integral_spark_type(data_type):
+        return Decimal(int(cast(Any, result)))
+    if isinstance(data_type, T.DateType) and isinstance(result, datetime):
+        return result.date()
+    if isinstance(result, pd.Timestamp):
+        return result.to_pydatetime()
+    return result
+
+
+def _decode_pandas_out(column: Column, data_type: T.DataType) -> Column:
+    """Maps pandas_udf transport columns back to the Spark column type."""
+    if _is_integral_spark_type(data_type):
+        return column.cast(data_type)
+    if _is_float_spark_type(data_type):
+        return (
+            F.when(column == F.lit(_FLOAT_NULL), F.lit(None).cast(data_type))
+            .when(column == F.lit(_FLOAT_NAN), F.lit(float("nan")).cast(data_type))
+            .when(column == F.lit(_FLOAT_INF), F.lit(float("inf")).cast(data_type))
+            .when(column == F.lit(_FLOAT_NINF), F.lit(float("-inf")).cast(data_type))
+            .otherwise(column.cast(data_type))
+        )
+    return column
+
+
+def _pandas_return_type(data_type: T.DataType) -> T.DataType:
+    if _is_integral_spark_type(data_type):
+        return _integral_bridge_type(data_type)
+    if _is_float_spark_type(data_type):
+        return T.StringType()
+    return data_type
+
+
+def _prep_value_column(column: Column, data_type: T.DataType) -> Column:
+    if _is_integral_spark_type(data_type):
+        return column.cast(_integral_bridge_type(data_type))
+    return column
+
+
+def _make_series_pandas_udf(
+    n_entity: int, *, float_flags: bool, return_type: T.DataType, row_fn: Callable[..., object]
+) -> Callable[..., Column]:
+    """Builds a Series→Series pandas_udf with a dynamic entity arity."""
+    names = ["values"]
+    if float_flags:
+        names.extend(["is_null", "is_nan"])
+    names.extend(f"e{index}" for index in range(n_entity))
+
+    def impl(*cols: pd.Series) -> pd.Series:
+        values = cols[0]
+        offset = 1
+        is_null = is_nan = None
+        if float_flags:
+            is_null, is_nan = cols[1], cols[2]
+            offset = 3
+        entity_cols = cols[offset:]
+        out: list[object] = []
+        for index in range(len(values)):
+            null_flag = None if is_null is None else _flag_true(is_null.iloc[index])
+            nan_flag = None if is_nan is None else _flag_true(is_nan.iloc[index])
+            out.append(
+                row_fn(
+                    values.iloc[index],
+                    tuple(_entity_from_pandas(col.iloc[index]) for col in entity_cols),
+                    null_flag,
+                    nan_flag,
+                )
+            )
+        return pd.Series(out, index=values.index, dtype=object)
+
+    params = [inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=pd.Series) for name in names]
+    impl.__signature__ = inspect.Signature(params, return_annotation=pd.Series)  # type: ignore[attr-defined]
+    impl.__annotations__ = dict.fromkeys(names, pd.Series)
+    impl.__annotations__["return"] = pd.Series
+    return cast(Callable[..., Column], F.pandas_udf(return_type.simpleString())(impl))  # type: ignore[call-overload]
 
 
 def _perturb_one_noise(
@@ -1533,59 +1689,6 @@ def _perturb_one_noise(
     return _perturb_value(value, data_type, noise=noise, scale=1, shift=0, mode="noise")
 
 
-def _perturb_column_scalar(
-    column: Column,
-    *,
-    data_type: T.DataType,
-    domain: str,
-    key: bytes,
-    rule: PiiRule,
-    stddev: float,
-    entity_columns: list[str],
-    row_entity_columns: list[str],
-) -> Column:
-    """Scalar Python UDF reference used by tests to lock vectorized output."""
-    mode = rule.perturb_mode()
-    noise_ratio = rule.perturb_noise_ratio()
-    exact = _is_exact_numeric_type(data_type)
-    quantum = _exact_numeric_quantum(data_type) if exact else Decimal(1)
-    if mode == "affine":
-        affine_scale: float | Decimal
-        affine_shift: float | Decimal
-        if exact:
-            affine_scale, affine_shift = _affine_coefficients_decimal(
-                key, domain, Decimal(str(stddev)), quantum=quantum
-            )
-        else:
-            affine_scale, affine_shift = _affine_coefficients_float(key, domain, stddev)
-
-        def affine_replace(value: object) -> object:
-            return _perturb_value(value, data_type, noise=0, scale=affine_scale, shift=affine_shift, mode="affine")
-
-        return F.udf(affine_replace, data_type, useArrow=False)(column)
-
-    sigma_exact = Decimal(str(stddev)) * Decimal(str(noise_ratio)) if exact else None
-    sigma_float = None if exact else stddev * noise_ratio
-    entity_names = list(entity_columns or row_entity_columns)
-
-    def noise_replace(value: object, *entity: object) -> object:
-        return _perturb_one_noise(
-            value,
-            entity,
-            data_type=data_type,
-            domain=domain,
-            key=key,
-            sigma_exact=sigma_exact,
-            sigma_float=sigma_float,
-            quantum=quantum,
-            keyed_by_entity=bool(entity_names),
-        )
-
-    extras = [F.col(name) for name in entity_names]
-    udf = F.udf(noise_replace, data_type, useArrow=False)
-    return udf(column, *extras) if extras else udf(column)
-
-
 def _perturb_column(
     column: Column,
     *,
@@ -1597,93 +1700,65 @@ def _perturb_column(
     entity_columns: list[str],
     row_entity_columns: list[str],
 ) -> Column:
-    """Applies keyed perturb via vectorized Arrow batches (exact Decimal/int per value).
+    """Applies keyed perturb via vectorized pandas_udf batches (exact Decimal/int per value).
 
-    ``pandas_udf``/mapInPandas promote nullable longs to float64 and collapse SQL null with
-    NaN, so this uses ``arrow_udf`` to keep exact int64/Decimal math and float null vs NaN.
+    Nullable integral columns are bridged through Decimal so Arrow does not promote them to
+    float64. Float null vs NaN is transported as strings because pandas Series cannot tell them
+    apart. Identity is always keyed per entity (or per value), never by batch position.
     """
     mode = rule.perturb_mode()
     noise_ratio = rule.perturb_noise_ratio()
     exact = _is_exact_numeric_type(data_type)
     quantum = _exact_numeric_quantum(data_type) if exact else Decimal(1)
+    float_flags = _is_float_spark_type(data_type)
+    return_type = _pandas_return_type(data_type)
+    value_col = _prep_value_column(column, data_type)
+    entity_names = list(entity_columns or row_entity_columns)
+    keyed_by_entity = bool(entity_names)
+
+    def apply_row(raw: object, entity: Sequence[object], sql_null: bool | None, sql_nan: bool | None) -> object:
+        value = _value_from_pandas(raw, data_type, sql_null=sql_null, sql_nan=sql_nan)
+        if mode == "affine":
+            result = _perturb_value(value, data_type, noise=0, scale=affine_scale, shift=affine_shift, mode="affine")
+        else:
+            result = _perturb_one_noise(
+                value,
+                entity,
+                data_type=data_type,
+                domain=domain,
+                key=key,
+                sigma_exact=sigma_exact,
+                sigma_float=sigma_float,
+                quantum=quantum,
+                keyed_by_entity=keyed_by_entity,
+            )
+        return _encode_pandas_out(result, data_type)
+
+    affine_scale: float | Decimal = 1
+    affine_shift: float | Decimal = 0
+    sigma_exact: Decimal | None = None
+    sigma_float: float | None = None
     if mode == "affine":
-        affine_scale: float | Decimal
-        affine_shift: float | Decimal
         if exact:
             affine_scale, affine_shift = _affine_coefficients_decimal(
                 key, domain, Decimal(str(stddev)), quantum=quantum
             )
         else:
             affine_scale, affine_shift = _affine_coefficients_float(key, domain, stddev)
-
-        @F.arrow_udf(data_type.simpleString())  # type: ignore[call-overload]
-        def affine_batch(batches: Iterator[pa.Array]) -> Iterator[pa.Array]:
-            for arr in batches:
-                out = [
-                    _perturb_value(value, data_type, noise=0, scale=affine_scale, shift=affine_shift, mode="affine")
-                    for value in arr.to_pylist()
-                ]
-                yield _values_to_arrow(out, data_type, template=arr.type)
-
-        return cast(Column, affine_batch(column))
-
-    sigma_exact: Decimal | None = None
-    sigma_float: float | None = None
-    if exact:
+    elif exact:
         sigma_exact = Decimal(str(stddev)) * Decimal(str(noise_ratio))
     else:
         sigma_float = stddev * noise_ratio
 
-    entity_names = list(entity_columns or row_entity_columns)
-    keyed_by_entity = bool(entity_names)
-
-    if not entity_names:
-
-        @F.arrow_udf(data_type.simpleString())  # type: ignore[call-overload]
-        def noise_batch(batches: Iterator[pa.Array]) -> Iterator[pa.Array]:
-            for arr in batches:
-                out = [
-                    _perturb_one_noise(
-                        value,
-                        (),
-                        data_type=data_type,
-                        domain=domain,
-                        key=key,
-                        sigma_exact=sigma_exact,
-                        sigma_float=sigma_float,
-                        quantum=quantum,
-                        keyed_by_entity=False,
-                    )
-                    for value in arr.to_pylist()
-                ]
-                yield _values_to_arrow(out, data_type, template=arr.type)
-
-        return cast(Column, noise_batch(column))
-
-    packed = F.struct(
-        column.alias("__v"), *[F.col(name).alias(f"__e{index}") for index, name in enumerate(entity_names)]
+    udf = _make_series_pandas_udf(
+        0 if mode == "affine" else len(entity_names),
+        float_flags=float_flags,
+        return_type=return_type,
+        row_fn=apply_row,
     )
-
-    @F.arrow_udf(data_type.simpleString())  # type: ignore[call-overload]
-    def noise_entity_batch(batches: Iterator[pa.Array]) -> Iterator[pa.Array]:
-        for arr in batches:
-            value_type = arr.field("__v").type
-            values = arr.field("__v").to_pylist()
-            entity_cols = [arr.field(f"__e{index}").to_pylist() for index in range(len(entity_names))]
-            out = [
-                _perturb_one_noise(
-                    value,
-                    tuple(entity_cols[index][row] for index in range(len(entity_names))),
-                    data_type=data_type,
-                    domain=domain,
-                    key=key,
-                    sigma_exact=sigma_exact,
-                    sigma_float=sigma_float,
-                    quantum=quantum,
-                    keyed_by_entity=keyed_by_entity,
-                )
-                for row, value in enumerate(values)
-            ]
-            yield _values_to_arrow(out, data_type, template=value_type)
-
-    return cast(Column, noise_entity_batch(packed))
+    inputs: list[Column] = [value_col]
+    if float_flags:
+        inputs.extend([column.isNull(), F.isnan(column)])
+    if mode != "affine":
+        inputs.extend(F.col(name) for name in entity_names)
+    return _decode_pandas_out(udf(*inputs), data_type)

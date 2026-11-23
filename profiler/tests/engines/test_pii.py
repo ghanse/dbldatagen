@@ -1,3 +1,4 @@
+import importlib
 import ipaddress
 import json
 import math
@@ -1865,6 +1866,34 @@ def test_uniform_mod_chi_square_unbiased() -> None:
     chi_square = sum((count - expected) ** 2 / expected for count in counts)
     # df=2 critical value at p=0.001 is ~13.8; unbiased draws stay far below.
     assert chi_square < 13.8, (counts, chi_square)
+
+
+def test_perturb_path_does_not_use_arrow_udf(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    substitute_mod = importlib.import_module("dbldatagen_profiler.pii.substitute")
+    module_file = substitute_mod.__file__
+    assert module_file is not None
+    source = Path(module_file).read_text(encoding="utf-8")
+    assert "arrow_udf" not in source
+
+    def banned(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("arrow_udf must not be used by perturb")
+
+    monkeypatch.setattr(substitute_mod.F, "arrow_udf", banned, raising=False)
+    frame = spark.createDataFrame(
+        [(1, 2**63 - 11, 1.5), (2, None, None), (3, -(2**63) + 9, float("nan"))],
+        "id int, huge long, amount double",
+    )
+    profile = profile_dataframe("t", frame, detect_pii=False)
+    qi = Semantic.model_validate(_semantic("other", "quasi_identifier"))
+    profile.tables[0].columns[1] = profile.tables[0].columns[1].model_copy(update={"semantic": qi})
+    profile.tables[0].columns[2] = profile.tables[0].columns[2].model_copy(update={"semantic": qi})
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    result = substitute(
+        {"t": frame}, profile, key=b"no-arrow-key", policy=_qi_numeric_policy(mode="noise", noise_ratio=0.1)
+    )
+    rows = {row.id: row for row in result.tables["t"].collect()}
+    assert rows[2].huge is None and rows[2].amount is None
+    assert isinstance(rows[3].amount, float) and math.isnan(rows[3].amount)
 
 
 def test_perturb_vectorized_matches_scalar_reference_and_repartition(spark: SparkSession) -> None:
