@@ -12,8 +12,9 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
-from typing import Any
+from typing import Any, cast
 
+import pyarrow as pa
 from pyspark.broadcast import Broadcast
 from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
@@ -1280,6 +1281,20 @@ def _exact_numeric_quantum(data_type: T.DataType) -> Decimal:
     return Decimal(1)
 
 
+def _uniform_mod(digest: bytes, steps: int, *, salt: bytes = b"\x00tail") -> int:
+    """Returns a near-uniform residue in ``[0, steps)`` (modulo bias < 2^-64).
+
+    Drawing only ``ceil(log2(steps)/8)`` bytes makes ``raw % steps`` heavily biased when
+    ``steps`` is just below a power of two. Extra 64 bits of HMAC expansion keep the bias
+    negligible without rejection sampling.
+    """
+    if steps <= 1:
+        return 0
+    n_bytes = (steps.bit_length() + 7) // 8 + 8
+    raw = int.from_bytes(_digest_expand(digest + salt, n_bytes), "big")
+    return raw % steps
+
+
 def _gaussian_noise_decimal(digest: bytes, sigma: Decimal, *, quantum: Decimal) -> Decimal:
     """Approx N(0, sigma^2); digits below float precision are HMAC-randomized down to quantum.
 
@@ -1302,9 +1317,7 @@ def _gaussian_noise_decimal(digest: bytes, sigma: Decimal, *, quantum: Decimal) 
         steps = int((coarse_step / quantum).to_integral_value(rounding=ROUND_HALF_EVEN))
         if steps <= 1:
             return coarse_q
-        n_bytes = max(8, (steps.bit_length() + 7) // 8)
-        raw = int.from_bytes(_digest_expand(digest + b"\x00tail", n_bytes), "big")
-        centered = (raw % steps) - (steps // 2)
+        centered = _uniform_mod(digest, steps) - (steps // 2)
         return coarse_q + Decimal(centered) * quantum
 
 
@@ -1468,7 +1481,59 @@ def _perturb_value(  # noqa: PLR0911
     raise ValueError(f"perturb is not supported for Spark type {data_type.simpleString()!r}")
 
 
-def _perturb_column(
+def _arrow_type_for_spark(data_type: T.DataType) -> pa.DataType:
+    """Maps a Spark type to the Arrow type used by vectorized perturb UDFs."""
+    integral = {
+        T.ByteType: pa.int8(),
+        T.ShortType: pa.int16(),
+        T.IntegerType: pa.int32(),
+        T.LongType: pa.int64(),
+        T.FloatType: pa.float32(),
+        T.DoubleType: pa.float64(),
+        T.DateType: pa.date32(),
+        T.TimestampType: pa.timestamp("us", tz="UTC"),
+    }
+    for kind, arrow_type in integral.items():
+        if isinstance(data_type, kind):
+            return arrow_type
+    if isinstance(data_type, T.DecimalType):
+        return pa.decimal128(data_type.precision, data_type.scale)
+    timestamp_ntz = getattr(T, "TimestampNTZType", None)
+    if timestamp_ntz is not None and isinstance(data_type, timestamp_ntz):
+        return pa.timestamp("us", tz=None)
+    raise ValueError(f"perturb is not supported for Spark type {data_type.simpleString()!r}")
+
+
+def _values_to_arrow(values: list[object], data_type: T.DataType, *, template: pa.DataType | None = None) -> pa.Array:
+    """Builds an Arrow array that round-trips through a vectorized Spark UDF."""
+    return pa.array(values, type=template or _arrow_type_for_spark(data_type))
+
+
+def _perturb_one_noise(
+    value: object,
+    entity: Sequence[object],
+    *,
+    data_type: T.DataType,
+    domain: str,
+    key: bytes,
+    sigma_exact: Decimal | None,
+    sigma_float: float | None,
+    quantum: Decimal,
+    keyed_by_entity: bool,
+) -> object:
+    """Scalar noise path shared by vectorized batches (identity keyed per entity/value)."""
+    if value is None:
+        return None
+    identity = _serialize_entity_parts(entity if keyed_by_entity else (value,))
+    digest = _digest(key, f"{domain}:perturb", identity)
+    if sigma_exact is not None:
+        noise: float | Decimal = _gaussian_noise_decimal(digest, sigma_exact, quantum=quantum)
+    else:
+        noise = _gaussian_from_digest(digest) * float(sigma_float or 0.0)
+    return _perturb_value(value, data_type, noise=noise, scale=1, shift=0, mode="noise")
+
+
+def _perturb_column_scalar(
     column: Column,
     *,
     data_type: T.DataType,
@@ -1479,6 +1544,7 @@ def _perturb_column(
     entity_columns: list[str],
     row_entity_columns: list[str],
 ) -> Column:
+    """Scalar Python UDF reference used by tests to lock vectorized output."""
     mode = rule.perturb_mode()
     noise_ratio = rule.perturb_noise_ratio()
     exact = _is_exact_numeric_type(data_type)
@@ -1498,6 +1564,69 @@ def _perturb_column(
 
         return F.udf(affine_replace, data_type, useArrow=False)(column)
 
+    sigma_exact = Decimal(str(stddev)) * Decimal(str(noise_ratio)) if exact else None
+    sigma_float = None if exact else stddev * noise_ratio
+    entity_names = list(entity_columns or row_entity_columns)
+
+    def noise_replace(value: object, *entity: object) -> object:
+        return _perturb_one_noise(
+            value,
+            entity,
+            data_type=data_type,
+            domain=domain,
+            key=key,
+            sigma_exact=sigma_exact,
+            sigma_float=sigma_float,
+            quantum=quantum,
+            keyed_by_entity=bool(entity_names),
+        )
+
+    extras = [F.col(name) for name in entity_names]
+    udf = F.udf(noise_replace, data_type, useArrow=False)
+    return udf(column, *extras) if extras else udf(column)
+
+
+def _perturb_column(
+    column: Column,
+    *,
+    data_type: T.DataType,
+    domain: str,
+    key: bytes,
+    rule: PiiRule,
+    stddev: float,
+    entity_columns: list[str],
+    row_entity_columns: list[str],
+) -> Column:
+    """Applies keyed perturb via vectorized Arrow batches (exact Decimal/int per value).
+
+    ``pandas_udf``/mapInPandas promote nullable longs to float64 and collapse SQL null with
+    NaN, so this uses ``arrow_udf`` to keep exact int64/Decimal math and float null vs NaN.
+    """
+    mode = rule.perturb_mode()
+    noise_ratio = rule.perturb_noise_ratio()
+    exact = _is_exact_numeric_type(data_type)
+    quantum = _exact_numeric_quantum(data_type) if exact else Decimal(1)
+    if mode == "affine":
+        affine_scale: float | Decimal
+        affine_shift: float | Decimal
+        if exact:
+            affine_scale, affine_shift = _affine_coefficients_decimal(
+                key, domain, Decimal(str(stddev)), quantum=quantum
+            )
+        else:
+            affine_scale, affine_shift = _affine_coefficients_float(key, domain, stddev)
+
+        @F.arrow_udf(data_type.simpleString())  # type: ignore[call-overload]
+        def affine_batch(batches: Iterator[pa.Array]) -> Iterator[pa.Array]:
+            for arr in batches:
+                out = [
+                    _perturb_value(value, data_type, noise=0, scale=affine_scale, shift=affine_shift, mode="affine")
+                    for value in arr.to_pylist()
+                ]
+                yield _values_to_arrow(out, data_type, template=arr.type)
+
+        return cast(Column, affine_batch(column))
+
     sigma_exact: Decimal | None = None
     sigma_float: float | None = None
     if exact:
@@ -1505,24 +1634,56 @@ def _perturb_column(
     else:
         sigma_float = stddev * noise_ratio
 
-    def noise_replace(value: object, *entity: object) -> object:
-        if value is None:
-            return None
-        identity = (
-            _serialize_entity_parts(entity)
-            if entity_columns or row_entity_columns
-            else _serialize_entity_parts((value,))
-        )
-        digest = _digest(key, f"{domain}:perturb", identity)
-        if sigma_exact is not None:
-            noise: float | Decimal = _gaussian_noise_decimal(digest, sigma_exact, quantum=quantum)
-        else:
-            noise = _gaussian_from_digest(digest) * float(sigma_float or 0.0)
-        return _perturb_value(value, data_type, noise=noise, scale=1, shift=0, mode="noise")
+    entity_names = list(entity_columns or row_entity_columns)
+    keyed_by_entity = bool(entity_names)
 
-    extras = [F.col(name) for name in (entity_columns or row_entity_columns)]
-    return (
-        F.udf(noise_replace, data_type, useArrow=False)(column, *extras)
-        if extras
-        else F.udf(noise_replace, data_type, useArrow=False)(column)
+    if not entity_names:
+
+        @F.arrow_udf(data_type.simpleString())  # type: ignore[call-overload]
+        def noise_batch(batches: Iterator[pa.Array]) -> Iterator[pa.Array]:
+            for arr in batches:
+                out = [
+                    _perturb_one_noise(
+                        value,
+                        (),
+                        data_type=data_type,
+                        domain=domain,
+                        key=key,
+                        sigma_exact=sigma_exact,
+                        sigma_float=sigma_float,
+                        quantum=quantum,
+                        keyed_by_entity=False,
+                    )
+                    for value in arr.to_pylist()
+                ]
+                yield _values_to_arrow(out, data_type, template=arr.type)
+
+        return cast(Column, noise_batch(column))
+
+    packed = F.struct(
+        column.alias("__v"), *[F.col(name).alias(f"__e{index}") for index, name in enumerate(entity_names)]
     )
+
+    @F.arrow_udf(data_type.simpleString())  # type: ignore[call-overload]
+    def noise_entity_batch(batches: Iterator[pa.Array]) -> Iterator[pa.Array]:
+        for arr in batches:
+            value_type = arr.field("__v").type
+            values = arr.field("__v").to_pylist()
+            entity_cols = [arr.field(f"__e{index}").to_pylist() for index in range(len(entity_names))]
+            out = [
+                _perturb_one_noise(
+                    value,
+                    tuple(entity_cols[index][row] for index in range(len(entity_names))),
+                    data_type=data_type,
+                    domain=domain,
+                    key=key,
+                    sigma_exact=sigma_exact,
+                    sigma_float=sigma_float,
+                    quantum=quantum,
+                    keyed_by_entity=keyed_by_entity,
+                )
+                for row, value in enumerate(values)
+            ]
+            yield _values_to_arrow(out, data_type, template=value_type)
+
+    return cast(Column, noise_entity_batch(packed))

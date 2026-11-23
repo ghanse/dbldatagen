@@ -45,9 +45,11 @@ from dbldatagen_profiler.pii.substitute import (
     _exact_numeric_quantum,
     _gaussian_noise_decimal,
     _mapping_surrogate,
+    _perturb_one_noise,
     _perturb_stddev,
     _perturb_value,
     _serialize_entity_parts,
+    _uniform_mod,
 )
 
 
@@ -1846,6 +1848,78 @@ def test_perturb_nopk_repartition_preserves_output_multiset(spark: SparkSession)
     left = substitute({"t": frame}, profile, key=b"multiset-key", policy=policy).tables["t"]
     right = substitute({"t": frame.repartition(4)}, profile, key=b"multiset-key", policy=policy).tables["t"]
     assert sorted(row.amount for row in left.collect()) == sorted(row.amount for row in right.collect())
+
+
+def test_uniform_mod_chi_square_unbiased() -> None:
+    # Awkward modulus just below 2^62: without +64 HMAC bits, residues in the first two
+    # thirds of the range are ~1.5x more likely than the last third.
+    steps = 3 * (2**61)
+    third = 2**61
+    draws = 6_000
+    counts = [0, 0, 0]
+    for index in range(draws):
+        digest = _digest(b"mod-bias-key", "tail-uniform", str(index))
+        bucket = _uniform_mod(digest, steps) // third
+        counts[bucket] += 1
+    expected = draws / 3
+    chi_square = sum((count - expected) ** 2 / expected for count in counts)
+    # df=2 critical value at p=0.001 is ~13.8; unbiased draws stay far below.
+    assert chi_square < 13.8, (counts, chi_square)
+
+
+def test_perturb_vectorized_matches_scalar_reference_and_repartition(spark: SparkSession) -> None:
+    rows = [
+        (1, 2**63 - 17, Decimal("123456789012345678.1234567890")),
+        (2, None, None),
+        (3, -(2**63) + 19, Decimal("-987654321098765432.0987654321")),
+        (4, 2**62 + 3, Decimal("0.0000000001")),
+    ]
+    frame = spark.createDataFrame(rows, "id int, huge long, amount decimal(38,10)")
+    profile = profile_dataframe("t", frame, detect_pii=False)
+    qi = Semantic.model_validate(_semantic("other", "quasi_identifier"))
+    profile.tables[0].columns[1] = profile.tables[0].columns[1].model_copy(update={"semantic": qi})
+    profile.tables[0].columns[2] = profile.tables[0].columns[2].model_copy(update={"semantic": qi})
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    policy = _qi_numeric_policy(mode="noise", noise_ratio=0.2)
+    key = b"vectorized-scalar-key"
+
+    vector_left = substitute({"t": frame.repartition(1)}, profile, key=key, policy=policy).tables["t"].orderBy("id")
+    vector_right = substitute({"t": frame.repartition(4)}, profile, key=key, policy=policy).tables["t"].orderBy("id")
+    vector_rows = {row.id: row for row in vector_left.collect()}
+    right_rows = {row.id: row for row in vector_right.collect()}
+    assert sorted(vector_rows) == sorted(right_rows)
+    for row_id, left in vector_rows.items():
+        assert right_rows[row_id].huge == left.huge
+        assert right_rows[row_id].amount == left.amount
+
+    # Scalar reference: same per-entity helpers the vectorized batches call (not batch position).
+    std_huge = _perturb_stddev(frame, "huge", frame.schema["huge"].dataType)
+    std_amount = _perturb_stddev(frame, "amount", frame.schema["amount"].dataType)
+    huge_type = frame.schema["huge"].dataType
+    amount_type = frame.schema["amount"].dataType
+    for row_id, huge, amount in rows:
+        assert vector_rows[row_id].huge == _perturb_one_noise(
+            huge,
+            (row_id,),
+            data_type=huge_type,
+            domain="t.huge",
+            key=key,
+            sigma_exact=Decimal(str(std_huge)) * Decimal("0.2"),
+            sigma_float=None,
+            quantum=_exact_numeric_quantum(huge_type),
+            keyed_by_entity=True,
+        )
+        assert vector_rows[row_id].amount == _perturb_one_noise(
+            amount,
+            (row_id,),
+            data_type=amount_type,
+            domain="t.amount",
+            key=key,
+            sigma_exact=Decimal(str(std_amount)) * Decimal("0.2"),
+            sigma_float=None,
+            quantum=_exact_numeric_quantum(amount_type),
+            keyed_by_entity=True,
+        )
 
 
 def test_no_policy_profile_output_is_stable(spark: SparkSession) -> None:
