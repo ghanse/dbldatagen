@@ -281,14 +281,15 @@ def _protect_column(
             pii_policy is not None
             and semantic.sensitivity.value in {"direct_identifier", "secret"}
             and rule is not None
-            and rule.action == PiiAction.KEEP
+            and rule.action in {PiiAction.KEEP, PiiAction.PERTURB}
         ):
             raise ValueError(f"PII policy cannot loosen the spec 0.2.0 privacy floor for {reference!r}")
+        # Perturb is substitution-time only; profile-time statistics stay on the given data (like keep).
         protect = semantic.sensitivity.value in {"direct_identifier", "secret"} or (
-            rule is not None and not low_confidence and rule.action != PiiAction.KEEP
+            rule is not None and not low_confidence and rule.action not in {PiiAction.KEEP, PiiAction.PERTURB}
         )
     else:
-        protect = rule is not None and rule.action != PiiAction.KEEP
+        protect = rule is not None and rule.action not in {PiiAction.KEEP, PiiAction.PERTURB}
     if protect:
         if column.numeric is not None:
             updates["numeric"] = column.numeric.model_copy(

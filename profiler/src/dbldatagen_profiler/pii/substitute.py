@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import ipaddress
+import json
 import math
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from decimal import Decimal
-from typing import Any
+from decimal import ROUND_HALF_EVEN, Decimal, localcontext
+from typing import Any, cast
 
+import pandas as pd
 from pyspark.broadcast import Broadcast
 from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
@@ -20,7 +23,12 @@ from pyspark.sql import types as T
 from pyspark.sql.window import Window
 
 from dbldatagen_profiler.model import ColumnProfile, PiiClass, Profile, Semantic, Sensitivity
-from dbldatagen_profiler.pii.policy import PiiAction, PiiPolicy, PiiRule
+from dbldatagen_profiler.pii.policy import (
+    PiiAction,
+    PiiPolicy,
+    PiiRule,
+    expected_correlation_attenuation,
+)
 
 
 MAX_NESTED_BROADCAST_VALUES = 100_000
@@ -69,6 +77,7 @@ def substitute(  # noqa: PLR0912, PLR0915
     domains = _domains(profile, opts)
     decisions = _decisions(profile, handling, opts)
     decisions = _domain_decisions(domains, decisions)
+    _validate_perturb_decisions(profile, tables, domains, decisions)
     domain_semantics: dict[str, Semantic] = {}
     for table_name, path, column in _profile_columns(profile):
         decision = decisions.get(f"{table_name}.{path}")
@@ -108,6 +117,13 @@ def substitute(  # noqa: PLR0912, PLR0915
         entity_keys = _capture_entity_keys(result, entity_columns)
         for entity_column, hidden in entity_keys.items():
             result = result.withColumn(hidden, F.col(entity_column))
+        row_entity = (
+            _capture_row_entity(result, frame.columns)
+            if not entity_columns and _table_has_perturb(table_name, frame.columns, decisions)
+            else {}
+        )
+        for hidden, expression in row_entity.items():
+            result = result.withColumn(hidden, expression)
         ordered_names = sorted(
             frame.columns,
             key=lambda name: _is_drop(decisions.get(f"{table_name}.{name}")),
@@ -146,6 +162,26 @@ def substitute(  # noqa: PLR0912, PLR0915
                 )
             elif rule.action == PiiAction.GENERALIZE:
                 result = result.withColumn(name, _generalize(F.col(name), rule.parameters, frame.schema[name].dataType))
+                count = frame.where(F.col(name).isNotNull()).count()
+                reports.append(
+                    _report(table_name, name, current_semantic, domains[reference], count, 0, rule, rule_source)
+                )
+            elif rule.action == PiiAction.PERTURB:
+                data_type = frame.schema[name].dataType
+                stddev = _perturb_stddev(frame, name, data_type)
+                result = result.withColumn(
+                    name,
+                    _perturb_column(
+                        F.col(name),
+                        data_type=data_type,
+                        domain=domains[reference],
+                        key=key,
+                        rule=rule,
+                        stddev=stddev,
+                        entity_columns=[entity_keys[item] for item in entity_columns],
+                        row_entity_columns=list(row_entity),
+                    ),
+                )
                 count = frame.where(F.col(name).isNotNull()).count()
                 reports.append(
                     _report(table_name, name, current_semantic, domains[reference], count, 0, rule, rule_source)
@@ -252,7 +288,7 @@ def substitute(  # noqa: PLR0912, PLR0915
                         ),
                     }
                 )
-        output[table_name] = result.drop(*entity_keys.values())
+        output[table_name] = result.drop(*entity_keys.values(), *row_entity)
     return SubstitutionResult(tables=output, report={"columns": reports})
 
 
@@ -330,9 +366,10 @@ def _domain_decisions(
     rank = {
         PiiAction.KEEP: 0,
         PiiAction.GENERALIZE: 1,
-        PiiAction.SUBSTITUTE: 2,
-        PiiAction.SUPPRESS: 3,
-        PiiAction.DROP: 4,
+        PiiAction.PERTURB: 2,
+        PiiAction.SUBSTITUTE: 3,
+        PiiAction.SUPPRESS: 4,
+        PiiAction.DROP: 5,
     }
     resolved = dict(decisions)
     for members in by_domain.values():
@@ -784,6 +821,11 @@ def _nested_policy_udf(
                 return None
             if rule.action == PiiAction.GENERALIZE:
                 return _generalize_nested(value, rule.parameters)
+            if rule.action == PiiAction.PERTURB:
+                raise ValueError(
+                    f"perturb is not supported for nested path {'.'.join(path)!r}; "
+                    "perturb only applies to top-level numeric and temporal columns"
+                )
             if semantic is None:
                 raise ValueError(f"substitute rule for nested path {'.'.join(path)!r} has no PII class")
             if str(value) == "":
@@ -1042,6 +1084,11 @@ def _report(
     rule_source: str,
 ) -> dict[str, Any]:
     source, separator, winner = rule_source.partition(":")
+    parameters = dict(rule.parameters)
+    if rule.action == PiiAction.PERTURB:
+        parameters.setdefault("mode", rule.perturb_mode())
+        if rule.perturb_mode() == "noise":
+            parameters.setdefault("noise_ratio", rule.perturb_noise_ratio())
     report: dict[str, Any] = {
         "table": table,
         "column": column,
@@ -1049,9 +1096,10 @@ def _report(
         "domain": domain,
         "rule_source": source,
         "action": rule.action.value,
-        "parameters": rule.parameters,
+        "parameters": parameters,
         "values_affected": count,
         "values_substituted": count if rule.action == PiiAction.SUBSTITUTE else 0,
+        "values_perturbed": count if rule.action == PiiAction.PERTURB else 0,
         "collisions_resolved": collisions,
         "generalizations": (
             [rule.parameters["method"]]
@@ -1059,6 +1107,658 @@ def _report(
             else ([rule.parameters] if rule.action == PiiAction.GENERALIZE else [])
         ),
     }
+    if rule.action == PiiAction.PERTURB:
+        report["mode"] = rule.perturb_mode()
+        report["expected_correlation_attenuation"] = expected_correlation_attenuation(rule)
+        report["equality_preserved"] = False
     if separator:
         report["winning_column"] = winner
     return report
+
+
+def _table_has_perturb(table_name: str, columns: list[str], decisions: dict[str, tuple[PiiRule, str]]) -> bool:
+    return any(
+        decisions.get(f"{table_name}.{name}", (PiiRule(action=PiiAction.KEEP), "default"))[0].action
+        == PiiAction.PERTURB
+        for name in columns
+    )
+
+
+def _capture_row_entity(frame: DataFrame, columns: list[str]) -> dict[str, Column]:
+    """Builds deterministic row-identity columns when no primary key is available."""
+    used = {name.lower() for name in frame.columns}
+    hash_name = "__pii_row_hash"
+    while hash_name.lower() in used:
+        hash_name = f"_{hash_name}"
+    used.add(hash_name.lower())
+    occ_name = "__pii_row_occ"
+    while occ_name.lower() in used:
+        occ_name = f"_{occ_name}"
+    parts = [F.coalesce(F.col(name).cast("string"), F.lit("\0")) for name in columns]
+    row_hash = F.xxhash64(*parts) if parts else F.lit(0)
+    occurrence = F.row_number().over(Window.partitionBy(row_hash).orderBy(F.monotonically_increasing_id()))
+    return {hash_name: row_hash, occ_name: occurrence}
+
+
+def _key_column_names(profile: Profile, table_name: str) -> set[str]:
+    table = next(item for item in profile.tables if item.name == table_name)
+    names = set(table.primary_key.columns if table.primary_key is not None else [])
+    for key in table.unique_keys or []:
+        names.update(key.columns)
+    return names
+
+
+def _validate_perturb_decisions(
+    profile: Profile,
+    tables: dict[str, DataFrame],
+    domains: dict[str, str],
+    decisions: dict[str, tuple[PiiRule, str]],
+) -> None:
+    key_references = {
+        f"{table.name}.{column}" for table in profile.tables for column in _key_column_names(profile, table.name)
+    }
+    domain_members: dict[str, list[str]] = {}
+    for reference, domain in domains.items():
+        domain_members.setdefault(domain, []).append(reference)
+    for reference, (rule, _) in decisions.items():
+        if rule.action != PiiAction.PERTURB:
+            continue
+        table_name, path = reference.split(".", maxsplit=1)
+        if "." in path:
+            raise ValueError(
+                f"perturb is not supported for nested column {reference!r}; "
+                "perturb only applies to top-level numeric and temporal columns"
+            )
+        frame = tables[table_name]
+        if path not in frame.columns:
+            raise ValueError(f"perturb column {reference!r} is absent from the input table")
+        column = next(col for t, p, col in _profile_columns(profile) if t == table_name and p == path)
+        semantic = column.semantic
+        if semantic is not None and semantic.sensitivity in {
+            Sensitivity.DIRECT_IDENTIFIER,
+            Sensitivity.SECRET,
+            Sensitivity.FREE_TEXT,
+        }:
+            raise ValueError(
+                f"perturb is not allowed for {semantic.sensitivity.value} column {reference!r}; "
+                "use it only on quasi_identifier columns or explicit column rules for undetected columns"
+            )
+        members = domain_members[domains[reference]]
+        if len(members) > 1:
+            raise ValueError(
+                f"perturb is not allowed on FK-linked column {reference!r}; "
+                "perturb cannot be applied to any column in an FK-linked substitution domain"
+            )
+        if reference in key_references:
+            raise ValueError(
+                f"perturb is not allowed on key column {reference!r}; "
+                "perturb cannot be applied to primary keys or unique keys"
+            )
+        data_type = frame.schema[path].dataType
+        if not _is_perturbable_type(data_type):
+            raise ValueError(
+                f"perturb is not supported for Spark type {data_type.simpleString()!r} on {reference!r}; "
+                "allowed types are numeric, date, timestamp, and timestamp_ntz"
+            )
+
+
+def _is_perturbable_type(data_type: T.DataType) -> bool:
+    if isinstance(
+        data_type,
+        (
+            T.ByteType,
+            T.ShortType,
+            T.IntegerType,
+            T.LongType,
+            T.FloatType,
+            T.DoubleType,
+            T.DecimalType,
+            T.DateType,
+            T.TimestampType,
+        ),
+    ):
+        return True
+    timestamp_ntz = getattr(T, "TimestampNTZType", None)
+    return timestamp_ntz is not None and isinstance(data_type, timestamp_ntz)
+
+
+def _is_exact_numeric_type(data_type: T.DataType) -> bool:
+    return isinstance(data_type, (T.ByteType, T.ShortType, T.IntegerType, T.LongType, T.DecimalType))
+
+
+def _perturb_numeric_expression(column: Column, data_type: T.DataType) -> Column:
+    if isinstance(data_type, T.DateType):
+        return F.datediff(column, F.lit(date(1970, 1, 1)).cast("date")).cast("double")
+    if isinstance(data_type, T.TimestampType):
+        return column.cast("double")
+    timestamp_ntz = getattr(T, "TimestampNTZType", None)
+    if timestamp_ntz is not None and isinstance(data_type, timestamp_ntz):
+        # TIMESTAMP_NTZ cannot cast directly to double; go through timestamp first.
+        return column.cast("timestamp").cast("double")
+    return column.cast("double")
+
+
+def _perturb_stddev(frame: DataFrame, name: str, data_type: T.DataType) -> float:
+    """Population stddev via Spark aggregates (double; scales sigma only, so approx is fine)."""
+    numeric = _perturb_numeric_expression(F.col(name), data_type)
+    if isinstance(data_type, (T.FloatType, T.DoubleType)):
+        numeric = F.when(F.isnan(name) | (F.abs(F.col(name)) == F.lit(float("inf"))), F.lit(None)).otherwise(numeric)
+    stats = frame.select(F.stddev_pop(numeric).alias("std")).first()
+    if stats is None or stats["std"] is None:
+        return 0.0
+    return float(stats["std"])
+
+
+def _unit_from_digest(digest: bytes, offset: int = 0) -> float:
+    """Maps 8 digest bytes to a uniform open unit interval (0, 1)."""
+    chunk = digest[offset : offset + 8]
+    if len(chunk) < 8:
+        chunk = (chunk + digest)[:8]
+    value = int.from_bytes(chunk, "big") % (2**53 - 1) + 1
+    return value / 2**53
+
+
+def _gaussian_from_digest(digest: bytes) -> float:
+    """Returns a deterministic standard-normal sample via Box-Muller."""
+    u1 = _unit_from_digest(digest, 0)
+    u2 = _unit_from_digest(digest, 8)
+    return math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+
+
+def _digest_expand(seed: bytes, nbytes: int) -> bytes:
+    """Deterministically expands a seed into nbytes via SHA-256 counter mode."""
+    out = bytearray()
+    counter = 0
+    while len(out) < nbytes:
+        out.extend(hashlib.sha256(seed + counter.to_bytes(4, "big")).digest())
+        counter += 1
+    return bytes(out[:nbytes])
+
+
+def _exact_numeric_quantum(data_type: T.DataType) -> Decimal:
+    """Returns the column quantum for exact integer/decimal types."""
+    if isinstance(data_type, T.DecimalType):
+        return Decimal(1).scaleb(-data_type.scale)
+    return Decimal(1)
+
+
+def _uniform_mod(digest: bytes, steps: int, *, salt: bytes = b"\x00tail") -> int:
+    """Returns a near-uniform residue in ``[0, steps)`` (modulo bias < 2^-64).
+
+    Drawing only ``ceil(log2(steps)/8)`` bytes makes ``raw % steps`` heavily biased when
+    ``steps`` is just below a power of two. Extra 64 bits of HMAC expansion keep the bias
+    negligible without rejection sampling.
+    """
+    if steps <= 1:
+        return 0
+    n_bytes = (steps.bit_length() + 7) // 8 + 8
+    raw = int.from_bytes(_digest_expand(digest + salt, n_bytes), "big")
+    return raw % steps
+
+
+def _gaussian_noise_decimal(digest: bytes, sigma: Decimal, *, quantum: Decimal) -> Decimal:
+    """Approx N(0, sigma^2); digits below float precision are HMAC-randomized down to quantum.
+
+    Float Box-Muller only yields ~53 bits. For large sigma that leaves low-order digits of
+    ``value + noise`` unchanged (a leak). Keep the float gaussian for the high significand,
+    then draw the unresolved lower digits uniformly from expanded HMAC bytes.
+    """
+    if sigma == 0 or quantum <= 0:
+        return Decimal(0)
+    z = _gaussian_from_digest(digest)
+    with localcontext() as context:
+        context.prec = max(50, abs(sigma).adjusted() - quantum.adjusted() + 40)
+        context.rounding = ROUND_HALF_EVEN
+        coarse = Decimal(str(z)) * sigma
+        ref = abs(coarse) if coarse != 0 else abs(sigma)
+        # Trust ~15 significant digits from the float draw; randomize everything finer.
+        trusted_place = ref.adjusted() - 14
+        coarse_step = max(Decimal(1).scaleb(trusted_place), quantum)
+        coarse_q = (coarse / coarse_step).to_integral_value(rounding=ROUND_HALF_EVEN) * coarse_step
+        steps = int((coarse_step / quantum).to_integral_value(rounding=ROUND_HALF_EVEN))
+        if steps <= 1:
+            return coarse_q
+        centered = _uniform_mod(digest, steps) - (steps // 2)
+        return coarse_q + Decimal(centered) * quantum
+
+
+_AFFINE_SCALE_DENOMINATOR = 1000
+
+
+def _affine_coefficients_float(key: bytes, domain: str, stddev: float) -> tuple[float, float]:
+    digest = _digest(key, f"{domain}:affine", "coefficients")
+    unit = _unit_from_digest(digest, 0)
+    scale = 0.5 + 1.5 * unit
+    shift = _gaussian_from_digest(digest[8:] + digest[:8]) * stddev
+    return scale, shift
+
+
+def _affine_coefficients_decimal(
+    key: bytes, domain: str, stddev: Decimal, *, quantum: Decimal
+) -> tuple[Decimal, Decimal]:
+    """Returns (a, b) with a = p/1000 in [0.5, 2.0] and b = z * stddev in high-precision Decimal."""
+    digest = _digest(key, f"{domain}:affine", "coefficients")
+    # Inclusive range 500/1000 .. 2000/1000 => 1501 distinct rationals.
+    index = int.from_bytes(digest[:8], "big") % 1501
+    scale = (Decimal(500) + Decimal(index)) / Decimal(_AFFINE_SCALE_DENOMINATOR)
+    shift_digest = digest[8:] + digest[:8]
+    shift = _gaussian_noise_decimal(shift_digest, stddev, quantum=quantum)
+    return scale, shift
+
+
+def _integer_bounds(data_type: T.DataType) -> tuple[int, int] | None:
+    bounds = {
+        T.ByteType: (-(2**7), 2**7 - 1),
+        T.ShortType: (-(2**15), 2**15 - 1),
+        T.IntegerType: (-(2**31), 2**31 - 1),
+        T.LongType: (-(2**63), 2**63 - 1),
+    }
+    for kind, span in bounds.items():
+        if isinstance(data_type, kind):
+            return span
+    return None
+
+
+def _decimal_bounds(data_type: T.DecimalType) -> tuple[Decimal, Decimal]:
+    with localcontext() as context:
+        context.prec = max(data_type.precision + 8, 50)
+        quantum = Decimal(1).scaleb(-data_type.scale)
+        maximum = (Decimal(10) ** (data_type.precision - data_type.scale)) - quantum
+        return -maximum, maximum
+
+
+def _clamp_integer(value: int, data_type: T.DataType) -> int:
+    bounds = _integer_bounds(data_type)
+    if bounds is None:
+        return value
+    minimum, maximum = bounds
+    return minimum if value < minimum else maximum if value > maximum else value
+
+
+def _clamp_decimal(value: Decimal, data_type: T.DecimalType) -> Decimal:
+    """Clamps via the unscaled integer domain so Spark accepts the Decimal(p,s) encoding."""
+    minimum, maximum = _decimal_bounds(data_type)
+    with localcontext() as context:
+        context.prec = max(data_type.precision + 8, 50)
+        context.rounding = ROUND_HALF_EVEN
+        if value > maximum:
+            value = maximum
+        elif value < minimum:
+            value = minimum
+        scale_factor = Decimal(10) ** data_type.scale
+        unscaled = int((value * scale_factor).to_integral_value(rounding=ROUND_HALF_EVEN))
+        limit = 10**data_type.precision - 1
+        if unscaled > limit:
+            unscaled = limit
+        elif unscaled < -limit:
+            unscaled = -limit
+        # scaleb avoids Decimal division rounding at default/low precision.
+        return Decimal(unscaled).scaleb(-data_type.scale)
+
+
+def _serialize_entity_parts(parts: Sequence[object]) -> str:
+    """Serializes entity-key parts so nulls and embedded separators cannot collide."""
+
+    def encode(value: object) -> object:  # noqa: PLR0911
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, float):
+            if math.isnan(value) or math.isinf(value):
+                return {"float": str(value)}
+            return value
+        if isinstance(value, Decimal):
+            return {"decimal": str(value)}
+        if isinstance(value, datetime):
+            return {"datetime": value.isoformat()}
+        if isinstance(value, date):
+            return {"date": value.isoformat()}
+        if isinstance(value, (bytes, bytearray)):
+            return {"bytes": bytes(value).hex()}
+        return {"string": str(value)}
+
+    return json.dumps([encode(part) for part in parts], separators=(",", ":"), ensure_ascii=False)
+
+
+def _perturb_value(  # noqa: PLR0911
+    value: object,
+    data_type: T.DataType,
+    *,
+    noise: float | Decimal,
+    scale: float | Decimal,
+    shift: float | Decimal,
+    mode: str,
+) -> object:
+    if value is None:
+        return None
+    if isinstance(data_type, (T.FloatType, T.DoubleType)):
+        number = float(str(value)) if not isinstance(value, (int, float)) else float(value)
+        if math.isnan(number) or math.isinf(number):
+            return number
+        scale_f, shift_f, noise_f = float(scale), float(shift), float(noise)
+        perturbed = scale_f * number + shift_f if mode == "affine" else number + noise_f
+        return float(perturbed)
+    if isinstance(data_type, T.DecimalType):
+        amount = value if isinstance(value, Decimal) else Decimal(str(value))
+        scale_d = scale if isinstance(scale, Decimal) else Decimal(str(scale))
+        shift_d = shift if isinstance(shift, Decimal) else Decimal(str(shift))
+        noise_d = noise if isinstance(noise, Decimal) else Decimal(str(noise))
+        with localcontext() as context:
+            context.prec = max(data_type.precision + 16, 50)
+            context.rounding = ROUND_HALF_EVEN
+            decimal_result = amount * scale_d + shift_d if mode == "affine" else amount + noise_d
+        return _clamp_decimal(decimal_result, data_type)
+    if isinstance(data_type, (T.ByteType, T.ShortType, T.IntegerType, T.LongType)):
+        number = int(str(value)) if not isinstance(value, int) else value
+        scale_d = scale if isinstance(scale, Decimal) else Decimal(str(scale))
+        shift_d = shift if isinstance(shift, Decimal) else Decimal(str(shift))
+        noise_d = noise if isinstance(noise, Decimal) else Decimal(str(noise))
+        with localcontext() as context:
+            context.prec = 50
+            context.rounding = ROUND_HALF_EVEN
+            exact = Decimal(number) * scale_d + shift_d if mode == "affine" else Decimal(number) + noise_d
+            integer_result = int(exact.to_integral_value(rounding=ROUND_HALF_EVEN))
+        return _clamp_integer(integer_result, data_type)
+    if isinstance(data_type, T.DateType):
+        current = (
+            value if isinstance(value, date) and not isinstance(value, datetime) else date.fromisoformat(str(value))
+        )
+        epoch = date(1970, 1, 1)
+        days = (current - epoch).days
+        scale_f, shift_f, noise_f = float(scale), float(shift), float(noise)
+        mapped_days = round(scale_f * days + shift_f) if mode == "affine" else days + round(noise_f)
+        return epoch + timedelta(days=mapped_days)
+    timestamp_ntz = getattr(T, "TimestampNTZType", None)
+    if isinstance(data_type, T.TimestampType) or (timestamp_ntz is not None and isinstance(data_type, timestamp_ntz)):
+        current = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+        epoch = datetime(1970, 1, 1, tzinfo=current.tzinfo) if current.tzinfo is not None else datetime(1970, 1, 1)
+        seconds = (current - epoch).total_seconds()
+        scale_f, shift_f, noise_f = float(scale), float(shift), float(noise)
+        mapped_seconds = scale_f * seconds + shift_f if mode == "affine" else seconds + noise_f
+        return epoch + timedelta(seconds=float(mapped_seconds))
+    raise ValueError(f"perturb is not supported for Spark type {data_type.simpleString()!r}")
+
+
+_FLOAT_NULL = "__NULL__"
+_FLOAT_NAN = "__NAN__"
+_FLOAT_INF = "__INF__"
+_FLOAT_NINF = "__NINF__"
+
+
+def _is_integral_spark_type(data_type: T.DataType) -> bool:
+    return isinstance(data_type, (T.ByteType, T.ShortType, T.IntegerType, T.LongType))
+
+
+def _is_float_spark_type(data_type: T.DataType) -> bool:
+    return isinstance(data_type, (T.FloatType, T.DoubleType))
+
+
+def _integral_bridge_type(data_type: T.DataType) -> T.DecimalType:
+    """Decimal bridge so nullable integral columns survive pandas_udf without float64 promotion."""
+    precision = {
+        T.ByteType: 3,
+        T.ShortType: 5,
+        T.IntegerType: 10,
+        T.LongType: 20,
+    }
+    for kind, digits in precision.items():
+        if isinstance(data_type, kind):
+            return T.DecimalType(digits, 0)
+    raise ValueError(f"no integral bridge for {data_type.simpleString()!r}")
+
+
+def _pandas_cell_null(value: object) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _flag_true(value: object) -> bool:
+    """True only for an explicit boolean true (SQL null/NaN flags stay false)."""
+    if _pandas_cell_null(value):
+        return False
+    return bool(value)
+
+
+def _entity_from_pandas(value: object) -> object:
+    """Normalizes a pandas/NumPy cell back to a Python value for entity keying."""
+    if _pandas_cell_null(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    item = getattr(value, "item", None)
+    if callable(item) and not isinstance(value, (bytes, bytearray, str, Decimal)):
+        try:
+            return item()
+        except (ValueError, TypeError):
+            pass
+    return value
+
+
+def _value_from_pandas(  # noqa: PLR0911
+    value: object,
+    data_type: T.DataType,
+    *,
+    sql_null: bool | None = None,
+    sql_nan: bool | None = None,
+) -> object:
+    """Normalizes a pandas batch cell to the Python type used by scalar perturb helpers."""
+    if sql_null is True:
+        return None
+    if sql_nan is True:
+        return float("nan")
+    if _pandas_cell_null(value):
+        return None
+    if _is_integral_spark_type(data_type):
+        return int(cast(Any, value))
+    if isinstance(data_type, T.DecimalType):
+        return value if isinstance(value, Decimal) else Decimal(str(value))
+    if _is_float_spark_type(data_type):
+        return float(cast(Any, value))
+    if isinstance(data_type, T.DateType):
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, pd.Timestamp):
+            return value.date()
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        return date.fromisoformat(str(value))
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    return value
+
+
+def _encode_pandas_out(result: object, data_type: T.DataType) -> object:  # noqa: PLR0911
+    """Encodes a Python perturb result for the pandas_udf return series."""
+    if _is_float_spark_type(data_type):
+        if result is None:
+            return _FLOAT_NULL
+        number = float(cast(Any, result))
+        if math.isnan(number):
+            return _FLOAT_NAN
+        if number == float("inf"):
+            return _FLOAT_INF
+        if number == float("-inf"):
+            return _FLOAT_NINF
+        return repr(number)
+    if result is None:
+        return None
+    if _is_integral_spark_type(data_type):
+        return Decimal(int(cast(Any, result)))
+    if isinstance(data_type, T.DateType) and isinstance(result, datetime):
+        return result.date()
+    if isinstance(result, pd.Timestamp):
+        return result.to_pydatetime()
+    return result
+
+
+def _decode_pandas_out(column: Column, data_type: T.DataType) -> Column:
+    """Maps pandas_udf transport columns back to the Spark column type."""
+    if _is_integral_spark_type(data_type):
+        return column.cast(data_type)
+    if _is_float_spark_type(data_type):
+        return (
+            F.when(column == F.lit(_FLOAT_NULL), F.lit(None).cast(data_type))
+            .when(column == F.lit(_FLOAT_NAN), F.lit(float("nan")).cast(data_type))
+            .when(column == F.lit(_FLOAT_INF), F.lit(float("inf")).cast(data_type))
+            .when(column == F.lit(_FLOAT_NINF), F.lit(float("-inf")).cast(data_type))
+            .otherwise(column.cast(data_type))
+        )
+    return column
+
+
+def _pandas_return_type(data_type: T.DataType) -> T.DataType:
+    if _is_integral_spark_type(data_type):
+        return _integral_bridge_type(data_type)
+    if _is_float_spark_type(data_type):
+        return T.StringType()
+    return data_type
+
+
+def _prep_value_column(column: Column, data_type: T.DataType) -> Column:
+    if _is_integral_spark_type(data_type):
+        return column.cast(_integral_bridge_type(data_type))
+    return column
+
+
+def _make_series_pandas_udf(
+    n_entity: int, *, float_flags: bool, return_type: T.DataType, row_fn: Callable[..., object]
+) -> Callable[..., Column]:
+    """Builds a Series→Series pandas_udf with a dynamic entity arity."""
+    names = ["values"]
+    if float_flags:
+        names.extend(["is_null", "is_nan"])
+    names.extend(f"e{index}" for index in range(n_entity))
+
+    def impl(*cols: pd.Series) -> pd.Series:
+        values = cols[0]
+        offset = 1
+        is_null = is_nan = None
+        if float_flags:
+            is_null, is_nan = cols[1], cols[2]
+            offset = 3
+        entity_cols = cols[offset:]
+        out: list[object] = []
+        for index in range(len(values)):
+            null_flag = None if is_null is None else _flag_true(is_null.iloc[index])
+            nan_flag = None if is_nan is None else _flag_true(is_nan.iloc[index])
+            out.append(
+                row_fn(
+                    values.iloc[index],
+                    tuple(_entity_from_pandas(col.iloc[index]) for col in entity_cols),
+                    null_flag,
+                    nan_flag,
+                )
+            )
+        return pd.Series(out, index=values.index, dtype=object)
+
+    params = [inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=pd.Series) for name in names]
+    impl.__signature__ = inspect.Signature(params, return_annotation=pd.Series)  # type: ignore[attr-defined]
+    impl.__annotations__ = dict.fromkeys(names, pd.Series)
+    impl.__annotations__["return"] = pd.Series
+    return cast(Callable[..., Column], F.pandas_udf(return_type.simpleString())(impl))  # type: ignore[call-overload]
+
+
+def _perturb_one_noise(
+    value: object,
+    entity: Sequence[object],
+    *,
+    data_type: T.DataType,
+    domain: str,
+    key: bytes,
+    sigma_exact: Decimal | None,
+    sigma_float: float | None,
+    quantum: Decimal,
+    keyed_by_entity: bool,
+) -> object:
+    """Scalar noise path shared by vectorized batches (identity keyed per entity/value)."""
+    if value is None:
+        return None
+    identity = _serialize_entity_parts(entity if keyed_by_entity else (value,))
+    digest = _digest(key, f"{domain}:perturb", identity)
+    if sigma_exact is not None:
+        noise: float | Decimal = _gaussian_noise_decimal(digest, sigma_exact, quantum=quantum)
+    else:
+        noise = _gaussian_from_digest(digest) * float(sigma_float or 0.0)
+    return _perturb_value(value, data_type, noise=noise, scale=1, shift=0, mode="noise")
+
+
+def _perturb_column(
+    column: Column,
+    *,
+    data_type: T.DataType,
+    domain: str,
+    key: bytes,
+    rule: PiiRule,
+    stddev: float,
+    entity_columns: list[str],
+    row_entity_columns: list[str],
+) -> Column:
+    """Applies keyed perturb via vectorized pandas_udf batches (exact Decimal/int per value).
+
+    Nullable integral columns are bridged through Decimal so Arrow does not promote them to
+    float64. Float null vs NaN is transported as strings because pandas Series cannot tell them
+    apart. Identity is always keyed per entity (or per value), never by batch position.
+    """
+    mode = rule.perturb_mode()
+    noise_ratio = rule.perturb_noise_ratio()
+    exact = _is_exact_numeric_type(data_type)
+    quantum = _exact_numeric_quantum(data_type) if exact else Decimal(1)
+    float_flags = _is_float_spark_type(data_type)
+    return_type = _pandas_return_type(data_type)
+    value_col = _prep_value_column(column, data_type)
+    entity_names = list(entity_columns or row_entity_columns)
+    keyed_by_entity = bool(entity_names)
+
+    def apply_row(raw: object, entity: Sequence[object], sql_null: bool | None, sql_nan: bool | None) -> object:
+        value = _value_from_pandas(raw, data_type, sql_null=sql_null, sql_nan=sql_nan)
+        if mode == "affine":
+            result = _perturb_value(value, data_type, noise=0, scale=affine_scale, shift=affine_shift, mode="affine")
+        else:
+            result = _perturb_one_noise(
+                value,
+                entity,
+                data_type=data_type,
+                domain=domain,
+                key=key,
+                sigma_exact=sigma_exact,
+                sigma_float=sigma_float,
+                quantum=quantum,
+                keyed_by_entity=keyed_by_entity,
+            )
+        return _encode_pandas_out(result, data_type)
+
+    affine_scale: float | Decimal = 1
+    affine_shift: float | Decimal = 0
+    sigma_exact: Decimal | None = None
+    sigma_float: float | None = None
+    if mode == "affine":
+        if exact:
+            affine_scale, affine_shift = _affine_coefficients_decimal(
+                key, domain, Decimal(str(stddev)), quantum=quantum
+            )
+        else:
+            affine_scale, affine_shift = _affine_coefficients_float(key, domain, stddev)
+    elif exact:
+        sigma_exact = Decimal(str(stddev)) * Decimal(str(noise_ratio))
+    else:
+        sigma_float = stddev * noise_ratio
+
+    udf = _make_series_pandas_udf(
+        0 if mode == "affine" else len(entity_names),
+        float_flags=float_flags,
+        return_type=return_type,
+        row_fn=apply_row,
+    )
+    inputs: list[Column] = [value_col]
+    if float_flags:
+        inputs.extend([column.isNull(), F.isnan(column)])
+    if mode != "affine":
+        inputs.extend(F.col(name) for name in entity_names)
+    return _decode_pandas_out(udf(*inputs), data_type)

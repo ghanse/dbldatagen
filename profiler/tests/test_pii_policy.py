@@ -4,7 +4,14 @@ import pytest
 
 from dbldatagen_profiler.cli import main
 from dbldatagen_profiler.model import PiiClass, Semantic, Sensitivity
-from dbldatagen_profiler.pii import PiiAction, PiiPolicy, PiiRule, dump_policy_json, load_policy
+from dbldatagen_profiler.pii import (
+    PiiAction,
+    PiiPolicy,
+    PiiRule,
+    dump_policy_json,
+    expected_correlation_attenuation,
+    load_policy,
+)
 
 
 def semantic(pii_class: PiiClass, sensitivity: Sensitivity, confidence: float = 1.0) -> Semantic:
@@ -19,6 +26,7 @@ def test_default_policy_yaml_and_json_round_trip() -> None:
     assert load_policy(json.loads(dump_policy_json(policy))) == policy
     assert all(policy.sensitivity[kind].action == PiiAction.SUBSTITUTE for kind in Sensitivity)
     assert policy.min_confidence == 0.25
+    assert PiiAction.PERTURB not in {rule.action for rule in policy.sensitivity.values()}
 
 
 def test_yaml_round_trip_preserves_overrides_and_parameters() -> None:
@@ -55,7 +63,12 @@ def test_column_then_class_then_sensitivity_precedence() -> None:
 @pytest.mark.parametrize("sensitivity", list(Sensitivity))
 @pytest.mark.parametrize("action", list(PiiAction))
 def test_each_action_can_be_configured_for_each_sensitivity(sensitivity: Sensitivity, action: PiiAction) -> None:
-    parameters = {"prefix_length": 3} if action == PiiAction.GENERALIZE else {}
+    if action == PiiAction.GENERALIZE:
+        parameters: dict[str, str | int | float | bool] = {"prefix_length": 3}
+    elif action == PiiAction.PERTURB:
+        parameters = {"mode": "noise", "noise_ratio": 0.1}
+    else:
+        parameters = {}
     policy = PiiPolicy(
         sensitivity={
             kind: (
@@ -71,6 +84,41 @@ def test_each_action_can_be_configured_for_each_sensitivity(sensitivity: Sensiti
 def test_generalize_requires_parameters() -> None:
     with pytest.raises(ValueError, match="generalize requires parameters"):
         PiiRule(action=PiiAction.GENERALIZE)
+
+
+def test_perturb_parameter_validation_and_attenuation() -> None:
+    assert PiiRule(action=PiiAction.PERTURB).perturb_mode() == "noise"
+    assert PiiRule(action=PiiAction.PERTURB).perturb_noise_ratio() == 0.1
+    noise = PiiRule(action=PiiAction.PERTURB, parameters={"mode": "noise", "noise_ratio": 0.1})
+    affine = PiiRule(action=PiiAction.PERTURB, parameters={"mode": "affine"})
+    assert expected_correlation_attenuation(noise) == pytest.approx(1.0 / (1.01**0.5))
+    assert expected_correlation_attenuation(affine) == 1.0
+    with pytest.raises(ValueError, match="noise_ratio must satisfy"):
+        PiiRule(action=PiiAction.PERTURB, parameters={"noise_ratio": 0.0})
+    with pytest.raises(ValueError, match="noise_ratio must satisfy"):
+        PiiRule(action=PiiAction.PERTURB, parameters={"noise_ratio": 1.5})
+    with pytest.raises(ValueError, match="mode must be"):
+        PiiRule(action=PiiAction.PERTURB, parameters={"mode": "shuffle"})
+    with pytest.raises(ValueError, match="affine mode does not use noise_ratio"):
+        PiiRule(action=PiiAction.PERTURB, parameters={"mode": "affine", "noise_ratio": 0.1})
+    with pytest.raises(ValueError, match="does not accept parameters"):
+        PiiRule(action=PiiAction.PERTURB, parameters={"mode": "noise", "sigma": 1})
+
+
+def test_perturb_yaml_and_json_round_trip() -> None:
+    policy = PiiPolicy(
+        sensitivity={
+            Sensitivity.DIRECT_IDENTIFIER: PiiRule(action=PiiAction.SUBSTITUTE),
+            Sensitivity.QUASI_IDENTIFIER: PiiRule(
+                action=PiiAction.PERTURB, parameters={"mode": "noise", "noise_ratio": 0.2}
+            ),
+            Sensitivity.SECRET: PiiRule(action=PiiAction.SUBSTITUTE),
+            Sensitivity.FREE_TEXT: PiiRule(action=PiiAction.SUBSTITUTE),
+        },
+        columns={"t.score": PiiRule(action=PiiAction.PERTURB, parameters={"mode": "affine"})},
+    )
+    assert load_policy(policy.to_yaml()) == policy
+    assert load_policy(dump_policy_json(policy)) == policy
 
 
 def test_cli_prints_default_policy(capsys: pytest.CaptureFixture[str]) -> None:

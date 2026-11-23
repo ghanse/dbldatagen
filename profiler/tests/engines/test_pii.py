@@ -1,15 +1,19 @@
+import importlib
 import ipaddress
 import json
+import math
+import random
 import re
 from collections import Counter
 from collections.abc import Callable, Mapping
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import jsonschema
 import pytest
 from pyspark.sql import DataFrame, Row, SparkSession
+from pyspark.sql import functions as F
 
 from dbldatagen_profiler.cli import main
 from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
@@ -20,6 +24,7 @@ from dbldatagen_profiler.model import (
     PrivacyPolicy,
     Profile,
     Relationship,
+    Semantic,
     Sensitivity,
     TableProfile,
     dump_profile,
@@ -36,7 +41,17 @@ from dbldatagen_profiler.pii import (
     substitute,
 )
 from dbldatagen_profiler.pii.detect import analyze_table
-from dbldatagen_profiler.pii.substitute import _mapping_surrogate
+from dbldatagen_profiler.pii.substitute import (
+    _digest,
+    _exact_numeric_quantum,
+    _gaussian_noise_decimal,
+    _mapping_surrogate,
+    _perturb_one_noise,
+    _perturb_stddev,
+    _perturb_value,
+    _serialize_entity_parts,
+    _uniform_mod,
+)
 
 
 pytestmark = [pytest.mark.spark, pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")]
@@ -718,6 +733,8 @@ def test_each_action_is_applied_to_real_data_for_every_sensitivity(spark: SparkS
     )
     columns = ["direct", "quasi", "secret", "free_text"]
     for action in PiiAction:
+        if action == PiiAction.PERTURB:
+            continue  # string columns are ineligible; covered by dedicated perturb tests
         parameters = {"prefix_length": 2} if action == PiiAction.GENERALIZE else {}
         policy = PiiPolicy(sensitivity={kind: PiiRule(action=action, parameters=parameters) for kind in Sensitivity})
         output = substitute({"t": frame}, profile, key=b"all-actions-key", policy=policy).tables["t"]
@@ -1362,6 +1379,678 @@ def test_cli_detect_and_substitute_end_to_end(spark: SparkSession, tmp_path: Pat
     assert values == {None}
     report = json.loads((output / "report.json").read_text())["columns"][0]
     assert report["action"] == "suppress" and report["rule_source"] == "pii_class"
+
+
+def _qi_numeric_policy(**parameters: str | int | float | bool) -> PiiPolicy:
+    return PiiPolicy(
+        sensitivity={
+            Sensitivity.DIRECT_IDENTIFIER: PiiRule(action=PiiAction.KEEP),
+            Sensitivity.QUASI_IDENTIFIER: PiiRule(action=PiiAction.PERTURB, parameters=dict(parameters)),
+            Sensitivity.SECRET: PiiRule(action=PiiAction.KEEP),
+            Sensitivity.FREE_TEXT: PiiRule(action=PiiAction.KEEP),
+        }
+    )
+
+
+def _pearson(frame: DataFrame, left: str, right: str) -> float:
+    row = frame.selectExpr(f"corr({left}, {right}) as r").first()
+    assert row is not None and row.r is not None
+    return float(row.r)
+
+
+def test_perturb_noise_and_affine_preserve_expected_pearson(spark: SparkSession) -> None:
+    rng = random.Random(42)
+    rows = []
+    for index in range(100_000):
+        x = rng.gauss(0.0, 1.0)
+        y = 0.8 * x + 0.6 * rng.gauss(0.0, 1.0)
+        rows.append((index, x, y))
+    frame = spark.createDataFrame(rows, "id int, x double, y double")
+    baseline = _pearson(frame, "x", "y")
+    assert baseline == pytest.approx(0.8, abs=0.05)
+    semantic = _semantic("other", "quasi_identifier")
+    profile = _profile(
+        [
+            (
+                "t",
+                100_000,
+                [
+                    _typed_column("id", "int32", None),
+                    _typed_column("x", "float64", semantic),
+                    _typed_column("y", "float64", semantic),
+                ],
+            )
+        ]
+    )
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    noise_policy = _qi_numeric_policy(mode="noise", noise_ratio=0.1)
+    noise = substitute({"t": frame}, profile, key=b"perturb-noise-key", policy=noise_policy)
+    per_column = 1.0 / (1.01**0.5)
+    # Both columns use the same ratio: pair correlation scales by the product of per-column factors.
+    expected = baseline / 1.01
+    assert _pearson(noise.tables["t"], "x", "y") == pytest.approx(expected, abs=0.02)
+    for item in noise.report["columns"]:
+        assert item["action"] == "perturb"
+        assert item["mode"] == "noise"
+        assert item["expected_correlation_attenuation"] == pytest.approx(per_column)
+        assert item["equality_preserved"] is False
+        assert item["parameters"] == {"mode": "noise", "noise_ratio": 0.1}
+    affine_policy = _qi_numeric_policy(mode="affine")
+    affine = substitute({"t": frame}, profile, key=b"perturb-affine-key", policy=affine_policy)
+    assert _pearson(affine.tables["t"], "x", "y") == pytest.approx(baseline, abs=1e-6)
+    assert all(item["expected_correlation_attenuation"] == 1.0 for item in affine.report["columns"])
+
+
+def test_perturb_is_keyed_deterministic_and_independent_for_duplicates(spark: SparkSession) -> None:
+    frame = spark.createDataFrame([(1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0)], "id int, amount double")
+    profile = _profile(
+        [
+            (
+                "t",
+                4,
+                [
+                    _typed_column("id", "int32", None),
+                    _typed_column("amount", "float64", _semantic("other", "quasi_identifier")),
+                ],
+            )
+        ]
+    )
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    policy = _qi_numeric_policy(mode="noise", noise_ratio=0.2)
+    first = substitute({"t": frame}, profile, key=b"same-key", policy=policy).tables["t"].orderBy("id").collect()
+    second = substitute({"t": frame}, profile, key=b"same-key", policy=policy).tables["t"].orderBy("id").collect()
+    other = substitute({"t": frame}, profile, key=b"other-key", policy=policy).tables["t"].orderBy("id").collect()
+    assert [row.amount for row in first] == [row.amount for row in second]
+    assert [row.amount for row in first] != [row.amount for row in other]
+    assert first[0].amount != first[1].amount
+    # Non-zero column stddev with duplicate values: occurrence counters force independent noise.
+    duplicates = spark.createDataFrame([(10.0,), (10.0,), (20.0,), (30.0,)], "amount double")
+    dup_profile = _profile([("t", 4, [_typed_column("amount", "float64", _semantic("other", "quasi_identifier"))])])
+    perturbed_pair = [
+        row.amount
+        for row in substitute({"t": duplicates}, dup_profile, key=b"dup-key", policy=policy).tables["t"].collect()
+    ]
+    assert len(set(perturbed_pair)) == len(perturbed_pair)
+
+
+def test_perturb_preserves_nulls_types_and_avoids_endpoint_clamping(spark: SparkSession) -> None:
+    key = "spark.sql.ansi.enabled"
+    previous = spark.conf.get(key, None)
+    try:
+        for ansi in (False, True):
+            spark.conf.set(key, str(ansi).lower())
+            rows = [
+                (None, None, None, None, None, None, None, None),
+                (
+                    42,
+                    2**63 - 8,
+                    Decimal("12345678901234567890.1234567890"),
+                    1.5,
+                    float("nan"),
+                    date(2020, 1, 2),
+                    datetime(2020, 1, 2, 3, 4, 5),
+                    datetime(2020, 1, 2, 3, 4, 5),
+                ),
+                (
+                    -7,
+                    -(2**63) + 8,
+                    Decimal("-12345678901234567890.1234567890"),
+                    -2.25,
+                    float("inf"),
+                    date(2021, 6, 7),
+                    datetime(2021, 6, 7, 8, 9, 10),
+                    datetime(2021, 6, 7, 8, 9, 10),
+                ),
+            ]
+            # Extra rows so endpoint share stays low even if a couple of values stay near extremes.
+            for index in range(400):
+                rows.append(
+                    (
+                        index,
+                        1_000_000 + index,
+                        Decimal(index).scaleb(-1),
+                        float(index),
+                        float(index),
+                        date(2000, 1, 1) + timedelta(days=index),
+                        datetime(2000, 1, 1) + timedelta(days=index),
+                        datetime(2000, 1, 1) + timedelta(days=index),
+                    )
+                )
+            schema = (
+                "small int, huge long, amount decimal(38,10), magnitude double, special double, "
+                "day date, ts timestamp, ts_ntz timestamp_ntz"
+            )
+            frame = spark.createDataFrame(rows, schema)
+            policy = PiiPolicy(
+                columns={
+                    f"t.{name}": PiiRule(action=PiiAction.PERTURB, parameters={"mode": "noise", "noise_ratio": 0.1})
+                    for name in frame.columns
+                }
+            )
+            profile = profile_dataframe("t", frame, detect_pii=False)
+            output = substitute({"t": frame}, profile, key=b"typed-perturb-key", policy=policy).tables["t"]
+            assert output.schema == frame.schema
+            null_out = [row for row in output.collect() if row.small is None and row.huge is None]
+            assert len(null_out) == 1
+            assert all(getattr(null_out[0], name) is None for name in frame.columns)
+            specials = [row.special for row in output.collect() if row.special is not None]
+            assert any(isinstance(value, float) and math.isnan(value) for value in specials)
+            assert any(value == float("inf") for value in specials)
+            for name in ("small", "huge", "amount", "magnitude"):
+                original = [row[name] for row in frame.collect() if row[name] is not None]
+                replaced = [row[name] for row in output.collect() if row[name] is not None]
+                lo, hi = min(original), max(original)
+                endpoint_share = sum(value in {lo, hi} for value in replaced) / len(replaced)
+                assert endpoint_share < 0.005
+    finally:
+        if previous is None:
+            spark.conf.unset(key)
+        else:
+            spark.conf.set(key, previous)
+
+
+def test_perturb_rejects_disallowed_targets(spark: SparkSession) -> None:
+    frame = spark.createDataFrame(
+        [(1, 10.0, 20.0, 30.0, "alice@example.com", True)],
+        "id int, email_score double, secret_score double, notes_score double, label string, flag boolean",
+    )
+    profile = _profile(
+        [
+            (
+                "t",
+                1,
+                [
+                    _typed_column("id", "int32", _semantic("account_id", "direct_identifier")),
+                    _typed_column("email_score", "float64", _semantic("other", "direct_identifier")),
+                    _typed_column("secret_score", "float64", _semantic("secret_token", "secret")),
+                    _typed_column("notes_score", "float64", _semantic("free_text_pii", "free_text")),
+                    _column("label", None),
+                    _typed_column("flag", "boolean", None),
+                ],
+            )
+        ]
+    )
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    with pytest.raises(ValueError, match=r"direct_identifier column 't\.email_score'"):
+        substitute(
+            {"t": frame},
+            profile,
+            key=b"reject-key",
+            policy=PiiPolicy(columns={"t.email_score": PiiRule(action=PiiAction.PERTURB)}),
+        )
+    with pytest.raises(ValueError, match=r"secret column 't\.secret_score'"):
+        substitute(
+            {"t": frame},
+            profile,
+            key=b"reject-key",
+            policy=PiiPolicy(columns={"t.secret_score": PiiRule(action=PiiAction.PERTURB)}),
+        )
+    with pytest.raises(ValueError, match=r"free_text column 't\.notes_score'"):
+        substitute(
+            {"t": frame},
+            profile,
+            key=b"reject-key",
+            policy=PiiPolicy(columns={"t.notes_score": PiiRule(action=PiiAction.PERTURB)}),
+        )
+    with pytest.raises(ValueError, match=r"direct_identifier column 't\.id'|key column 't\.id'"):
+        substitute(
+            {"t": frame},
+            profile,
+            key=b"reject-key",
+            policy=PiiPolicy(columns={"t.id": PiiRule(action=PiiAction.PERTURB)}),
+        )
+    unique_frame = spark.createDataFrame([(10.0,), (20.0,)], "score double")
+    unique_profile = _profile([("t", 2, [_typed_column("score", "float64", _semantic("other", "quasi_identifier"))])])
+    unique_profile.tables[0].unique_keys = [KeyCandidate(columns=["score"], confidence=1.0)]
+    with pytest.raises(ValueError, match=r"key column 't\.score'"):
+        substitute(
+            {"t": unique_frame},
+            unique_profile,
+            key=b"reject-key",
+            policy=PiiPolicy(columns={"t.score": PiiRule(action=PiiAction.PERTURB)}),
+        )
+    with pytest.raises(ValueError, match=r"not supported for Spark type 'string'"):
+        substitute(
+            {"t": frame},
+            profile,
+            key=b"reject-key",
+            policy=PiiPolicy(columns={"t.label": PiiRule(action=PiiAction.PERTURB)}),
+        )
+    with pytest.raises(ValueError, match=r"not supported for Spark type 'boolean'"):
+        substitute(
+            {"t": frame},
+            profile,
+            key=b"reject-key",
+            policy=PiiPolicy(columns={"t.flag": PiiRule(action=PiiAction.PERTURB)}),
+        )
+
+
+def test_perturb_rejects_any_fk_linked_domain(spark: SparkSession) -> None:
+    parent = spark.createDataFrame([(1.0,), (2.0,)], "score double")
+    child = spark.createDataFrame([(1.0,), (1.0,), (2.0,)], "score double")
+    semantic = _semantic("other", "quasi_identifier")
+    profile = _profile(
+        [
+            ("parent", 2, [_typed_column("score", "float64", {**semantic, "confidence": 0.9})]),
+            ("child", 3, [_typed_column("score", "float64", {**semantic, "confidence": 0.2})]),
+        ],
+        relationships=[
+            Relationship(
+                child_table="child",
+                child_columns=["score"],
+                parent_table="parent",
+                parent_columns=["score"],
+                coverage=1.0,
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match=r"FK-linked column"):
+        substitute(
+            {"parent": parent, "child": child},
+            profile,
+            key=b"fk-perturb-reject",
+            policy=PiiPolicy(
+                columns={
+                    "parent.score": PiiRule(action=PiiAction.PERTURB, parameters={"mode": "noise", "noise_ratio": 0.1})
+                }
+            ),
+        )
+    # Strictest-order still prefers suppress over perturb without applying perturb on the FK domain.
+    suppress_policy = PiiPolicy(
+        sensitivity={
+            Sensitivity.DIRECT_IDENTIFIER: PiiRule(action=PiiAction.SUBSTITUTE),
+            Sensitivity.QUASI_IDENTIFIER: PiiRule(
+                action=PiiAction.PERTURB, parameters={"mode": "noise", "noise_ratio": 0.1}
+            ),
+            Sensitivity.SECRET: PiiRule(action=PiiAction.SUBSTITUTE),
+            Sensitivity.FREE_TEXT: PiiRule(action=PiiAction.SUBSTITUTE),
+        },
+        columns={"parent.score": PiiRule(action=PiiAction.SUPPRESS)},
+    )
+    result = substitute({"parent": parent, "child": child}, profile, key=b"fk-suppress-key", policy=suppress_policy)
+    assert all(item["action"] == "suppress" for item in result.report["columns"])
+    assert all(item["rule_source"] == "fk_group" for item in result.report["columns"])
+
+
+def test_perturb_exact_int64_and_decimal_near_type_limits(spark: SparkSession) -> None:
+    # Near type extremes while leaving headroom so noise/affine stay in-type after clamping.
+    near_max = 2**63 - 10_000
+    near_min = -(2**63) + 10_000
+    dec_max = Decimal("9999999999999999999999990000.1234567890")
+    dec_min = Decimal("-9999999999999999999999990000.1234567890")
+    rows = [
+        (1, near_max, dec_max),
+        (2, near_min, dec_min),
+        (3, near_max - 100, dec_max - Decimal("1.0000000000")),
+        (4, near_min + 100, dec_min + Decimal("1.0000000000")),
+        (5, 0, Decimal("0.0000000000")),
+        (6, 1_000_000, Decimal("1000000.0000000000")),
+    ]
+    frame = spark.createDataFrame(rows, "id int, huge long, amount decimal(38,10)")
+    profile = profile_dataframe("t", frame, detect_pii=False)
+    qi_model = Semantic.model_validate(_semantic("other", "quasi_identifier"))
+    profile.tables[0].columns[1] = profile.tables[0].columns[1].model_copy(update={"semantic": qi_model})
+    profile.tables[0].columns[2] = profile.tables[0].columns[2].model_copy(update={"semantic": qi_model})
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    mode_parameters: list[tuple[str, dict[str, str | int | float | bool]]] = [
+        ("noise", {"mode": "noise", "noise_ratio": 0.1}),
+        ("affine", {"mode": "affine"}),
+    ]
+    for mode, parameters in mode_parameters:
+        policy = _qi_numeric_policy(**parameters)
+        first = substitute({"t": frame}, profile, key=b"exact-limit-key", policy=policy).tables["t"].orderBy("id")
+        second = substitute({"t": frame}, profile, key=b"exact-limit-key", policy=policy).tables["t"].orderBy("id")
+        assert first.schema == frame.schema
+        assert first.collect() == second.collect()
+        collected = first.collect()
+        for row in collected:
+            assert isinstance(row.huge, int)
+            assert -(2**63) <= row.huge <= 2**63 - 1
+            assert isinstance(row.amount, Decimal)
+            # Avoid abs() under default Decimal precision (28): it rounds ±(10^28-ulp) to 1E+28.
+            max_amount = Decimal("9999999999999999999999999999.9999999999")
+            assert -max_amount <= row.amount <= max_amount
+            assert first.schema["huge"].dataType.simpleString() == "bigint"
+            assert first.schema["amount"].dataType.simpleString() == "decimal(38,10)"
+        if mode == "affine":
+            # Integer/decimal affine preserves Pearson only up to rounding.
+            baseline = _pearson(frame, "huge", "amount")
+            measured = _pearson(first, "huge", "amount")
+            assert measured == pytest.approx(baseline, abs=1e-3)
+
+
+def test_perturb_entity_key_serialization_avoids_collisions(spark: SparkSession) -> None:
+    # Separator collision: ("a\x1fb", None) vs ("a", "b") must not share noise.
+    sep = "\u001f"
+    frame = spark.createDataFrame(
+        [
+            (f"a{sep}b", None, 10.0),
+            ("a", "b", 10.0),
+            (None, "x", 20.0),
+            ("None", "x", 20.0),
+        ],
+        "k1 string, k2 string, amount double",
+    )
+    profile = _profile(
+        [
+            (
+                "t",
+                4,
+                [
+                    _typed_column("k1", "string", None),
+                    _typed_column("k2", "string", None),
+                    _typed_column("amount", "float64", _semantic("other", "quasi_identifier")),
+                ],
+            )
+        ]
+    )
+    profile.tables[0].primary_key = KeyCandidate(columns=["k1", "k2"], confidence=1.0)
+    output = (
+        substitute(
+            {"t": frame}, profile, key=b"entity-serialize-key", policy=_qi_numeric_policy(mode="noise", noise_ratio=0.5)
+        )
+        .tables["t"]
+        .collect()
+    )
+    by_key = {(row.k1, row.k2): row.amount for row in output}
+    assert by_key[(f"a{sep}b", None)] != by_key[("a", "b")]
+    assert by_key[(None, "x")] != by_key[("None", "x")]
+
+
+def test_perturb_exact_numeric_avoids_column_collect(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    frame = spark.range(1_000_000).select(
+        F.col("id").cast("int").alias("id"),
+        (F.col("id") * F.lit(1_000)).cast("bigint").alias("huge"),
+        (F.col("id").cast("decimal(38,10)") * F.lit(Decimal("1000.0000000001"))).alias("amount"),
+    )
+    profile = profile_dataframe("t", frame.limit(10), detect_pii=False)
+    # Rebuild profile row_count for the full frame without profiling 1M rows.
+    profile = profile.model_copy(update={"tables": [profile.tables[0].model_copy(update={"row_count": 1_000_000})]})
+    qi = Semantic.model_validate(_semantic("other", "quasi_identifier"))
+    profile.tables[0].columns[1] = profile.tables[0].columns[1].model_copy(update={"semantic": qi})
+    profile.tables[0].columns[2] = profile.tables[0].columns[2].model_copy(update={"semantic": qi})
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    policy = _qi_numeric_policy(mode="noise", noise_ratio=0.1)
+    key = b"scale-no-collect-key"
+
+    real_collect = DataFrame.collect
+
+    def guarded_collect(self: DataFrame) -> list[Row]:
+        rows = real_collect(self)
+        if len(rows) > 1_000:
+            raise AssertionError(f"driver collected {len(rows)} rows during exact-numeric perturb")
+        return rows
+
+    monkeypatch.setattr(DataFrame, "collect", guarded_collect)
+    result = substitute({"t": frame}, profile, key=key, policy=policy)
+    assert result.tables["t"].count() == 1_000_000
+
+    # Small-sample exact-arithmetic check against the same Spark stddev + Decimal noise path.
+    monkeypatch.setattr(DataFrame, "collect", real_collect)
+    sample_ids = list(range(25))
+    originals = {row.id: row for row in frame.where(F.col("id").isin(sample_ids)).collect()}
+    outputs = {row.id: row for row in result.tables["t"].where(F.col("id").isin(sample_ids)).collect()}
+    std_huge = _perturb_stddev(frame, "huge", frame.schema["huge"].dataType)
+    std_amount = _perturb_stddev(frame, "amount", frame.schema["amount"].dataType)
+    for row_id in sample_ids:
+        identity = _serialize_entity_parts((row_id,))
+        for name, std, dtype in (
+            ("huge", std_huge, frame.schema["huge"].dataType),
+            ("amount", std_amount, frame.schema["amount"].dataType),
+        ):
+            digest = _digest(key, f"t.{name}:perturb", identity)
+            sigma = Decimal(str(std)) * Decimal("0.1")
+            noise = _gaussian_noise_decimal(digest, sigma, quantum=_exact_numeric_quantum(dtype))
+            expected = _perturb_value(
+                getattr(originals[row_id], name), dtype, noise=noise, scale=1, shift=0, mode="noise"
+            )
+            assert getattr(outputs[row_id], name) == expected
+
+
+def test_perturb_exact_noise_randomizes_low_order_digits(spark: SparkSession) -> None:
+    rows: list[tuple[int, int, Decimal]] = []
+    for index in range(2_000):
+        huge = (2**63 - 1 - (index % 997)) if index % 2 == 0 else (-(2**63) + (index % 997))
+        # Spread ~1e24 so population stddev is ~1e20+; embed unique low digits in the fraction.
+        whole = (10**24 + index) if index % 2 == 0 else -(10**24 + index)
+        frac = f"{(index * 1_000_003) % 10**10:010d}"
+        rows.append((index, huge, Decimal(f"{whole}.{frac}")))
+    frame = spark.createDataFrame(rows, "id int, huge long, amount decimal(38,10)")
+    profile = profile_dataframe("t", frame, detect_pii=False)
+    qi = Semantic.model_validate(_semantic("other", "quasi_identifier"))
+    profile.tables[0].columns[1] = profile.tables[0].columns[1].model_copy(update={"semantic": qi})
+    profile.tables[0].columns[2] = profile.tables[0].columns[2].model_copy(update={"semantic": qi})
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    policy = _qi_numeric_policy(mode="noise", noise_ratio=1.0)
+    output = {
+        row.id: row
+        for row in substitute({"t": frame}, profile, key=b"low-digit-key", policy=policy).tables["t"].collect()
+    }
+    original = {row[0]: row for row in rows}
+
+    def decimal_low12(value: Decimal) -> int:
+        unscaled = int((abs(value) * (Decimal(10) ** 10)).to_integral_value())
+        return unscaled % (10**12)
+
+    decimal_matches = sum(
+        1 for index in original if decimal_low12(original[index][2]) == decimal_low12(output[index].amount)
+    )
+    int_matches = sum(
+        1 for index in original if abs(original[index][1]) % (10**12) == abs(output[index].huge) % (10**12)
+    )
+    assert decimal_matches / len(original) < 0.01
+    assert int_matches / len(original) < 0.01
+
+
+def test_perturb_nopk_repartition_preserves_output_multiset(spark: SparkSession) -> None:
+    frame = spark.createDataFrame([(10.0,), (10.0,), (20.0,), (30.0,), (40.0,)], "amount double")
+    profile = _profile([("t", 5, [_typed_column("amount", "float64", _semantic("other", "quasi_identifier"))])])
+    policy = _qi_numeric_policy(mode="noise", noise_ratio=0.2)
+    left = substitute({"t": frame}, profile, key=b"multiset-key", policy=policy).tables["t"]
+    right = substitute({"t": frame.repartition(4)}, profile, key=b"multiset-key", policy=policy).tables["t"]
+    assert sorted(row.amount for row in left.collect()) == sorted(row.amount for row in right.collect())
+
+
+def test_uniform_mod_chi_square_unbiased() -> None:
+    # Awkward modulus just below 2^62: without +64 HMAC bits, residues in the first two
+    # thirds of the range are ~1.5x more likely than the last third.
+    steps = 3 * (2**61)
+    third = 2**61
+    draws = 6_000
+    counts = [0, 0, 0]
+    for index in range(draws):
+        digest = _digest(b"mod-bias-key", "tail-uniform", str(index))
+        bucket = _uniform_mod(digest, steps) // third
+        counts[bucket] += 1
+    expected = draws / 3
+    chi_square = sum((count - expected) ** 2 / expected for count in counts)
+    # df=2 critical value at p=0.001 is ~13.8; unbiased draws stay far below.
+    assert chi_square < 13.8, (counts, chi_square)
+
+
+def test_perturb_path_does_not_use_arrow_udf(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    substitute_mod = importlib.import_module("dbldatagen_profiler.pii.substitute")
+    module_file = substitute_mod.__file__
+    assert module_file is not None
+    source = Path(module_file).read_text(encoding="utf-8")
+    assert "arrow_udf" not in source
+
+    def banned(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("arrow_udf must not be used by perturb")
+
+    monkeypatch.setattr(substitute_mod.F, "arrow_udf", banned, raising=False)
+    frame = spark.createDataFrame(
+        [(1, 2**63 - 11, 1.5), (2, None, None), (3, -(2**63) + 9, float("nan"))],
+        "id int, huge long, amount double",
+    )
+    profile = profile_dataframe("t", frame, detect_pii=False)
+    qi = Semantic.model_validate(_semantic("other", "quasi_identifier"))
+    profile.tables[0].columns[1] = profile.tables[0].columns[1].model_copy(update={"semantic": qi})
+    profile.tables[0].columns[2] = profile.tables[0].columns[2].model_copy(update={"semantic": qi})
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    result = substitute(
+        {"t": frame}, profile, key=b"no-arrow-key", policy=_qi_numeric_policy(mode="noise", noise_ratio=0.1)
+    )
+    rows = {row.id: row for row in result.tables["t"].collect()}
+    assert rows[2].huge is None and rows[2].amount is None
+    assert isinstance(rows[3].amount, float) and math.isnan(rows[3].amount)
+
+
+def test_perturb_vectorized_matches_scalar_reference_and_repartition(spark: SparkSession) -> None:
+    rows = [
+        (1, 2**63 - 17, Decimal("123456789012345678.1234567890")),
+        (2, None, None),
+        (3, -(2**63) + 19, Decimal("-987654321098765432.0987654321")),
+        (4, 2**62 + 3, Decimal("0.0000000001")),
+    ]
+    frame = spark.createDataFrame(rows, "id int, huge long, amount decimal(38,10)")
+    profile = profile_dataframe("t", frame, detect_pii=False)
+    qi = Semantic.model_validate(_semantic("other", "quasi_identifier"))
+    profile.tables[0].columns[1] = profile.tables[0].columns[1].model_copy(update={"semantic": qi})
+    profile.tables[0].columns[2] = profile.tables[0].columns[2].model_copy(update={"semantic": qi})
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    policy = _qi_numeric_policy(mode="noise", noise_ratio=0.2)
+    key = b"vectorized-scalar-key"
+
+    vector_left = substitute({"t": frame.repartition(1)}, profile, key=key, policy=policy).tables["t"].orderBy("id")
+    vector_right = substitute({"t": frame.repartition(4)}, profile, key=key, policy=policy).tables["t"].orderBy("id")
+    vector_rows = {row.id: row for row in vector_left.collect()}
+    right_rows = {row.id: row for row in vector_right.collect()}
+    assert sorted(vector_rows) == sorted(right_rows)
+    for row_id, left in vector_rows.items():
+        assert right_rows[row_id].huge == left.huge
+        assert right_rows[row_id].amount == left.amount
+
+    # Scalar reference: same per-entity helpers the vectorized batches call (not batch position).
+    std_huge = _perturb_stddev(frame, "huge", frame.schema["huge"].dataType)
+    std_amount = _perturb_stddev(frame, "amount", frame.schema["amount"].dataType)
+    huge_type = frame.schema["huge"].dataType
+    amount_type = frame.schema["amount"].dataType
+    for row_id, huge, amount in rows:
+        assert vector_rows[row_id].huge == _perturb_one_noise(
+            huge,
+            (row_id,),
+            data_type=huge_type,
+            domain="t.huge",
+            key=key,
+            sigma_exact=Decimal(str(std_huge)) * Decimal("0.2"),
+            sigma_float=None,
+            quantum=_exact_numeric_quantum(huge_type),
+            keyed_by_entity=True,
+        )
+        assert vector_rows[row_id].amount == _perturb_one_noise(
+            amount,
+            (row_id,),
+            data_type=amount_type,
+            domain="t.amount",
+            key=key,
+            sigma_exact=Decimal(str(std_amount)) * Decimal("0.2"),
+            sigma_float=None,
+            quantum=_exact_numeric_quantum(amount_type),
+            keyed_by_entity=True,
+        )
+
+
+def test_no_policy_profile_output_is_stable(spark: SparkSession) -> None:
+    frame = spark.createDataFrame([(1, "a@example.com"), (2, "b@example.com")], "id int, email string")
+    first = json.loads(dump_profile(profile_dataframe("t", frame)))
+    second = json.loads(dump_profile(profile_dataframe("t", frame)))
+    first.pop("created_at")
+    second.pop("created_at")
+    assert first == second
+    assert all(rule.action != PiiAction.PERTURB for rule in PiiPolicy().sensitivity.values())
+
+
+def test_perturb_report_contains_counts_not_values(spark: SparkSession) -> None:
+    frame = spark.createDataFrame([(1, 12.5), (2, 17.5)], "id int, amount double")
+    profile = _profile(
+        [
+            (
+                "t",
+                2,
+                [
+                    _typed_column("id", "int32", None),
+                    _typed_column("amount", "float64", _semantic("other", "quasi_identifier")),
+                ],
+            )
+        ]
+    )
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    result = substitute({"t": frame}, profile, key=b"report-key", policy=_qi_numeric_policy())
+    serialized = json.dumps(result.report)
+    assert "12.5" not in serialized and "17.5" not in serialized
+    assert "report-key" not in serialized
+    assert result.report["columns"][0]["values_perturbed"] == 2
+    assert result.report["columns"][0]["values_affected"] == 2
+
+
+def test_perturb_profile_time_behaves_like_keep(spark: SparkSession) -> None:
+    frame = spark.createDataFrame([(1.0,), (2.0,), (3.0,)], "score double")
+    protected = profile_dataframe(
+        "t",
+        frame,
+        detect_pii=False,
+        pii_policy=PiiPolicy(columns={"t.score": PiiRule(action=PiiAction.PERTURB)}),
+    )
+    assert protected.tables[0].columns[0].numeric is not None
+    assert protected.tables[0].columns[0].numeric.min is not None
+    with pytest.raises(ValueError, match=r"cannot loosen the spec 0\.2\.0 privacy floor"):
+        profile_dataframe(
+            "t",
+            spark.createDataFrame([("a@example.com",)], "email string"),
+            pii_policy=PiiPolicy(columns={"t.email": PiiRule(action=PiiAction.PERTURB)}),
+        )
+
+
+def test_cli_perturb_end_to_end(spark: SparkSession, tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    profile_path = tmp_path / "profile.json"
+    key_path = tmp_path / "key.bin"
+    policy_path = tmp_path / "policy.json"
+    output = tmp_path / "output"
+    frame = spark.createDataFrame([(1, 10.0), (2, 20.0)], "id int, score double")
+    frame.write.parquet(str(source))
+    profile = _profile(
+        [
+            (
+                "customers",
+                2,
+                [
+                    _typed_column("id", "int32", None),
+                    _typed_column("score", "float64", _semantic("other", "quasi_identifier")),
+                ],
+            )
+        ]
+    )
+    profile.tables[0].primary_key = KeyCandidate(columns=["id"], confidence=1.0)
+    profile_path.write_text(dump_profile(profile), encoding="utf-8")
+    key_path.write_bytes(b"cli-perturb-key".ljust(32, b"!"))
+    key_path.chmod(0o600)
+    policy_path.write_text(dump_policy_json(_qi_numeric_policy(mode="noise", noise_ratio=0.1)))
+    assert (
+        main(
+            [
+                "pii",
+                "substitute",
+                "--table",
+                f"customers={source}",
+                "--profile",
+                str(profile_path),
+                "--key-file",
+                str(key_path),
+                "--policy",
+                str(policy_path),
+                "-o",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    report = json.loads((output / "report.json").read_text())["columns"][0]
+    assert report["action"] == "perturb"
+    assert report["mode"] == "noise"
+    assert report["equality_preserved"] is False
+    assert "10.0" not in json.dumps(report)
 
 
 def _column(name: str, semantic: object) -> dict[str, object]:
