@@ -227,12 +227,32 @@ Policies are JSON or YAML mappings. A fully-qualified column rule (including nes
 which wins over a sensitivity rule. The default `min_confidence` is 0.25, so name-only detections are substituted.
 Direct identifiers and secrets are never skipped for low confidence. Other detections below the configured threshold
 are reported as `skipped_low_confidence` and left unchanged unless a class or column override names them. Linked FK
-columns use one action for the whole substitution domain (`drop` > `suppress` > `substitute` > `generalize` > `keep`);
-conflicting explicit rules are rejected. One explicit `keep` in an FK group is therefore overridden by a stricter
-action elsewhere in that group. Dropping one detected member also drops linked columns with no detected semantic,
-just as other FK-group actions propagate to preserve join consistency. Available actions are `substitute`,
-`generalize`, `suppress`, `drop`, and `keep`. Generalization parameters include `prefix_length`, `date_granularity`
-(`month` or `year`), and `bucket_width`. For example:
+columns use one action for the whole substitution domain
+(`drop` > `suppress` > `substitute` > `perturb` > `generalize` > `keep`); conflicting explicit rules are rejected.
+One explicit `keep` in an FK group is therefore overridden by a stricter action elsewhere in that group. Dropping one
+detected member also drops linked columns with no detected semantic, just as other FK-group actions propagate to
+preserve join consistency. Available actions are `substitute`, `perturb`, `generalize`, `suppress`, `drop`, and
+`keep`. Generalization parameters include `prefix_length`, `date_granularity` (`month` or `year`), and `bucket_width`.
+`perturb` is opt-in only (absent from the default policy) and keeps Pearson correlations on sensitive numeric and
+temporal columns. It is allowed on quasi-identifiers, or via an explicit column rule when detection missed a column,
+for int/long/short/byte/float/double/decimal and date/timestamp/timestamp_ntz types. It is rejected on direct
+identifiers, secrets, free text, primary/unique keys, any column in an FK-linked substitution domain (perturbing either
+side would break joins), and on strings, booleans, binary, or nested containers. Nested numeric/temporal leaves stay
+rejected for now (follow-up). Modes: `noise` (default) adds keyed Gaussian noise with
+`sigma = noise_ratio × population_stddev` (`0 < noise_ratio ≤ 1`, default `0.1`), drawn from
+`HMAC(key, domain, entity)` where `entity` is the table primary key when present, otherwise a row content hash plus an
+occurrence counter so duplicate rows still get independent noise; equality is not preserved. Without a primary key the
+perturbed multiset is deterministic across reshuffles, though the row order of exact duplicates may vary. Expected
+Pearson attenuation is stated per column as `1/sqrt(1+noise_ratio²)`. A pairwise correlation between two perturbed
+columns is scaled by the product of those per-column factors (`r/(1+ratio²)` when both use the same ratio). Column stddev is computed with Spark aggregates (double; it only scales
+sigma). Integer and decimal columns then apply noise/affine in exact Decimal/int arithmetic without collecting the
+column to the driver (affine `a` is a rational with a bounded denominator). Exact-type Gaussian noise fills digits
+below float precision from extra HMAC bytes so low-order digits cannot pass through when sigma is large. Values are
+then rounded or quantized to the column type, with overflow clamped only to the type range, never to the observed
+min/max. Affine on float/double preserves Pearson exactly (sign-preserving); on
+integer/decimal columns it preserves Pearson only up to rounding. Affine is reversible if two real values are known —
+a weaker mode when exact correlations are required. Dates/timestamps shift in days/seconds; NaN/Inf pass through. For
+example:
 
 ```yaml
 min_confidence: 0.25
@@ -260,8 +280,11 @@ column-specific error.
 
 The same file can be passed to `dbldatagen-profile profile --policy policy.yaml`. At profile time, policy rules may
 only remove or coarsen emitted information. They cannot weaken the spec 0.2.0 floor for direct identifiers and
-secrets; a conflicting `keep` rule is rejected. Profile-time `generalize` and `drop` strip sensitive statistics just
-like `suppress`; they do not change the source schema or calculate generalized statistics.
+secrets; a conflicting `keep` or `perturb` rule on those floors is rejected. Profile-time `generalize` and `drop`
+strip sensitive statistics just like `suppress`; they do not change the source schema or calculate generalized
+statistics. `perturb` is substitution-time only: at profile time it behaves like `keep` for statistics (computed from
+the data given). Profiling the original data is preferred; profiling already-perturbed output yields attenuated
+correlations.
 
 JSON policy files always work. YAML policy files and `pii policy --default` require the optional
 `dbldatagen-profiler[yaml]` extra.
