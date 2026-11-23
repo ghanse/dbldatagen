@@ -6,9 +6,10 @@ from decimal import Decimal
 
 import jsonschema
 import pytest
-from pyspark.sql import Row, SparkSession
+from pyspark.sql import Column, DataFrame, Row, SparkSession
 from pyspark.sql import types as T
 
+from dbldatagen_profiler.engines.spark import engine as spark_engine
 from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
 from dbldatagen_profiler.engines.spark.engine import _histogram, _logical_type, _numeric_stats, _pearson_pairs
 from dbldatagen_profiler.model import LogicalType, PrivacyPolicy, ValueTreatment, profile_json_schema
@@ -193,15 +194,23 @@ def test_pearson_dependencies_honor_custom_privacy_support(spark: SparkSession) 
     assert table.dependencies[0].columns == ("x", "y")
 
 
-def test_pearson_dependencies_skip_weak_sample_noise(spark: SparkSession) -> None:
-    frame = spark.createDataFrame(
-        [(float(x % 10), float((x * 7) % 11)) for x in range(100)],
-        "x double, y double",
-    )
+def test_pearson_dependencies_use_a_separate_aggregate(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+    collect = spark_engine._collect_aggregate
 
-    table = profile_dataframe("noise", frame, detect_pii=False).tables[0]
+    def recording_collect(df: DataFrame, expressions: list[Column]) -> dict[str, object]:
+        calls.append([str(expression) for expression in expressions])
+        return collect(df, expressions)
 
-    assert table.dependencies is None
+    monkeypatch.setattr(spark_engine, "_collect_aggregate", recording_collect)
+    frame = spark.createDataFrame([(float(x), float(x * x)) for x in range(20) for _ in range(2)], "x double, y double")
+
+    profile_dataframe("separate", frame, detect_pii=False)
+
+    assert len(calls) == 2
+    assert all("p0_" not in expression for expression in calls[0])
+    assert len(calls[1]) == 2
+    assert all("p0_" in expression for expression in calls[1])
 
 
 def test_pearson_dependencies_skip_near_deterministic_and_key_like_pairs(spark: SparkSession) -> None:

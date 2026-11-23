@@ -72,7 +72,6 @@ _HISTOGRAM_MAX_DISTINCT = 64
 # left index. This puts adjacent columns first and caps wide-table aggregate
 # growth deterministically instead of constructing every possible pair.
 _MAX_PEARSON_PAIRS = 64
-_MIN_PEARSON_CORRELATION = 0.05
 _MAX_PEARSON_CORRELATION = 0.999
 
 
@@ -249,11 +248,7 @@ def _dependencies_from_aggregate(
     for index, (left, right, _, _) in enumerate(pairs):
         correlation = _finite_float(values[f"p{index}_correlation"])
         supported = int(values[f"p{index}_support"]) >= privacy.min_value_count
-        if (
-            supported
-            and correlation is not None
-            and _MIN_PEARSON_CORRELATION <= abs(correlation) <= _MAX_PEARSON_CORRELATION
-        ):
+        if supported and correlation is not None and abs(correlation) <= _MAX_PEARSON_CORRELATION:
             dependencies.append(
                 Dependency(
                     columns=(left, right), method=DependenceMethod.PEARSON, value=max(-1.0, min(1.0, correlation))
