@@ -72,6 +72,7 @@ _HISTOGRAM_MAX_DISTINCT = 64
 # left index. This puts adjacent columns first and caps wide-table aggregate
 # growth deterministically instead of constructing every possible pair.
 _MAX_PEARSON_PAIRS = 64
+_MIN_PEARSON_CORRELATION = 0.05
 _MAX_PEARSON_CORRELATION = 0.999
 
 
@@ -149,12 +150,13 @@ def _profile_table(
     for index, field in enumerate(df.schema.fields):
         expressions.extend(_aggregate_expressions(df[field.name], field.dataType, index))
     pairs = _pearson_pairs(df)
+    pearson_expressions: list[Column] = []
     for pair_index, (_, _, left, right) in enumerate(pairs):
         paired = left.isNotNull() & right.isNotNull()
         paired_left = F.when(paired, left)
         paired_right = F.when(paired, right)
         denominator = F.stddev_samp(paired_left) * F.stddev_samp(paired_right)
-        expressions.extend(
+        pearson_expressions.extend(
             [
                 F.count(F.when(paired, 1)).alias(f"p{pair_index}_support"),
                 F.when(denominator != 0, F.covar_samp(paired_left, paired_right) / denominator).alias(
@@ -167,6 +169,8 @@ def _profile_table(
         [(f"c{index}", df[field.name], field.dataType) for index, field in enumerate(df.schema.fields)],
         _collect_aggregate(df, expressions),
     )
+    if pearson_expressions:
+        values.update(_collect_aggregate(df, pearson_expressions))
     row_count = int(values["__row_count"])
     columns = [
         _column_from_aggregate(field, values, index, row_count, privacy, nested=False, df=df)
@@ -245,7 +249,11 @@ def _dependencies_from_aggregate(
     for index, (left, right, _, _) in enumerate(pairs):
         correlation = _finite_float(values[f"p{index}_correlation"])
         supported = int(values[f"p{index}_support"]) >= privacy.min_value_count
-        if supported and correlation is not None and abs(correlation) <= _MAX_PEARSON_CORRELATION:
+        if (
+            supported
+            and correlation is not None
+            and _MIN_PEARSON_CORRELATION <= abs(correlation) <= _MAX_PEARSON_CORRELATION
+        ):
             dependencies.append(
                 Dependency(
                     columns=(left, right), method=DependenceMethod.PEARSON, value=max(-1.0, min(1.0, correlation))

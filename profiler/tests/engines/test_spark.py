@@ -193,6 +193,17 @@ def test_pearson_dependencies_honor_custom_privacy_support(spark: SparkSession) 
     assert table.dependencies[0].columns == ("x", "y")
 
 
+def test_pearson_dependencies_skip_weak_sample_noise(spark: SparkSession) -> None:
+    frame = spark.createDataFrame(
+        [(float(x % 10), float((x * 7) % 11)) for x in range(100)],
+        "x double, y double",
+    )
+
+    table = profile_dataframe("noise", frame, detect_pii=False).tables[0]
+
+    assert table.dependencies is None
+
+
 def test_pearson_dependencies_skip_near_deterministic_and_key_like_pairs(spark: SparkSession) -> None:
     rows = [(value, index, value * 3, value * 6) for index, value in enumerate(list(range(10)) * 2)]
     frame = spark.createDataFrame(rows, "order_id long, unique_key long, exact long, exact_copy long")
