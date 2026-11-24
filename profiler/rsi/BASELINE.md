@@ -20,7 +20,11 @@ re-measured under policy 2.0.0 and will be measured only for speed proposals tha
 Machine: Apple M2 Max, 12 physical / 12 logical cores, 64 GiB RAM; macOS 26.7.2 (25G332), Python 3.10.20,
 OpenJDK 17.0.16, and Spark/PySpark 4.1.1. Speed used `local[8]`, an 8 GiB driver, and 2 shuffle partitions.
 Fidelity workers used `local[4]` with an 8 GiB driver, up to 3 cells in parallel. Experiment wall time for
-`baseline-v2-0002`: **24728 s** (6.87 h).
+`baseline-v2-0002`: about **24728 s** (6.87 h), as reported by the run's driver log; the committed artifacts do
+not record start and end times.
+
+This baseline is valid for the current accuracy gate. The planned discriminator-first gate (P1.6e) changes the
+discriminator features and adds new metrics, so it needs another baseline refresh once it merges.
 
 ## Tier-s fidelity
 
@@ -118,3 +122,8 @@ Gaps are ceiling minus score, ranked across dataset/group means over five seeds.
 Discriminator fidelity dominates the headroom for five of six datasets. Retail structure/constraints and strings
 constraints remain major accuracy targets. Nested wall time (~272 s median at tier s) is the leading speed target at
 the measured tier; tier-m speed is deferred until a proposal targets it.
+
+Nested is slower under this speed config: 271.7 s median wall time (48.5 s Python CPU) at `local[8]`/8 GiB, against
+about 197-212 s wall in earlier `local[2]`/2 GiB runs. The samples show the slowdown but not its cause; the extra
+wall time is not Python CPU, so per-job Spark overhead across nested's many small jobs is the likely explanation,
+not yet confirmed.
