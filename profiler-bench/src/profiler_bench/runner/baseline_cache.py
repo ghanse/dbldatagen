@@ -12,9 +12,15 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
+import subprocess
 from collections.abc import Sequence
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
+
+from profiler_bench.catalog import REAL_DATASETS, materialize
+from profiler_bench.catalog.store import get
 
 
 def config_hash(value: object) -> str:
@@ -77,7 +83,7 @@ def store_entry(
 def _is_complete(records: list[Any], components: dict[str, Any]) -> bool:
     """Returns whether `records` are the complete, successful, ordered baseline set for `components`."""
     if components["kind"] == "fidelity":
-        index_field, indices = "seed", list(components["seeds"])
+        index_field, indices = "seed", list(components["sampler_seeds"])
     else:
         index_field, indices = "sample_index", list(range(int(components["samples"])))
     if not indices or len(records) != len(indices):
@@ -92,3 +98,39 @@ def _is_complete(records: list[Any], components: dict[str, Any]) -> bool:
         and record.get(index_field) == index
         for record, index in zip(records, indices, strict=True)
     )
+
+
+ENVIRONMENT_PACKAGES = ("pyspark", "numpy", "pandas", "scikit-learn", "pyarrow")
+
+
+def environment(*, java: bool) -> dict[str, str]:
+    """Returns the Python and library versions, plus the Java version when `java` is set."""
+    versions = {"python": platform.python_version()}
+    for package in ENVIRONMENT_PACKAGES:
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = "missing"
+    if java:
+        versions["java"] = java_version()
+    return versions
+
+
+def java_version() -> str:
+    """Returns the first line of `java -version` for `$JAVA_HOME/bin/java` (or `java` on PATH)."""
+    java_home = os.environ.get("JAVA_HOME")
+    exe = str(Path(java_home) / "bin" / "java") if java_home else "java"
+    try:
+        completed = subprocess.run([exe, "-version"], check=False, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return "missing"
+    lines = (completed.stderr or completed.stdout).strip().splitlines()
+    return lines[0] if lines else "missing"
+
+
+def dataset_identity(dataset: str, tier: str, seed: int, root: Path | None) -> dict[str, Any]:
+    """Returns the catalog generator fingerprint, instance content hash, and real-dataset pinned hashes."""
+    if dataset in REAL_DATASETS:
+        return {"real_pinned_hashes": dict(REAL_DATASETS[dataset].hashes)}
+    instance = materialize(dataset, tier, seed=seed, root=root, check_hash=False)
+    return {"catalog_fingerprint": get(dataset).fingerprint(), "catalog_content_hash": instance.content_hash}

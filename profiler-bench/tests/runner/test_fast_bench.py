@@ -11,10 +11,11 @@ from typing import Any
 
 import pytest
 
+from profiler_bench.catalog import REAL_DATASETS
 from profiler_bench.evaluate.evaluate import evaluate_experiment
 from profiler_bench.evaluate.gates import evaluate_gates, expected_sample_keys
 from profiler_bench.rsi import __main__ as rsi_cli
-from profiler_bench.runner import baseline_cache, fidelity_run, measure
+from profiler_bench.runner import baseline_cache, experiment, fidelity_run, measure
 from profiler_bench.runner.experiment import ExperimentConfig, run_experiment
 from profiler_bench.runner.fidelity_run import run_fidelity_samples
 from profiler_bench.runner.identity import BuildIdentity
@@ -167,8 +168,20 @@ def _components(**overrides: object) -> dict[str, Any]:
         "tier": "s",
         "dataset_seed": 0,
         "spark_hash": "spark",
-        "seeds": [0, 1],
+        "sampler_seeds": [0, 1],
         "scorer_hash": "scorer",
+        "catalog_fingerprint": "fingerprint",
+        "catalog_content_hash": "content",
+        "real_pinned_hashes": {"t": "pinned"},
+        "environment": {
+            "python": "3.10.20",
+            "pyspark": "4.1.1",
+            "numpy": "2.0",
+            "pandas": "2.2",
+            "scikit-learn": "1.5",
+            "pyarrow": "17",
+            "java": "17",
+        },
     }
     components.update(overrides)
     return components
@@ -194,20 +207,53 @@ def test_cache_round_trip(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "field",
+    ("field", "value"),
     [
-        "baseline_profiler_src_hash",
-        "harness_hash",
-        "policy_hash",
-        "metrics_config_hash",
-        "dataset_seed",
-        "spark_hash",
-        "scorer_hash",
+        ("baseline_profiler_src_hash", "other"),
+        ("harness_hash", "other"),
+        ("policy_hash", "other"),
+        ("metrics_config_hash", "other"),
+        ("dataset_seed", 1),
+        ("spark_hash", "other"),
+        ("scorer_hash", "other"),
+        ("sampler_seeds", [0, 2]),
+        ("catalog_fingerprint", "other"),
+        ("catalog_content_hash", "other"),
+        ("real_pinned_hashes", {"t": "repinned"}),
+        *[
+            (f"environment.{name}", "other")
+            for name in ("python", "pyspark", "numpy", "pandas", "scikit-learn", "pyarrow", "java")
+        ],
     ],
 )
-def test_cache_misses_on_each_key_component(tmp_path: Path, field: str) -> None:
+def test_cache_misses_on_each_key_component(tmp_path: Path, field: str, value: object) -> None:
     _store(tmp_path, _components())
-    assert baseline_cache.load_entry(tmp_path, _components(**{field: "other"})) is None
+    changed = _components()
+    if field.startswith("environment."):
+        changed["environment"] = {**changed["environment"], field.split(".", 1)[1]: value}
+    else:
+        changed[field] = value
+    assert baseline_cache.load_entry(tmp_path, changed) is None
+
+
+def test_environment_records_python_libraries_and_java() -> None:
+    assert set(baseline_cache.environment(java=False)) == {
+        "python",
+        "pyspark",
+        "numpy",
+        "pandas",
+        "scikit-learn",
+        "pyarrow",
+    }
+    assert "java" in baseline_cache.environment(java=True)
+
+
+def test_dataset_identity_uses_catalog_hashes_and_real_pins(tmp_path: Path) -> None:
+    synthetic = baseline_cache.dataset_identity("numeric", "xs", 0, tmp_path)
+    assert set(synthetic) == {"catalog_fingerprint", "catalog_content_hash"}
+    assert baseline_cache.dataset_identity("numeric", "xs", 1, tmp_path) != synthetic
+    real = next(iter(REAL_DATASETS.values()))
+    assert baseline_cache.dataset_identity(real.name, "s", 0, None) == {"real_pinned_hashes": dict(real.hashes)}
 
 
 def test_cache_misses_on_dataset_and_tier(tmp_path: Path) -> None:
@@ -361,7 +407,7 @@ def test_speed_never_overlaps_fidelity(
     assert all(a["end"] <= b["start"] for a, b in itertools.pairwise(ordered))
 
 
-def test_baseline_cache_hit_reuses_baseline_only(
+def test_accuracy_cache_hit_reuses_baseline_speed_and_fidelity(
     setup: dict[str, Path], speed_log: list[dict[str, Any]], fidelity_log: list[dict[str, Any]]
 ) -> None:
     _run(setup, "first")
@@ -373,6 +419,7 @@ def test_baseline_cache_hit_reuses_baseline_only(
     fidelity_log.clear()
     run = _run(setup, "second")
     assert run["baseline_cached"] is True
+    assert run["baseline_cache_parts"] == {"speed_cache_allowed": True, "speed_cached": True, "fidelity_cached": True}
     assert run["baseline_cache_sources"] == ["first"]
     assert len(run["baseline_cache_hits"]) == 2 * len(DATASETS)
     assert _roles(speed_log) == ["candidate"]
@@ -382,6 +429,67 @@ def test_baseline_cache_hit_reuses_baseline_only(
         for path in (setup["repo"] / "profiler/rsi/experiments/second/samples").glob("*-baseline-*")
     }
     assert second == first
+
+
+@pytest.mark.parametrize("proposal_type", ["speed", "data_volume"])
+def test_non_accuracy_runs_time_fresh_paired_baselines_with_warm_cache(
+    setup: dict[str, Path],
+    speed_log: list[dict[str, Any]],
+    fidelity_log: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    proposal_type: str,
+) -> None:
+    monkeypatch.setattr(experiment, "evaluate_experiment", lambda out: {})
+    proposal = {"type": proposal_type, "targets": DATASETS}
+    _run(setup, "warm-accuracy")
+    _run(setup, "warm-same-type", proposal=proposal)
+    speed_log.clear()
+    fidelity_log.clear()
+    run = _run(setup, "fresh-speed", proposal=proposal)
+    assert run["baseline_cache_parts"] == {"speed_cache_allowed": False, "speed_cached": False, "fidelity_cached": True}
+    assert all(hit["case"].startswith("fidelity/") for hit in run["baseline_cache_hits"])
+    assert _roles(fidelity_log) == ["candidate"]
+    samples = setup["repo"] / "profiler/rsi/experiments/fresh-speed/samples"
+    for dataset in DATASETS:
+        runs = [entry["role"] for entry in speed_log if entry["dataset"] == dataset]
+        assert sorted(runs) == ["baseline", "baseline", "candidate", "candidate"]
+        orders = {
+            tuple(json.loads((samples / f"speed-candidate-{dataset}-xs-{index}.json").read_text())["order"])
+            for index in range(2)
+        }
+        assert orders == {("baseline", "candidate"), ("candidate", "baseline")}
+    assert not [path for path in setup["cache"].glob("speed-*.json") if "fresh-speed" in path.read_text()]
+
+
+def test_environment_change_misses_cache(
+    setup: dict[str, Path],
+    speed_log: list[dict[str, Any]],
+    fidelity_log: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _run(setup, "first")
+    real = baseline_cache.environment
+    monkeypatch.setattr(experiment, "environment", lambda *, java: {**real(java=java), "numpy": "0.0"})
+    speed_log.clear()
+    run = _run(setup, "new-numpy")
+    assert run["baseline_cached"] is False
+    assert "baseline" in _roles(speed_log)
+
+
+def test_catalog_content_change_misses_cache(
+    setup: dict[str, Path],
+    speed_log: list[dict[str, Any]],
+    fidelity_log: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _run(setup, "first")
+    real = baseline_cache.dataset_identity
+    monkeypatch.setattr(
+        experiment,
+        "dataset_identity",
+        lambda *args: {**real(*args), "catalog_content_hash": "regenerated"},
+    )
+    assert _run(setup, "new-catalog")["baseline_cached"] is False
 
 
 def test_baseline_change_misses_cache(

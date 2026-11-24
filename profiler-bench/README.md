@@ -358,15 +358,17 @@ are frozen per experiment, and a candidate's profile JSON is the only candidate 
 the candidate profiler from its worktree. Each result includes the full reconstruction, structure, privacy, and
 real-vs-real ceiling detail. Ceilings are cached by dataset, tier, and harness hash in the experiment cache under an
 fcntl lock with atomic writes. Baseline-build samples are also cached across experiments in
-`profiler/rsi/experiments/.cache/baseline/` (git-ignored). A speed entry holds all N baseline samples of one
-(dataset, tier) case; a fidelity entry holds the baseline profile and its K per-seed scores. Entries are keyed by the
-baseline `profiler/src` hash, harness hash, policy hash, metrics config hash, dataset, tier, dataset seed, and Spark
-config hash (speed entries add the sample count and machine; fidelity entries add the seeds and scorer). A matching
-entry is reused and only the candidate runs; any mismatch, corrupt file, or failed sample recomputes. Writes use an
-fcntl lock with atomic replace. `run.json` records `baseline_cached`, `baseline_cache_sources` (the experiment ids
-that produced the reused samples), and `baseline_cache_hits`. Cached baseline speed samples were timed in an earlier
-run, so speed pairs then span two runs; pass `--no-baseline-cache` to measure the baseline fresh. The candidate role
-never reads the cache, including in control runs. `--control` runs the baseline against itself. Unmeasured privacy checks keep the
+`profiler/rsi/experiments/.cache/baseline/` (git-ignored). Fidelity entries (the baseline profile and its K per-seed
+scores) are reused for any proposal type. Speed entries (all N baseline samples of one dataset and tier) are reused
+only for accuracy proposals; speed and data-volume proposals always time both builds fresh in the same run, with
+rotated order. Keys cover the baseline `profiler/src` hash, harness hash, policy hash, metrics config hash, dataset,
+tier, dataset seed, Spark config hash, the catalog generator fingerprint and instance content hash (or the pinned
+hashes of a real dataset), and the Python, PySpark, NumPy, pandas, scikit-learn, and pyarrow versions. Speed keys add
+the Java version, sample count, and machine; fidelity keys add the sampler seeds and scorer. Any mismatch, corrupt
+file, or failed sample recomputes. Writes use an fcntl lock with atomic replace. `run.json` records `baseline_cached`,
+`baseline_cache_parts` (whether speed caching was allowed and whether speed or fidelity came from the cache),
+`baseline_cache_sources`, and `baseline_cache_hits`. Pass `--no-baseline-cache` to measure the baseline fresh. The
+candidate role never reads the cache, including in control runs. `--control` runs the baseline against itself. Unmeasured privacy checks keep the
 sample successful with `privacy_passed=false` and are listed in `privacy_unmeasured`, so the evaluator's hard guard
 rejects them. Tests can explicitly inject a `FakeScorer`; command-line runs never use it.
 

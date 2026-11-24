@@ -12,7 +12,7 @@ from typing import Any
 
 from profiler_bench.catalog import DATASETS
 from profiler_bench.evaluate.evaluate import evaluate_experiment
-from profiler_bench.runner.baseline_cache import config_hash, load_entry, store_entry
+from profiler_bench.runner.baseline_cache import config_hash, dataset_identity, environment, load_entry, store_entry
 from profiler_bench.runner.fidelity_run import DEFAULT_FIDELITY_CELL_TIMEOUT_S, paired_seeds, run_fidelity_samples
 from profiler_bench.runner.identity import (
     BuildIdentity,
@@ -129,7 +129,8 @@ def run_experiment(config: ExperimentConfig) -> Path:
 
     proposal = config.proposal or {"type": "accuracy", "targets": datasets}
     (out / "proposal.json").write_text(json.dumps(proposal, indent=2, sort_keys=True) + "\n")
-    all_speed_n = effective_speed_samples(policy, str(proposal.get("type", "accuracy")))
+    proposal_type = str(proposal.get("type", "accuracy"))
+    all_speed_n = effective_speed_samples(policy, proposal_type)
     speed_n = {tier: all_speed_n[tier] for tier in speed_tiers}
     if speed_n[fidelity_tier] < 1:
         raise ValueError(f"fidelity tier {fidelity_tier!r} needs at least one speed sample for its profile")
@@ -150,15 +151,21 @@ def run_experiment(config: ExperimentConfig) -> Path:
     scorer_baseline, scorer_candidate = _role_scorers(scorer)
 
     cache_root = (config.baseline_cache_dir or out.parent / ".cache" / "baseline") if config.baseline_cache else None
-    speed_keys, fidelity_keys = _cache_keys(
-        baseline=baseline,
-        harness=harness,
-        policy=policy,
-        datasets=datasets,
-        speed_n=speed_n,
-        fidelity_tier=fidelity_tier,
-        fidelity_spark=fidelity_spark,
-        scorer=scorer_baseline,
+    speed_keys, fidelity_keys = (
+        _cache_keys(
+            baseline=baseline,
+            harness=harness,
+            policy=policy,
+            datasets=datasets,
+            speed_n=speed_n,
+            fidelity_tier=fidelity_tier,
+            fidelity_spark=fidelity_spark,
+            scorer=scorer_baseline,
+            cache_speed=proposal_type == "accuracy",
+            catalog_root=config.cache_dir,
+        )
+        if cache_root is not None
+        else ({}, {})
     )
     speed_hits = _cache_hits(cache_root, speed_keys)
     fidelity_hits = _cache_hits(cache_root, fidelity_keys)
@@ -180,6 +187,11 @@ def run_experiment(config: ExperimentConfig) -> Path:
         "fidelity_cell_timeout_s": float(config.fidelity_cell_timeout_s),
         "fidelity_model_source": "harness",
         "baseline_cache_enabled": cache_root is not None,
+        "baseline_cache_parts": {
+            "speed_cache_allowed": proposal_type == "accuracy",
+            "speed_cached": bool(speed_hits),
+            "fidelity_cached": bool(fidelity_hits),
+        },
         "baseline_cached": bool(hits),
         "baseline_cache_sources": sorted({hit["source"] for hit in hits}),
         "baseline_cache_hits": hits,
@@ -242,38 +254,53 @@ def _cache_keys(
     fidelity_tier: str,
     fidelity_spark: dict[str, Any],
     scorer: Scorer,
+    cache_speed: bool,
+    catalog_root: Path | None,
 ) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
-    """Returns baseline cache key components for every speed and fidelity case `(dataset, tier)`."""
+    """Returns baseline cache key components for every cacheable speed and fidelity case `(dataset, tier)`.
+
+    Speed cases are cacheable only when `cache_speed` is set (accuracy proposals); other proposal
+    types time both builds fresh in the same run.
+    """
+    dataset_seed = int(policy.get("dataset_seed", 0))
     common = {
         "baseline_profiler_src_hash": baseline.profiler_src_hash,
         "harness_hash": harness.harness_hash,
         "policy_hash": harness.policy_hash,
         "metrics_config_hash": harness.metrics_config_hash,
-        "dataset_seed": int(policy.get("dataset_seed", 0)),
+        "dataset_seed": dataset_seed,
     }
-    speed = {
-        (dataset, tier): {
-            **common,
-            "kind": "speed",
-            "dataset": dataset,
-            "tier": tier,
-            "samples": n,
-            "spark_hash": config_hash(policy.get("spark", {})),
-            "machine": machine_info(),
+    speed = (
+        {
+            (dataset, tier): {
+                **common,
+                **dataset_identity(dataset, tier, dataset_seed, catalog_root),
+                "kind": "speed",
+                "dataset": dataset,
+                "tier": tier,
+                "samples": n,
+                "spark_hash": config_hash(policy.get("spark", {})),
+                "machine": machine_info(),
+                "environment": environment(java=True),
+            }
+            for dataset in datasets
+            for tier, n in speed_n.items()
+            if n > 0
         }
-        for dataset in datasets
-        for tier, n in speed_n.items()
-        if n > 0
-    }
+        if cache_speed
+        else {}
+    )
     fidelity = {
         (dataset, fidelity_tier): {
             **common,
+            **dataset_identity(dataset, fidelity_tier, dataset_seed, catalog_root),
             "kind": "fidelity",
             "dataset": dataset,
             "tier": fidelity_tier,
-            "seeds": paired_seeds(int(policy.get("fidelity_seeds", 5))),
+            "sampler_seeds": paired_seeds(int(policy.get("fidelity_seeds", 5))),
             "spark_hash": config_hash(fidelity_spark),
             "scorer_hash": config_hash(_scorer_fingerprint(scorer)),
+            "environment": environment(java=False),
         }
         for dataset in datasets
     }
