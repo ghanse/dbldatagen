@@ -10,7 +10,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
@@ -45,12 +46,16 @@ def run_fidelity_samples(
     cell_timeout_s: float = DEFAULT_FIDELITY_CELL_TIMEOUT_S,
     worker_prefix: Sequence[str] | None = None,
     kill_grace_s: float = DEFAULT_WORKER_KILL_GRACE_S,
+    parallelism: int = 1,
+    cached_baseline: Mapping[str, Sequence[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     """Scores one representative profile per build/dataset in an isolated worker.
 
     Each (role, dataset) cell runs in a fresh subprocess with its own SparkSession.
     All K paired seeds for that cell share the process. A crash in one cell cannot
-    affect any other cell.
+    affect any other cell. Up to `parallelism` cells run at once; each cell writes only
+    its own sample files and records keep the serial order, so output does not depend
+    on `parallelism`. Datasets in `cached_baseline` reuse those baseline records.
     """
     tier = str(policy.get("fidelity_tier", "s"))
     k = int(policy.get("fidelity_seeds", 5))
@@ -59,46 +64,59 @@ def run_fidelity_samples(
     spark_config = fidelity_spark or fidelity_spark_config(driver_memory=DEFAULT_FIDELITY_DRIVER_MEMORY)
     profiles = _representative_profiles(speed_records, datasets, tier)
     scorers = {"baseline": scorer_baseline, "candidate": scorer_candidate}
-    records: list[dict[str, Any]] = []
+    cached = cached_baseline or {}
     exe = python_exe or sys.executable
-    for case_index, dataset in enumerate(datasets):
-        order = rotate_order(0, case_index)
-        if dataset not in profiles.get("baseline", {}) or dataset not in profiles.get("candidate", {}):
-            for role in order:
-                for seed in seeds:
-                    records.append(
-                        _failed_seed(
-                            role,
-                            dataset,
-                            tier,
-                            seed,
-                            "MissingProfileError",
-                            "missing speed profile for fidelity scoring",
-                            samples_dir,
-                        )
+    plan: list[Future[list[dict[str, Any]]] | list[dict[str, Any]]] = []
+    with ThreadPoolExecutor(max_workers=max(1, int(parallelism))) as pool:
+        for case_index, dataset in enumerate(datasets):
+            order = rotate_order(0, case_index)
+            needs_profile = [role for role in order if not (role == "baseline" and dataset in cached)]
+            if any(dataset not in profiles.get(role, {}) for role in needs_profile):
+                for role in order:
+                    plan.append(
+                        [
+                            _failed_seed(
+                                role,
+                                dataset,
+                                tier,
+                                seed,
+                                "MissingProfileError",
+                                "missing speed profile for fidelity scoring",
+                                samples_dir,
+                            )
+                            for seed in seeds
+                        ]
                     )
-            continue
-        for role in order:
-            cell_records = _run_cell(
-                role=role,
-                dataset=dataset,
-                tier=tier,
-                seeds=seeds,
-                profile=profiles[role][dataset],
-                scorer=scorers[role],
-                samples_dir=samples_dir,
-                dataset_seed=dataset_seed,
-                fidelity_spark=spark_config,
-                cache_dir=cache_dir,
-                harness_hash=harness_hash,
-                metrics_config_hash=metrics_config_hash,
-                python_exe=exe,
-                cell_timeout_s=cell_timeout_s,
-                worker_prefix=worker_prefix,
-                kill_grace_s=kill_grace_s,
-            )
-            records.extend(cell_records)
-    return records
+                continue
+            for role in order:
+                if role not in needs_profile:
+                    reused = [dict(record) for record in cached[dataset]]
+                    for record in reused:
+                        _write_sample(samples_dir, record)
+                    plan.append(reused)
+                    continue
+                plan.append(
+                    pool.submit(
+                        _run_cell,
+                        role=role,
+                        dataset=dataset,
+                        tier=tier,
+                        seeds=seeds,
+                        profile=profiles[role][dataset],
+                        scorer=scorers[role],
+                        samples_dir=samples_dir,
+                        dataset_seed=dataset_seed,
+                        fidelity_spark=spark_config,
+                        cache_dir=cache_dir,
+                        harness_hash=harness_hash,
+                        metrics_config_hash=metrics_config_hash,
+                        python_exe=exe,
+                        cell_timeout_s=cell_timeout_s,
+                        worker_prefix=worker_prefix,
+                        kill_grace_s=kill_grace_s,
+                    )
+                )
+        return [record for item in plan for record in (item.result() if isinstance(item, Future) else item)]
 
 
 def score_one_seed(

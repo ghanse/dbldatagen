@@ -6,7 +6,7 @@ import json
 import subprocess
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -32,9 +32,17 @@ def run_speed_samples(
     dataset_seed: int = 0,
     cache_dir: Path | None = None,
     python_exe: str | None = None,
+    speed_n: Mapping[str, int] | None = None,
+    cached_baseline: Mapping[tuple[str, str], Sequence[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Runs N fresh-process speed samples per (build, dataset, tier) with rotating order."""
-    speed_n = policy.get("speed_samples", {})
+    """Runs N fresh-process speed samples per (build, dataset, tier) with rotating order.
+
+    `speed_n` overrides the policy's per-tier counts. Cases in `cached_baseline`, keyed by
+    `(dataset, tier)`, reuse those baseline records and run only the candidate.
+    Samples run one at a time; nothing else may run concurrently.
+    """
+    counts = speed_n if speed_n is not None else policy.get("speed_samples", {})
+    cached = cached_baseline or {}
     builds = {"baseline": baseline, "candidate": candidate}
     records: list[dict[str, Any]] = []
     case_index = 0
@@ -43,24 +51,29 @@ def run_speed_samples(
         policy_path.write_text(json.dumps(policy, sort_keys=True))
         for dataset in datasets:
             for tier in tiers:
-                n = int(speed_n[tier])
+                n = int(counts[tier])
+                reused = cached.get((dataset, tier))
                 for sample_index in range(n):
                     order = rotate_order(sample_index, case_index)
                     for role in order:
-                        record = _one_sample(
-                            build=builds[role],
-                            role=role,
-                            dataset=dataset,
-                            tier=tier,
-                            sample_index=sample_index,
-                            order=order,
-                            policy=policy,
-                            policy_path=policy_path,
-                            samples_dir=samples_dir,
-                            dataset_seed=dataset_seed,
-                            cache_dir=cache_dir,
-                            python_exe=python_exe or sys.executable,
-                        )
+                        if role == "baseline" and reused is not None:
+                            record = dict(reused[sample_index])
+                            _write_record(samples_dir, record)
+                        else:
+                            record = _one_sample(
+                                build=builds[role],
+                                role=role,
+                                dataset=dataset,
+                                tier=tier,
+                                sample_index=sample_index,
+                                order=order,
+                                policy=policy,
+                                policy_path=policy_path,
+                                samples_dir=samples_dir,
+                                dataset_seed=dataset_seed,
+                                cache_dir=cache_dir,
+                                python_exe=python_exe or sys.executable,
+                            )
                         records.append(record)
                 case_index += 1
     return records
@@ -134,8 +147,14 @@ def _one_sample(
         "not_measured": payload.get("not_measured", policy.get("not_measured", [])),
         "policy_file": str(DEFAULT_POLICY.name),
     }
-    out.write_text(json.dumps(record, sort_keys=True, default=str))
+    _write_record(samples_dir, record)
     return record
+
+
+def _write_record(samples_dir: Path, record: dict[str, Any]) -> None:
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    out = samples_dir / f"speed-{record['role']}-{record['dataset']}-{record['tier']}-{record['sample_index']}.json"
+    out.write_text(json.dumps(record, sort_keys=True, default=str))
 
 
 def check_profile_determinism(records: Sequence[dict[str, Any]]) -> dict[str, Any]:

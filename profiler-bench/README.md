@@ -330,16 +330,25 @@ The reference sampler is designed for benchmark tiers up to `s` (about 100,000 r
 harness. Each build is a git worktree plus commit; the **speed** worker imports that worktree's `profiler/src` via
 `PYTHONPATH` in a **fresh subprocess**. Speed samples time `profile_tables` (driver wall, process CPU, peak RSS)
 after an untimed warmup, rotate baseline/candidate order across cases, and record profile hashes under the policy's
-timed Spark config (unchanged by fidelity settings). The default policy (version 1.1.0) takes N=15 speed samples per
-build and case for tiers `s` and `m`, up from N=5; this triples speed-run time. The speed baselines in
-`profiler/rsi/BASELINE.md` were measured at N=5 and must be re-measured under this policy. Fidelity samples take one
+timed Spark config (unchanged by fidelity settings). The default policy (version 2.0.0) times speed on `local[8]` with
+an 8 GiB driver (other confs unchanged; 1.x used `local[2]` and 2 GiB). Speed results under 1.x are not comparable
+with 2.0.0; old experiments re-evaluate against the policy recorded in their own `run.json`. The speed baselines in
+`profiler/rsi/BASELINE.md` were measured under 1.x and must be re-measured (P1.8e). The nested tier-m OOM at 2 GiB is
+no longer the binding limit, so rsi-0007 targets wall time rather than completion. Speed and data-volume proposals take
+N=15 speed samples per build and case for tiers `s` and `m`. Accuracy proposals, whose speed gates are off, take only
+a smoke check from `speed_samples_accuracy` (2 per build and case at tier `s`, none at `m`). `run.json` records the
+count actually used as `speed_samples_effective`, and the evaluator's expected matrix uses it (runs recorded before
+this field use the policy's `speed_samples`). Fidelity samples take one
 profile per build/dataset at the fidelity tier and score it with the reference sampler and fidelity metrics for K
 **paired** sampler seeds. Each
 `(build, dataset)` cell runs in its own fidelity worker subprocess with a fresh SparkSession (profile in via file,
 score JSON out via file; all K seeds share that process; default per-cell timeout 45 minutes via
 `ExperimentConfig.fidelity_cell_timeout_s`, recorded as `fidelity_cell_timeout_s`). On timeout the parent SIGTERMs
 then SIGKILLs the worker process group so orphan JVMs cannot survive. Builds rotate per dataset the same way speed
-samples do. A crash, timeout, or invalid worker payload in one cell cannot affect any other cell; that cell's seed
+samples do. Up to `fidelity_parallelism` cells (policy default 3) run at once, each on `local[4]` with an 8 GiB
+driver; each cell writes only its own sample files and records keep the serial order, so results are byte-identical
+to serial execution. Fidelity always starts after every speed sample has finished, and speed samples run one at a
+time, so timing never shares the machine with other benchmark work. A crash, timeout, or invalid worker payload in one cell cannot affect any other cell; that cell's seed
 records are `ok=false` with `error_class` (`WorkerTimeout`, `WorkerCrashed`, `WorkerOutputInvalid`,
 `WorkerOutputMismatch`, or `MissingProfileError`). Fidelity workers use a fixed Spark config recorded in `run.json`
 as `fidelity_spark` (default `spark.driver.memory=8g`, override with `ExperimentConfig.fidelity_driver_memory`;
@@ -348,7 +357,16 @@ shuffle partitions sized for `local[N]`). Fidelity workers deliberately parse pr
 are frozen per experiment, and a candidate's profile JSON is the only candidate input. Speed workers keep importing
 the candidate profiler from its worktree. Each result includes the full reconstruction, structure, privacy, and
 real-vs-real ceiling detail. Ceilings are cached by dataset, tier, and harness hash in the experiment cache under an
-fcntl lock with atomic writes. `--control` runs the baseline against itself. Unmeasured privacy checks keep the
+fcntl lock with atomic writes. Baseline-build samples are also cached across experiments in
+`profiler/rsi/experiments/.cache/baseline/` (git-ignored). A speed entry holds all N baseline samples of one
+(dataset, tier) case; a fidelity entry holds the baseline profile and its K per-seed scores. Entries are keyed by the
+baseline `profiler/src` hash, harness hash, policy hash, metrics config hash, dataset, tier, dataset seed, and Spark
+config hash (speed entries add the sample count and machine; fidelity entries add the seeds and scorer). A matching
+entry is reused and only the candidate runs; any mismatch, corrupt file, or failed sample recomputes. Writes use an
+fcntl lock with atomic replace. `run.json` records `baseline_cached`, `baseline_cache_sources` (the experiment ids
+that produced the reused samples), and `baseline_cache_hits`. Cached baseline speed samples were timed in an earlier
+run, so speed pairs then span two runs; pass `--no-baseline-cache` to measure the baseline fresh. The candidate role
+never reads the cache, including in control runs. `--control` runs the baseline against itself. Unmeasured privacy checks keep the
 sample successful with `privacy_passed=false` and are listed in `privacy_unmeasured`, so the evaluator's hard guard
 rejects them. Tests can explicitly inject a `FakeScorer`; command-line runs never use it.
 

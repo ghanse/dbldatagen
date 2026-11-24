@@ -10,6 +10,7 @@ from pyspark.sql import SparkSession
 
 DEFAULT_FIDELITY_DRIVER_MEMORY = "8g"
 DEFAULT_FIDELITY_MASTER = "local[2]"
+EXPERIMENT_FIDELITY_MASTER = "local[4]"
 
 
 def build_spark(policy: dict[str, Any], *, app_name: str = "profiler-bench-rsi") -> SparkSession:
