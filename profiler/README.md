@@ -76,7 +76,7 @@ With an interval trigger the command runs until interrupted and rewrites `profil
 
 The streaming engine requires pyspark 3.5 or later (for Spark's `hll_sketch_agg`); `StreamingProfiler` and
 `dbldatagen-profile stream` fail with a clear error on older versions. The batch engine still supports pyspark 3.4.1.
-Quantiles and cross-column dependencies are batch-only because streaming checkpoints do not retain mergeable
+Quantiles, comparison constraints, and cross-column dependencies are batch-only because streaming checkpoints do not retain mergeable
 percentile sketches or cross-column moments.
 
 A snapshot equals the batch profile of the same rows on these statistics: row count, null fraction, nested
@@ -139,16 +139,23 @@ A profile contains:
   counts child rows for every parent key, including keys with none; child keys that match no parent are left out and
   show up in `coverage` instead.
 - `dependencies`: the Spark engine computes Pearson correlation for at most 64 top-level numeric/temporal pairs in a
-  separate aggregate: one additional Spark job per table when candidate pairs exist, with at most 128 expressions.
-  Keeping those expressions out of the marginal aggregate prevents wide tables from exhausting the driver. Pairs are
-  selected deterministically by increasing distance in schema order, then by the left column's schema position, so
-  adjacent columns are considered first and a 200-column table does not generate every possible pair.
-  Temporal-temporal and conventionally named ID/key pairs are not candidates, and correlations with absolute value
-  above 0.999 are omitted. A dependency requires at least
+  separate aggregate: one additional Spark job per table when candidate pairs exist. Keeping those expressions out of
+  the marginal aggregate prevents wide tables from exhausting the driver. Pairs are selected deterministically by
+  increasing distance in schema order, then by the left column's schema position, so adjacent columns are considered
+  first and a 200-column table does not generate every possible pair.
+  Conventionally named ID/key pairs are not candidates. A dependency requires at least
   `privacy.min_value_count` paired finite values and a finite correlation. Numeric values are converted to doubles;
   dates to UTC epoch days; timestamps, timestamp-without-time-zone, and times to UTC epoch seconds. The profile
   contains only the aggregate coefficient and column names, never source values or row samples. Dependencies are
   batch-only.
+- `check_constraints`: the Spark engine considers at most 64 top-level comparison pairs in the same pairwise aggregate
+  as dependencies. Numeric pairs must share a family (integer, fractional, or decimal); temporal pairs must have the
+  same kind (date, timestamp, or timestamp-without-time-zone), and time columns are excluded. It emits `<` when every
+  jointly non-null row is strictly ordered, otherwise `<=` when every such row is ordered, reversing the column names
+  when necessary. Non-finite floats are excluded. Each constraint requires at least `privacy.min_value_count` paired
+  values. ID/key-like columns are skipped, and the deterministic schema-distance cap bounds wide-table work. At both
+  64-pair caps, the pairwise aggregate has at most 320 expressions per table. Comparison constraints contain column
+  names only, never literals, and are batch-only.
 - `semantic`: optional PII class, sensitivity, confidence, and value-free detection evidence. Tables may also record
   sampled pairs and triples that behave as quasi-identifiers.
 

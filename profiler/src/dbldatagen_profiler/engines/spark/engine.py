@@ -18,6 +18,7 @@ from dbldatagen_profiler.model import (
     SPEC_VERSION,
     BooleanStats,
     ColumnProfile,
+    ComparisonConstraint,
     DependenceMethod,
     Dependency,
     DistinctCount,
@@ -72,7 +73,10 @@ _HISTOGRAM_MAX_DISTINCT = 64
 # left index. This puts adjacent columns first and caps wide-table aggregate
 # growth deterministically instead of constructing every possible pair.
 _MAX_PEARSON_PAIRS = 64
-_MAX_PEARSON_CORRELATION = 0.999
+
+# Comparison pairs use the same deterministic schema-distance ordering as
+# Pearson pairs. The cap bounds the width of the single pairwise aggregate.
+_MAX_COMPARISON_PAIRS = 64
 
 
 def profile_tables(
@@ -149,13 +153,14 @@ def _profile_table(
     for index, field in enumerate(df.schema.fields):
         expressions.extend(_aggregate_expressions(df[field.name], field.dataType, index))
     pairs = _pearson_pairs(df)
-    pearson_expressions: list[Column] = []
+    comparison_pairs = _comparison_pairs(df)
+    pairwise_expressions: list[Column] = []
     for pair_index, (_, _, left, right) in enumerate(pairs):
         paired = left.isNotNull() & right.isNotNull()
         paired_left = F.when(paired, left)
         paired_right = F.when(paired, right)
         denominator = F.stddev_samp(paired_left) * F.stddev_samp(paired_right)
-        pearson_expressions.extend(
+        pairwise_expressions.extend(
             [
                 F.count(F.when(paired, 1)).alias(f"p{pair_index}_support"),
                 F.when(denominator != 0, F.covar_samp(paired_left, paired_right) / denominator).alias(
@@ -163,13 +168,22 @@ def _profile_table(
                 ),
             ]
         )
+    for pair_index, (_, _, left, right) in enumerate(comparison_pairs):
+        paired = left.isNotNull() & right.isNotNull()
+        pairwise_expressions.extend(
+            [
+                F.count(F.when(paired, 1)).alias(f"c{pair_index}_support"),
+                F.count(F.when(paired & (left <= right), 1)).alias(f"c{pair_index}_lte"),
+                F.count(F.when(paired & (left < right), 1)).alias(f"c{pair_index}_lt"),
+            ]
+        )
     values = _with_value_counts(
         df,
         [(f"c{index}", df[field.name], field.dataType) for index, field in enumerate(df.schema.fields)],
         _collect_aggregate(df, expressions),
     )
-    if pearson_expressions:
-        values.update(_collect_aggregate(df, pearson_expressions))
+    if pairwise_expressions:
+        values.update(_collect_aggregate(df, pairwise_expressions))
     row_count = int(values["__row_count"])
     columns = [
         _column_from_aggregate(field, values, index, row_count, privacy, nested=False, df=df)
@@ -183,10 +197,12 @@ def _profile_table(
         QuasiIdentifierSet(columns=names, unique_fraction=unique, k_anonymity=k) for names, unique, k in quasi_sets
     ]
     dependencies = _dependencies_from_aggregate(pairs, values, privacy)
+    constraints = _comparisons_from_aggregate(comparison_pairs, values, privacy)
     return TableProfile(
         name=name,
         row_count=row_count,
         columns=protected,
+        check_constraints=constraints or None,
         dependencies=dependencies or None,
         quasi_identifier_sets=quasi or None,
     )
@@ -211,7 +227,6 @@ def _pearson_pairs(df: DataFrame) -> list[tuple[str, str, Column, Column]]:
             for left_index, left_name, left_type, left in eligible
             for right_index, right_name, right_type, right in eligible
             if left_index < right_index
-            and not (isinstance(left_type, _temporal_types()) and isinstance(right_type, _temporal_types()))
         ),
         key=lambda pair: (pair[0], pair[1]),
     )
@@ -219,6 +234,47 @@ def _pearson_pairs(df: DataFrame) -> list[tuple[str, str, Column, Column]]:
         (left_name, right_name, left, right)
         for _, _, left_name, right_name, left, right in ordered[:_MAX_PEARSON_PAIRS]
     ]
+
+
+def _comparison_pairs(df: DataFrame) -> list[tuple[str, str, Column, Column]]:
+    """Returns at most 64 deterministically ordered comparable column pairs."""
+    eligible = [
+        (index, field.name, field.dataType, _comparison_value(df[field.name], field.dataType))
+        for index, field in enumerate(df.schema.fields)
+        if _comparison_family(field.dataType) is not None and not _key_like_name(field.name)
+    ]
+    ordered = sorted(
+        (
+            (right_index - left_index, left_index, left_name, right_name, left, right)
+            for left_index, left_name, left_type, left in eligible
+            for right_index, right_name, right_type, right in eligible
+            if left_index < right_index and _comparison_family(left_type) == _comparison_family(right_type)
+        ),
+        key=lambda pair: (pair[0], pair[1]),
+    )
+    return [
+        (left_name, right_name, left, right)
+        for _, _, left_name, right_name, left, right in ordered[:_MAX_COMPARISON_PAIRS]
+    ]
+
+
+def _comparison_family(data_type: T.DataType) -> str | None:
+    families: tuple[tuple[tuple[type[T.DataType], ...], str], ...] = (
+        ((T.ByteType, T.ShortType, T.IntegerType, T.LongType), "integer"),
+        ((T.FloatType, T.DoubleType), "fractional"),
+        ((T.DecimalType,), "decimal"),
+        ((T.DateType,), "date"),
+        ((T.TimestampType,), "timestamp"),
+        (_timestamp_ntz_types(), "timestamp_ntz"),
+    )
+    return next((family for types, family in families if isinstance(data_type, types)), None)
+
+
+def _comparison_value(column: Column, data_type: T.DataType) -> Column:
+    """Converts non-finite floating-point values to null before comparison."""
+    if isinstance(data_type, (T.FloatType, T.DoubleType)):
+        return F.when(~F.isnan(column) & (F.abs(column) != float("inf")), column)
+    return column
 
 
 def _key_like_name(name: str) -> bool:
@@ -248,13 +304,41 @@ def _dependencies_from_aggregate(
     for index, (left, right, _, _) in enumerate(pairs):
         correlation = _finite_float(values[f"p{index}_correlation"])
         supported = int(values[f"p{index}_support"]) >= privacy.min_value_count
-        if supported and correlation is not None and abs(correlation) <= _MAX_PEARSON_CORRELATION:
+        if supported and correlation is not None:
             dependencies.append(
                 Dependency(
                     columns=(left, right), method=DependenceMethod.PEARSON, value=max(-1.0, min(1.0, correlation))
                 )
             )
     return dependencies
+
+
+def _comparisons_from_aggregate(
+    pairs: list[tuple[str, str, Column, Column]],
+    values: Mapping[str, Any],
+    privacy: PrivacyPolicy,
+) -> list[ComparisonConstraint]:
+    constraints = []
+    for index, (left, right, _, _) in enumerate(pairs):
+        support = int(values[f"c{index}_support"])
+        if support < privacy.min_value_count:
+            continue
+        lte = int(values[f"c{index}_lte"])
+        lt = int(values[f"c{index}_lt"])
+        if lte == support:
+            constraint_left, constraint_right = left, right
+            operator = "<" if lt == support else "<="
+        elif lt == 0:
+            constraint_left, constraint_right = right, left
+            operator = "<" if lte == 0 else "<="
+        else:
+            continue
+        constraints.append(
+            ComparisonConstraint(
+                left=constraint_left, operator=operator, right=constraint_right, satisfied_fraction=1.0
+            )
+        )
+    return constraints
 
 
 def _protect_column(
