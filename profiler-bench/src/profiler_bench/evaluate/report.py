@@ -59,7 +59,11 @@ def build_summary(
             "n": len(rows),
             "reconstruction_mean": sum(float(row["reconstruction"]) for row in rows) / len(rows),
             "relative_mean": sum(float(row["relative_reconstruction"]) for row in rows) / len(rows),
-            "structure_mean": sum(float(row["structure"]) for row in rows) / len(rows),
+            "structure_mean": (
+                "not_applicable"
+                if any(row["structure"] is None for row in rows)
+                else sum(float(row["structure"]) for row in rows) / len(rows)
+            ),
             "privacy_all_passed": all(bool(row["privacy_passed"]) for row in rows),
         }
 

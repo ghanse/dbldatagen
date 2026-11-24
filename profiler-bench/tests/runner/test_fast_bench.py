@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from profiler_bench.catalog import REAL_DATASETS
+from profiler_bench.catalog.real import SPLIT
 from profiler_bench.evaluate.evaluate import evaluate_experiment
 from profiler_bench.evaluate.gates import evaluate_gates, expected_sample_keys
 from profiler_bench.rsi import __main__ as rsi_cli
@@ -253,7 +254,10 @@ def test_dataset_identity_uses_catalog_hashes_and_real_pins(tmp_path: Path) -> N
     assert set(synthetic) == {"catalog_fingerprint", "catalog_content_hash"}
     assert baseline_cache.dataset_identity("numeric", "xs", 1, tmp_path) != synthetic
     real = next(iter(REAL_DATASETS.values()))
-    assert baseline_cache.dataset_identity(real.name, "s", 0, None) == {"real_pinned_hashes": dict(real.hashes)}
+    assert baseline_cache.dataset_identity(real.name, "s", 0, None) == {
+        "real_pinned_hashes": dict(real.hashes),
+        "real_split": SPLIT,
+    }
 
 
 def test_cache_misses_on_dataset_and_tier(tmp_path: Path) -> None:

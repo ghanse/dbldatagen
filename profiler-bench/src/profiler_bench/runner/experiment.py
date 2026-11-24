@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from profiler_bench.catalog import DATASETS
+from profiler_bench.catalog import DATASETS, REAL_DATASETS, Unavailable, cache_dir
+from profiler_bench.catalog.real import PARTS, SPLIT, materialize_part
 from profiler_bench.evaluate.evaluate import evaluate_experiment
 from profiler_bench.runner.baseline_cache import config_hash, dataset_identity, environment, load_entry, store_entry
 from profiler_bench.runner.fidelity_run import DEFAULT_FIDELITY_CELL_TIMEOUT_S, paired_seeds, run_fidelity_samples
@@ -51,6 +52,7 @@ class ExperimentConfig:
         fidelity_cell_timeout_s: Wall-clock timeout for one (build, dataset) fidelity worker.
         baseline_cache: Reuse and store baseline-build samples across experiments.
         baseline_cache_dir: Baseline cache location; defaults to `profiler/rsi/experiments/.cache/baseline`.
+        suite: `synthetic` (the catalog generators), `real` (the real datasets, a holdout check), or `all`.
     """
 
     experiment_id: str
@@ -69,6 +71,46 @@ class ExperimentConfig:
     fidelity_cell_timeout_s: float = DEFAULT_FIDELITY_CELL_TIMEOUT_S
     baseline_cache: bool = True
     baseline_cache_dir: Path | None = None
+    suite: str = "synthetic"
+
+
+SUITES = ("synthetic", "real", "all")
+
+
+def suite_datasets(suite: str, datasets: Sequence[str] | None) -> tuple[list[str], list[str]]:
+    """Returns the `(synthetic, real)` datasets of a suite, restricted to `datasets` when given.
+
+    Raises:
+        ValueError: If the suite is unknown or `datasets` names a dataset outside it.
+    """
+    if suite not in SUITES:
+        raise ValueError(f"unknown suite {suite!r}; expected one of {list(SUITES)}")
+    synthetic = sorted(DATASETS) if suite != "real" else []
+    real = sorted(REAL_DATASETS) if suite != "synthetic" else []
+    if datasets is None:
+        return synthetic, real
+    outside = [name for name in datasets if name not in synthetic and name not in real]
+    if outside:
+        raise ValueError(f"datasets {outside} are not in the {suite} suite")
+    return [n for n in datasets if n in synthetic], [n for n in datasets if n in real]
+
+
+def prepare_real(names: Sequence[str], tier: str, root: Path | None) -> tuple[list[str], dict[str, str]]:
+    """Materializes every benchmark part of each real dataset and returns `(ready, skipped)`.
+
+    A dataset is skipped, with the reason, when its export is neither cached nor exportable (no warehouse
+    configured, rejected credentials, offline), fails its pinned checks, or has no tier `tier`.
+    """
+    ready, skipped = [], {}
+    for name in names:
+        try:
+            for part in PARTS:
+                materialize_part(REAL_DATASETS[name], tier, part, root)
+        except (Unavailable, ValueError, KeyError) as reason:
+            skipped[name] = f"{type(reason).__name__}: {reason}"
+        else:
+            ready.append(name)
+    return ready, skipped
 
 
 def experiment_dir(experiment_id: str, repo_root: Path | None = None) -> Path:
@@ -119,7 +161,7 @@ def run_experiment(config: ExperimentConfig) -> Path:
     harness = identify_harness(policy=policy)
     recording_root = Path(harness.harness_root)
 
-    datasets = list(config.datasets) if config.datasets is not None else sorted(DATASETS)
+    datasets, real_requested = suite_datasets(config.suite, config.datasets)
     speed_tiers = (
         list(config.speed_tiers) if config.speed_tiers is not None else list(policy.get("speed_tiers", ["s", "m"]))
     )
@@ -136,6 +178,9 @@ def run_experiment(config: ExperimentConfig) -> Path:
         raise ValueError(f"fidelity tier {fidelity_tier!r} needs at least one speed sample for its profile")
     dataset_seed = int(policy.get("dataset_seed", 0))
     fidelity_parallelism = int(policy.get("fidelity_parallelism", 1))
+    real_root = config.cache_dir or cache_dir()
+    real_datasets, real_skipped = prepare_real(real_requested, fidelity_tier, real_root)
+    real_speed_n = {fidelity_tier: speed_n[fidelity_tier]}
 
     fidelity_spark = fidelity_spark_config(
         driver_memory=config.fidelity_driver_memory,
@@ -145,6 +190,7 @@ def run_experiment(config: ExperimentConfig) -> Path:
         cache_dir=out / "cache",
         harness_hash=harness.harness_hash,
         metrics_config_hash=harness.metrics_config_hash,
+        real_root=real_root,
     )
     if scorer is None:
         raise RuntimeError("no Scorer available: inject ExperimentConfig.scorer or merge sampler/fidelity modules")
@@ -152,17 +198,22 @@ def run_experiment(config: ExperimentConfig) -> Path:
 
     cache_root = (config.baseline_cache_dir or out.parent / ".cache" / "baseline") if config.baseline_cache else None
     speed_keys, fidelity_keys = (
-        _cache_keys(
-            baseline=baseline,
-            harness=harness,
-            policy=policy,
-            datasets=datasets,
-            speed_n=speed_n,
-            fidelity_tier=fidelity_tier,
-            fidelity_spark=fidelity_spark,
-            scorer=scorer_baseline,
-            cache_speed=proposal_type == "accuracy",
-            catalog_root=config.cache_dir,
+        _merged_keys(
+            [
+                _cache_keys(
+                    baseline=baseline,
+                    harness=harness,
+                    policy=policy,
+                    datasets=names,
+                    speed_n=tiers,
+                    fidelity_tier=fidelity_tier,
+                    fidelity_spark=fidelity_spark,
+                    scorer=scorer_baseline,
+                    cache_speed=proposal_type == "accuracy",
+                    catalog_root=config.cache_dir,
+                )
+                for names, tiers in ((datasets, speed_n), (real_datasets, real_speed_n))
+            ]
         )
         if cache_root is not None
         else ({}, {})
@@ -175,7 +226,15 @@ def run_experiment(config: ExperimentConfig) -> Path:
         for (dataset, tier), entry in found.items()
     ]
 
+    real_meta = {
+        "real_datasets": real_datasets,
+        "real_skipped": real_skipped,
+        "real_split": SPLIT,
+        "real_speed_tiers": [fidelity_tier],
+    }
     run_meta = {
+        "suite": config.suite,
+        **(real_meta if config.suite != "synthetic" else {}),
         "experiment_id": config.experiment_id,
         "control": config.control,
         "datasets": datasets,
@@ -206,18 +265,22 @@ def run_experiment(config: ExperimentConfig) -> Path:
     }
     (out / "run.json").write_text(json.dumps(run_meta, indent=2, sort_keys=True, default=str) + "\n")
 
-    speed_records = run_speed_samples(
-        baseline=baseline,
-        candidate=candidate,
-        datasets=datasets,
-        tiers=speed_tiers,
-        policy=policy,
-        samples_dir=samples_dir,
-        dataset_seed=dataset_seed,
-        cache_dir=config.cache_dir,
-        speed_n=speed_n,
-        cached_baseline={case: entry["records"] for case, entry in speed_hits.items()},
-    )
+    speed_records = [
+        record
+        for names, tiers in ((datasets, speed_n), (real_datasets, real_speed_n))
+        for record in run_speed_samples(
+            baseline=baseline,
+            candidate=candidate,
+            datasets=names,
+            tiers=list(tiers),
+            policy=policy,
+            samples_dir=samples_dir,
+            dataset_seed=dataset_seed,
+            cache_dir=config.cache_dir,
+            speed_n=tiers,
+            cached_baseline={case: entry["records"] for case, entry in speed_hits.items()},
+        )
+    ]
     determinism = check_profile_determinism(speed_records)
     (samples_dir / "profile_determinism.json").write_text(json.dumps(determinism, indent=2, sort_keys=True) + "\n")
     _store_misses(cache_root, speed_keys, speed_hits, speed_records, config.experiment_id)
@@ -226,7 +289,7 @@ def run_experiment(config: ExperimentConfig) -> Path:
         speed_records=speed_records,
         scorer_baseline=scorer_baseline,
         scorer_candidate=scorer_candidate,
-        datasets=datasets,
+        datasets=[*datasets, *real_datasets],
         policy=policy,
         samples_dir=samples_dir,
         dataset_seed=dataset_seed,
@@ -237,6 +300,7 @@ def run_experiment(config: ExperimentConfig) -> Path:
         cell_timeout_s=float(config.fidelity_cell_timeout_s),
         parallelism=fidelity_parallelism,
         cached_baseline={dataset: entry["records"] for (dataset, _), entry in fidelity_hits.items()},
+        real_root=real_root,
     )
     _store_misses(cache_root, fidelity_keys, fidelity_hits, fidelity_records, config.experiment_id, speed_records)
 
@@ -305,6 +369,13 @@ def _cache_keys(
         for dataset in datasets
     }
     return speed, fidelity
+
+
+def _merged_keys(
+    parts: Sequence[tuple[dict[tuple[str, str], dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]],
+) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
+    """Returns the union of several `(speed, fidelity)` cache key sets."""
+    return {k: v for speed, _ in parts for k, v in speed.items()}, {k: v for _, fid in parts for k, v in fid.items()}
 
 
 def _role_scorers(scorer: Scorer) -> tuple[Scorer, Scorer]:

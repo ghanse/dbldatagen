@@ -125,8 +125,18 @@ any network or authentication failure, the export raises `Unavailable` with the 
 
 Real data has no planted truth. Its manifest is marked `ground_truth: none` and claims only the schema, row counts,
 documented primary, unique, and foreign keys that hold in the data, and privacy classes; it makes no distribution
-claims. `verify` checks just those. Structure scoring must skip these manifests. Reconstruction and privacy can still
-run, but each real dataset has one sample, so there is no independent holdout or ceiling (see COVERAGE.md).
+claims. `verify` checks just those, and structure scoring is skipped: it is recorded as `not_applicable`, never 0.
+
+For benchmarking, `real.split` divides each export into three disjoint parts (`real.SPLIT`, version 1, recorded in
+`run.json` and the baseline cache key). `profiled` is the only part the profiler sees; `holdout` is the privacy
+baseline; `ceiling` stands in for the synthetic data, so the ceiling is the reconstruction of `ceiling` against
+`profiled`. A row of a table without foreign keys goes to part `blake2b-64("split", table, key) mod 3`, where the key
+is the primary key (all non-nested columns without one). A row with non-null foreign keys takes the part of the parent
+rows it references, and is dropped when those parents are in different parts or were dropped, so each part satisfies
+the declared foreign keys. Tier `s` of a part is the tier-s subset of that part. Parts are cached under
+`real/<dataset>/split-v1/<part>/<tier>`. The rule is symmetric across parts, but child tables with several
+independently split parents lose rows: a row whose k parents must agree survives with probability about (1/3)^(k-1).
+This hits TPC-DS hardest, where `customer` references `customer_address` and three `date_dim` rows.
 
 | Dataset | Source | Licence and terms |
 |---|---|---|
@@ -363,7 +373,7 @@ scores) are reused for any proposal type. Speed entries (all N baseline samples 
 only for accuracy proposals; speed and data-volume proposals always time both builds fresh in the same run, with
 rotated order. Keys cover the baseline `profiler/src` hash, harness hash, policy hash, metrics config hash, dataset,
 tier, dataset seed, Spark config hash, the catalog generator fingerprint and instance content hash (or the pinned
-hashes of a real dataset), and the Python, PySpark, NumPy, pandas, scikit-learn, and pyarrow versions. Speed keys add
+hashes and split method of a real dataset), and the Python, PySpark, NumPy, pandas, scikit-learn, and pyarrow versions. Speed keys add
 the Java version, sample count, and machine; fidelity keys add the sampler seeds and scorer. Any mismatch, corrupt
 file, or failed sample recomputes. Writes use an fcntl lock with atomic replace. `run.json` records `baseline_cached`,
 `baseline_cache_parts` (whether speed caching was allowed and whether speed or fidelity came from the cache),
@@ -381,6 +391,24 @@ hard guard (not policy-disableable). Completeness is checked against the expecte
 and identical `profiler_src_hash` builds can never be `accepted`. Results land in `profiler/rsi/experiments/<id>/` as
 `run.json`, `samples/*.json`, `summary.json`, `verdict.json`, `REPORT.md`, and `benchmark_entry.json` (shaped for
 `rsi_log.py append` kind `benchmark`).
+
+### Real holdout suite
+
+`ExperimentConfig.suite` picks the datasets: `synthetic` (default, the catalog generators; behaviour and cache keys
+as before), `real` (the four real datasets), or `all`. Before any timing, each requested real dataset's parts are
+materialized at the fidelity tier. A dataset whose export is neither cached nor exportable (no warehouse, rejected
+credentials, offline), fails its pinned checks, or has no such tier (real datasets have only `s` and `full`) is
+skipped with the reason in `run.json` `real_skipped`; the run continues. Scored real datasets are listed in
+`real_datasets` and take speed samples only at the fidelity tier, for their profile.
+
+The evaluator treats the real suite as a **holdout**, not part of acceptance: real samples are excluded from
+completeness, privacy, accuracy mean, per-dataset, structure, and speed gates, and checked only by the `real_holdout`
+gate. It reports each real dataset's baseline and candidate relative reconstruction with bootstrap CIs, the paired
+regression CI, and whether the candidate passed privacy. A candidate sample that fails privacy on a real dataset
+**rejects** (`real_holdout_privacy_failed`). A regression CI that reaches `accuracy.max_dataset_regression` makes the
+verdict **inconclusive** (`real_holdout_regression`) instead of accepted; failed or missing real samples do the same
+(`real_holdout_incomplete`). With every real dataset skipped the gate passes as `real_holdout_skipped`. A
+`real`-only run has no synthetic pairs, so it can measure but never accept.
 
 ```bash
 uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi run \

@@ -14,6 +14,13 @@ requested just before the chunk is downloaded; an expired link is requested agai
 backoff. Each table's source `SELECT COUNT(*)` must match the rows received and the declared count. See `connect`
 for the environment variables. Any network or authentication failure raises `Unavailable`; a cached instance
 needs no warehouse.
+
+Benchmark parts: `split` divides an export into the three disjoint parts of `PARTS` as described by `SPLIT`. The
+profiler sees only `profiled`; `holdout` is the privacy baseline and `ceiling` stands in for synthetic data in the
+real-vs-real ceiling. A row of a table with no foreign keys goes to the part its primary key (all non-nested columns
+when it has none) hashes to. A row with non-null foreign keys takes the part of the parent rows it references and is
+dropped when they are in different parts or were dropped, so every part satisfies the declared foreign keys. Tier `s`
+of a part is the tier-s subset of that part. Bump `SPLIT["version"]` whenever the method changes.
 """
 
 from __future__ import annotations
@@ -40,6 +47,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.compute as pc
 from pyarrow import ipc
+from pyspark.sql import DataFrame, SparkSession
 
 from profiler_bench.catalog.hashing import table_hash
 from profiler_bench.catalog.manifest import Column, ForeignKey, Manifest, Privacy, Table
@@ -57,6 +65,15 @@ PROFILE_ENV = "PROFILER_BENCH_DATABRICKS_PROFILE"
 TIMEOUT = 120.0
 _NULL = "\0"
 _SEPARATOR = "\x1f"
+PARTS = ("profiled", "holdout", "ceiling")
+SPLIT: dict[str, Any] = {
+    "version": 1,
+    "parts": list(PARTS),
+    "assignment": "blake2b-64 of 'split', the table, and the primary key (all non-nested columns without one), mod 3",
+    "foreign_keys": "a row with non-null foreign keys takes its parents' part; dropped when they differ or are dropped",
+    "tier_s": "the tier-s subset of each part",
+}
+_DROPPED = -1
 
 
 class Unavailable(Exception):
@@ -219,16 +236,98 @@ def materialize(
     else:
         full = materialize(dataset, "full", root, check_hash)
         tables = subset(dataset, {t.name: full.read_table(t.name) for t in full.manifest.tables}, TIERS["s"])
-    truth = dataset.manifest(tier, tables)
+    _write(target, tables, dataset.manifest(tier, tables))
+    return read_instance(target)
+
+
+def _write(target: Path, tables: Mapping[str, pa.Table], truth: Manifest) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(dir=target.parent, prefix=".tmp-"))
     try:
-        write_instance(staging, tables, truth, 0)
+        write_instance(staging, dict(tables), truth, 0)
         staging.rename(target)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
+
+
+def part_dir(dataset: RealDataset, tier: str, part: str, root: Path | None = None) -> Path:
+    """Returns the cache directory of one tier of one benchmark part of a real dataset."""
+    return (root or cache_dir()) / "real" / dataset.name / f"split-v{SPLIT['version']}" / part / tier
+
+
+def materialize_part(
+    dataset: RealDataset, tier: str, part: str, root: Path | None = None, check_hash: bool = True
+) -> Materialized:
+    """Returns a tier of one benchmark part (see `split`) from the cache, splitting the full export first if needed.
+
+    Raises:
+        KeyError: If `tier` or `part` is unknown.
+        Unavailable: If the full export is not cached and the warehouse cannot be used.
+        ValueError: If the export differs from the declared row counts, schema, or pinned hashes.
+    """
+    if tier not in REAL_TIERS or part not in PARTS:
+        raise KeyError(f"unknown tier {tier!r} or part {part!r}; expected {list(REAL_TIERS)} and {list(PARTS)}")
+    target = part_dir(dataset, tier, part, root)
+    if (target / META_FILE).exists():
+        if is_intact(target, check_hash):
+            return read_instance(target)
+        shutil.rmtree(target)
+    if tier == "full":
+        full = materialize(dataset, "full", root, check_hash)
+        for name, tables in split(dataset, {t.name: full.read_table(t.name) for t in full.manifest.tables}).items():
+            other = part_dir(dataset, tier, name, root)
+            if name == part or not (other / META_FILE).exists():
+                shutil.rmtree(other, ignore_errors=True)
+                _write(other, tables, dataset.manifest(tier, tables))
+    else:
+        whole = materialize_part(dataset, "full", part, root, check_hash)
+        tables = subset(dataset, {t.name: whole.read_table(t.name) for t in whole.manifest.tables}, TIERS["s"])
+        _write(target, tables, dataset.manifest(tier, tables))
     return read_instance(target)
+
+
+def load_part(
+    dataset: RealDataset, tier: str, part: str, spark: SparkSession, root: Path | None = None, check_hash: bool = True
+) -> dict[str, DataFrame]:
+    """Returns the tables of one benchmark part as Spark DataFrames, materializing it first if needed."""
+    instance = materialize_part(dataset, tier, part, root, check_hash)
+    return {t.name: spark.read.parquet(str(instance.table_path(t.name))) for t in instance.manifest.tables}
+
+
+def split(dataset: RealDataset, tables: Mapping[str, pa.Table]) -> dict[str, dict[str, pa.Table]]:
+    """Returns the disjoint benchmark parts of `tables` by part name, each closed under the declared foreign keys.
+
+    Args:
+        dataset: Real dataset the tables belong to.
+        tables: Full tables by name.
+    """
+    specs = {t.name: t for t in dataset.tables}
+    parents = {name: {fk.parent_table for fk in dataset.foreign_keys if fk.child_table == name} for name in specs}
+    assigned: dict[str, list[int]] = {}
+    for name in TopologicalSorter(parents).static_order():
+        table = tables[name]
+        columns = specs[name].primary_key or [f.name for f in table.schema if not pa.types.is_nested(f.type)]
+        own = [_bucket(f"split{_SEPARATOR}{name}{_SEPARATOR}{v}") for v in _key_text(table, columns).to_pylist()]
+        inherited: list[int | None] = [None] * table.num_rows
+        for fk in (fk for fk in dataset.foreign_keys if fk.child_table == name):
+            parent = tables[fk.parent_table]
+            lookup = dict(zip(_key_text(parent, fk.parent_columns).to_pylist(), assigned[fk.parent_table], strict=True))
+            present = reduce(pc.and_, [pc.is_valid(table.column(c)) for c in fk.child_columns]).to_pylist()
+            references = _key_text(table, fk.child_columns).to_pylist()
+            for row, (valid, key) in enumerate(zip(present, references, strict=True)):
+                if valid:
+                    found = lookup.get(key, _DROPPED)
+                    inherited[row] = found if inherited[row] in (None, found) else _DROPPED
+        assigned[name] = [o if i is None else i for o, i in zip(own, inherited, strict=True)]
+    return {
+        part: {name: tables[name].filter(pc.equal(pa.array(assigned[name], pa.int8()), index)) for name in specs}
+        for index, part in enumerate(PARTS)
+    }
+
+
+def _bucket(text: str) -> int:
+    return int.from_bytes(hashlib.blake2b(text.encode(), digest_size=8).digest(), "little") % len(PARTS)
 
 
 def _pinned(dataset: RealDataset, instance: Materialized) -> bool:

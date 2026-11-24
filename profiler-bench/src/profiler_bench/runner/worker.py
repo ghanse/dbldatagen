@@ -63,20 +63,20 @@ def _profile_once(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str,
     import dbldatagen_profiler  # noqa: PLC0415
     from dbldatagen_profiler.engines.spark.engine import profile_tables  # noqa: PLC0415
     from dbldatagen_profiler.model import dump_profile, load_profile  # noqa: PLC0415
-    from profiler_bench.catalog import load, materialize  # noqa: PLC0415
+    from profiler_bench.catalog import REAL_DATASETS, load, materialize  # noqa: PLC0415
+    from profiler_bench.catalog.real import load_part  # noqa: PLC0415
     from profiler_bench.runner.identity import profile_content_hash  # noqa: PLC0415
     from profiler_bench.runner.spark_conf import build_spark  # noqa: PLC0415
 
     profiler_module_file = str(Path(dbldatagen_profiler.__file__).resolve())
     spark = build_spark(policy, app_name=f"rsi-{args.dataset}-{args.tier}")
     sample_seed = args.sample_seed if args.sample_seed is not None else args.seed
-    tables = load(
-        args.dataset,
-        args.tier,
-        seed=args.seed,
-        spark=spark,
-        sample_seed=sample_seed,
-    )
+    if args.dataset in REAL_DATASETS:
+        if args.fraction is not None:
+            raise ValueError("data-volume subsets of real datasets are not supported")
+        tables = load_part(REAL_DATASETS[args.dataset], args.tier, "profiled", spark)
+    else:
+        tables = load(args.dataset, args.tier, seed=args.seed, spark=spark, sample_seed=sample_seed)
     subset_meta = None
     if args.fraction is not None:
         from profiler_bench.runner.subset import (  # noqa: PLC0415
