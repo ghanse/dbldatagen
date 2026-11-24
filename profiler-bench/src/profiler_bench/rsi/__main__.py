@@ -31,6 +31,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument("--proposal", type=Path, default=None, help="Optional proposal.json to copy.")
     run.add_argument("--speed-tiers", nargs="+", default=None, help="Override speed tiers.")
     run.add_argument(
+        "--no-baseline-cache",
+        action="store_true",
+        help="Measure the baseline build fresh instead of reusing cached baseline samples.",
+    )
+    run.add_argument(
         "--mode",
         choices=("default", "data-volume"),
         default="default",
@@ -110,6 +115,7 @@ def _run(args: argparse.Namespace) -> int:
                 proposal=proposal,
                 speed_tiers=args.speed_tiers,
                 command_line=sys.argv,
+                baseline_cache=not args.no_baseline_cache,
             )
         )
     verdict = json.loads((path / "verdict.json").read_text())
