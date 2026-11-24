@@ -1,0 +1,144 @@
+{
+  "baseline": {
+    "commit": "69a3127180b91c9e490aa1061e588ecb6bf70281",
+    "dirty": true,
+    "profiler_src_hash": "6b7c9ccbf595cd414d04d87a54d16b97b553fbed7bbff68222f2d7468ab1f200",
+    "role": "baseline",
+    "worktree": "<repo>"
+  },
+  "candidate": {
+    "commit": "13ab01113c725bb8ae89867adc27169fea6b913a",
+    "dirty": false,
+    "profiler_src_hash": "bcbf63a7b5868756fd988b06190c6dcdacc338c17e33fe8cb845edae6a5c3161",
+    "role": "candidate",
+    "worktree": "<external>/rsi-0003b"
+  },
+  "command_line": [
+    "<repo>/profiler-bench/src/profiler_bench/rsi/__main__.py",
+    "run",
+    "--baseline",
+    "<repo>",
+    "--candidate",
+    "<external>/rsi-0003b",
+    "--policy",
+    "profiler-bench/policies/default.json",
+    "--experiment-id",
+    "rsi-0003b-s-0001",
+    "--datasets",
+    "retail",
+    "numeric",
+    "strings",
+    "temporal",
+    "nested",
+    "edge",
+    "--speed-tiers",
+    "s",
+    "--proposal",
+    "profiler/rsi/experiments/.rsi-0003b-s-0001-proposal.json"
+  ],
+  "control": false,
+  "datasets": [
+    "retail",
+    "numeric",
+    "strings",
+    "temporal",
+    "nested",
+    "edge"
+  ],
+  "experiment_id": "rsi-0003b-s-0001",
+  "fidelity_cell_timeout_s": 2700.0,
+  "fidelity_model_source": "harness",
+  "fidelity_spark": {
+    "configs": {
+      "spark.driver.memory": "8g",
+      "spark.sql.session.timeZone": "UTC",
+      "spark.sql.shuffle.partitions": "2",
+      "spark.ui.enabled": "false"
+    },
+    "master": "local[2]"
+  },
+  "fidelity_tier": "s",
+  "harness": {
+    "commit": "69a3127180b91c9e490aa1061e588ecb6bf70281",
+    "dirty": true,
+    "harness_hash": "ab3c0499e396478c5218533109e2d80ec237ec7eafff7407f5344d642ed5f322",
+    "harness_root": "<repo>",
+    "hashed_roots": [
+      "<repo>/profiler-bench/src/profiler_bench",
+      "<repo>/profiler-bench/policies"
+    ],
+    "metrics_config_hash": "846521dcf72bb2f576d3ac9af89b95c4fcbee5e6b49bc9c5e838e5a54bf2be69",
+    "policy_hash": "ce43d8463c382ec9140ce7db2e1898d94ba4926b0b17d022fc2a9fb64caba81b"
+  },
+  "machine": {
+    "machine": "arm64",
+    "node": "X5R2FN2YQC",
+    "platform": "macOS-26.7.2-arm64-arm-64bit",
+    "processor": "arm",
+    "python": "3.10.20 (main, Mar  3 2026, 00:49:35) [Clang 17.0.0 (clang-1700.6.3.2)]"
+  },
+  "not_measured": [
+    "Spark executor / JVM heap and RSS (driver process RSS only)",
+    "GPU / accelerator time",
+    "network and disk IO bytes",
+    "cluster-scale Spark (local[*] only)",
+    "end-to-end dbldatagen generation from the profile"
+  ],
+  "policy": {
+    "accuracy": {
+      "ci_lower_must_exceed": 0.0,
+      "max_dataset_regression": 0.01,
+      "max_structure_regression": 0.02,
+      "min_mean_improvement": 0.005
+    },
+    "bootstrap": {
+      "confidence": 0.95,
+      "samples": 2000,
+      "seed": 0
+    },
+    "dataset_seed": 0,
+    "fidelity_seeds": 5,
+    "fidelity_tier": "s",
+    "not_measured": [
+      "Spark executor / JVM heap and RSS (driver process RSS only)",
+      "GPU / accelerator time",
+      "network and disk IO bytes",
+      "cluster-scale Spark (local[*] only)",
+      "end-to-end dbldatagen generation from the profile"
+    ],
+    "privacy": {
+      "hard_guard": true,
+      "note": "Privacy cannot be disabled; every candidate dataset x seed must set privacy_passed=true."
+    },
+    "spark": {
+      "configs": {
+        "spark.driver.memory": "2g",
+        "spark.sql.session.timeZone": "UTC",
+        "spark.sql.shuffle.partitions": "2",
+        "spark.ui.enabled": "false"
+      },
+      "master": "local[2]"
+    },
+    "speed": {
+      "max_cpu_regression": 0.1,
+      "max_rss_regression_abs_mib": 64.0,
+      "max_rss_regression_frac": 0.05,
+      "max_wall_regression": 0.1,
+      "min_target_improvement": 0.05
+    },
+    "speed_samples": {
+      "m": 15,
+      "s": 15,
+      "xs": 2
+    },
+    "speed_tiers": [
+      "s",
+      "m"
+    ],
+    "version": "1.1.0"
+  },
+  "policy_path": "<repo>/profiler-bench/policies/default.json",
+  "speed_tiers": [
+    "s"
+  ]
+}
