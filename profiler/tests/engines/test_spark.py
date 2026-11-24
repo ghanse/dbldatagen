@@ -183,14 +183,6 @@ def test_profiles_pearson_dependencies_for_numeric_and_temporal_pairs(spark: Spa
     actual = {(dependency.columns, dependency.method.value): dependency.value for dependency in table.dependencies}
     assert actual[(("x", "y"), "pearson")] == pytest.approx(0.9968, rel=1e-3)
     assert actual[(("day", "moment"), "pearson")] == pytest.approx(1.0)
-    assert table.check_constraints is not None
-    assert any(
-        isinstance(constraint, ComparisonConstraint)
-        and constraint.left == "day"
-        and constraint.operator == "<="
-        and constraint.right == "moment"
-        for constraint in table.check_constraints
-    )
 
 
 def test_pearson_dependencies_require_privacy_min_value_count_finite_pairs(spark: SparkSession) -> None:
@@ -270,17 +262,75 @@ def test_profiles_strict_and_nonstrict_comparison_constraints(spark: SparkSessio
     ]
 
 
+def test_profiles_reverse_strict_and_nonstrict_comparison_constraints(spark: SparkSession) -> None:
+    rows = [(value + 1, value + value % 2, value) for value in range(20)]
+    frame = spark.createDataFrame(rows, "strict_left long, weak_left long, right long")
+
+    table = profile_dataframe("reverse_ordered", frame, detect_pii=False).tables[0]
+
+    assert table.check_constraints is not None
+    actual = {
+        (constraint.left, constraint.operator, constraint.right)
+        for constraint in table.check_constraints
+        if isinstance(constraint, ComparisonConstraint)
+    }
+    assert ("right", "<", "strict_left") in actual
+    assert ("right", "<=", "weak_left") in actual
+
+
 def test_comparison_constraints_require_support_and_skip_violations_keys_and_cross_family(
     spark: SparkSession,
 ) -> None:
-    rows = [(index, index + 1, float(index + 2), index - 1, index + 3) for index in range(9)] + [
-        (None, None, None, None, 12)
+    rows = [
+        (
+            index,
+            index + 1 if index < 9 else None,
+            float(index + 2),
+            index + 1 if index < 9 else -1,
+            index + 3,
+        )
+        for index in range(10)
     ]
     frame = spark.createDataFrame(rows, "left long, low_support long, fractional double, violated long, order_id long")
 
     table = profile_dataframe("guarded", frame, detect_pii=False).tables[0]
 
     assert table.check_constraints is None
+
+
+def test_comparison_constraints_exclude_nan_from_support(spark: SparkSession) -> None:
+    rows = [(float(value), float(value + 1)) for value in range(10)] + [(float("nan"), 0.0)]
+    frame = spark.createDataFrame(rows, "left double, right double")
+
+    table = profile_dataframe("nan", frame, detect_pii=False).tables[0]
+
+    assert table.check_constraints is not None
+    constraint = table.check_constraints[0]
+    assert isinstance(constraint, ComparisonConstraint)
+    assert (constraint.left, constraint.operator, constraint.right) == ("left", "<", "right")
+
+
+def test_comparison_pairs_require_matching_supported_temporal_kinds(spark: SparkSession) -> None:
+    schema = T.StructType(
+        [
+            T.StructField("date_a", T.DateType()),
+            T.StructField("date_b", T.DateType()),
+            T.StructField("timestamp_a", T.TimestampType()),
+            T.StructField("timestamp_b", T.TimestampType()),
+            T.StructField("ntz_a", T.TimestampNTZType()),
+            T.StructField("ntz_b", T.TimestampNTZType()),
+            T.StructField("time_a", T.TimeType()),
+            T.StructField("time_b", T.TimeType()),
+        ]
+    )
+
+    pairs = _comparison_pairs(spark.createDataFrame([], schema))
+
+    assert {(left, right) for left, right, _, _ in pairs} == {
+        ("date_a", "date_b"),
+        ("timestamp_a", "timestamp_b"),
+        ("ntz_a", "ntz_b"),
+    }
 
 
 def test_comparison_constraints_honor_custom_privacy_support(spark: SparkSession) -> None:

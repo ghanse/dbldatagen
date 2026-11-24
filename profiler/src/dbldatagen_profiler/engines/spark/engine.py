@@ -239,7 +239,7 @@ def _pearson_pairs(df: DataFrame) -> list[tuple[str, str, Column, Column]]:
 def _comparison_pairs(df: DataFrame) -> list[tuple[str, str, Column, Column]]:
     """Returns at most 64 deterministically ordered comparable column pairs."""
     eligible = [
-        (index, field.name, field.dataType, df[field.name])
+        (index, field.name, field.dataType, _comparison_value(df[field.name], field.dataType))
         for index, field in enumerate(df.schema.fields)
         if _comparison_family(field.dataType) is not None and not _key_like_name(field.name)
     ]
@@ -259,15 +259,22 @@ def _comparison_pairs(df: DataFrame) -> list[tuple[str, str, Column, Column]]:
 
 
 def _comparison_family(data_type: T.DataType) -> str | None:
-    if isinstance(data_type, (T.ByteType, T.ShortType, T.IntegerType, T.LongType)):
-        return "integer"
+    families: tuple[tuple[tuple[type[T.DataType], ...], str], ...] = (
+        ((T.ByteType, T.ShortType, T.IntegerType, T.LongType), "integer"),
+        ((T.FloatType, T.DoubleType), "fractional"),
+        ((T.DecimalType,), "decimal"),
+        ((T.DateType,), "date"),
+        ((T.TimestampType,), "timestamp"),
+        (_timestamp_ntz_types(), "timestamp_ntz"),
+    )
+    return next((family for types, family in families if isinstance(data_type, types)), None)
+
+
+def _comparison_value(column: Column, data_type: T.DataType) -> Column:
+    """Converts non-finite floating-point values to null before comparison."""
     if isinstance(data_type, (T.FloatType, T.DoubleType)):
-        return "fractional"
-    if isinstance(data_type, T.DecimalType):
-        return "decimal"
-    if isinstance(data_type, _temporal_types()):
-        return "temporal"
-    return None
+        return F.when(~F.isnan(column) & (F.abs(column) != float("inf")), column)
+    return column
 
 
 def _key_like_name(name: str) -> bool:
@@ -314,10 +321,23 @@ def _comparisons_from_aggregate(
     constraints = []
     for index, (left, right, _, _) in enumerate(pairs):
         support = int(values[f"c{index}_support"])
-        if support < privacy.min_value_count or int(values[f"c{index}_lte"]) != support:
+        if support < privacy.min_value_count:
             continue
-        operator = "<" if int(values[f"c{index}_lt"]) == support else "<="
-        constraints.append(ComparisonConstraint(left=left, operator=operator, right=right, satisfied_fraction=1.0))
+        lte = int(values[f"c{index}_lte"])
+        lt = int(values[f"c{index}_lt"])
+        if lte == support:
+            constraint_left, constraint_right = left, right
+            operator = "<" if lt == support else "<="
+        elif lt == 0:
+            constraint_left, constraint_right = right, left
+            operator = "<" if lte == 0 else "<="
+        else:
+            continue
+        constraints.append(
+            ComparisonConstraint(
+                left=constraint_left, operator=operator, right=constraint_right, satisfied_fraction=1.0
+            )
+        )
     return constraints
 
 
