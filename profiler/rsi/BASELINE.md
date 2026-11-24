@@ -1,23 +1,26 @@
-# Frozen profiler baseline
+# Frozen profiler baseline (policy 2.0.0)
 
-This baseline compares the profiler with itself. `baseline-s-0001` is the six-dataset tier-s control; its verdict is
-**inconclusive**, as required for a control. `baseline-m-speed-0001` used the contract's 90-minute fallback and measured
-retail, numeric, and nested; its verdict is **rejected** because nested did not complete. Privacy passed in both runs.
+This baseline re-measures the profiler against itself under policy **2.0.0** at the 100k-row (`s`) tier only.
+`baseline-v2-0002` is the six-dataset tier-s control with proposal type `speed` (N=15 fresh speed samples per
+build and dataset, no baseline cache). Its verdict is **inconclusive**, as required for a control. Privacy passed
+on every seed. The prior policy-1.x baseline is kept as `BASELINE-v1.md`. The 2M-row (`m`) tier was **not**
+re-measured under policy 2.0.0 and will be measured only for speed proposals that target it.
 
 ## Identity
 
 | Item | Frozen value |
 |---|---|
-| Profiler commit | `da5d1e641ba2b53ecb301967fad6bc2d68a44cd5` |
-| `profiler/src` SHA-256 | `d02bb9fe3f6177e6e2bc1f6c17284cba672fe11f0d37f22bc6c1657bb8f7881c` |
-| Harness commit | `da5d1e641ba2b53ecb301967fad6bc2d68a44cd5` |
-| Harness SHA-256 | `cc84dbbcf5a631dfbfac570c489f9639a868ad7bdeac3bae6f076847f37506c5` |
-| Metrics config | version `1.8.0`; canonical SHA-256 `768c6bd24a4e1a749c29a40ab49c8e478533feadd681fca184bb022c576f40b8`; file SHA-256 `5fbc62012d271b69c3f575bc7b55ae8824fe7ae7dab601aecc14919168de6a3d` |
-| Policy SHA-256 | `1a0f1225a27733fb52a301612c80b73849cf3f52c2b82c3e4eadb930a325e5cd` |
+| Profiler commit | `d49f687663bd7d3e57e34bbeb156b2a4f132c9e5` |
+| `profiler/src` SHA-256 | `bcbf63a7b5868756fd988b06190c6dcdacc338c17e33fe8cb845edae6a5c3161` |
+| Harness commit | `d49f687663bd7d3e57e34bbeb156b2a4f132c9e5` |
+| Harness SHA-256 | `a29910e8bb919841f76d08d51fd72127d570653284b7a1e4cf155819cc4c6534` |
+| Metrics config | version `1.9.0`; canonical SHA-256 `4a1b0f70821e3746992ccff286b6c444b90ca85829ed8b0d797a42cae1d81078`; file SHA-256 `846521dcf72bb2f576d3ac9af89b95c4fcbee5e6b49bc9c5e838e5a54bf2be69` |
+| Policy SHA-256 | `bfcd33c433bbd05624326c338b8af4225c903915d52dc626f8a9ea9e5a5d623e` |
 
 Machine: Apple M2 Max, 12 physical / 12 logical cores, 64 GiB RAM; macOS 26.7.2 (25G332), Python 3.10.20,
-OpenJDK 17.0.16, and Spark/PySpark 4.1.1. Speed used `local[2]`, a 2 GiB driver, and 2 shuffle partitions. Fidelity
-workers used `local[2]` with an 8 GiB driver.
+OpenJDK 17.0.16, and Spark/PySpark 4.1.1. Speed used `local[8]`, an 8 GiB driver, and 2 shuffle partitions.
+Fidelity workers used `local[4]` with an 8 GiB driver, up to 3 cells in parallel. Experiment wall time for
+`baseline-v2-0002`: **24728 s** (6.87 h).
 
 ## Tier-s fidelity
 
@@ -25,44 +28,37 @@ Values are means over five sampler seeds; brackets show min-max. Privacy is pass
 
 | Dataset | Reconstruction | Ceiling | Relative to ceiling | Structure | Privacy | Three weakest reconstruction groups |
 |---|---:|---:|---:|---:|---:|---|
-| retail | 0.615095 [0.613446-0.616419] | 0.937465 | 0.653499 [0.650407-0.655510] | 0.286447 | 5/5 | discriminator 0.010813; constraints 0.468955; foreign_keys 0.524638 |
-| numeric | 0.769972 [0.767434-0.770775] | 0.990435 | 0.774184 [0.771772-0.774951] | 0.307692 | 5/5 | discriminator 0.026964; dependence_declared 0.497691; keys 0.631934 |
-| strings | 0.599840 [0.599039-0.600405] | 0.997216 | 0.601108 [0.600305-0.601675] | 0.235294 | 5/5 | discriminator 0; constraints 0.037698; marginal 0.593040 |
-| temporal | 0.763910 [0.760911-0.767279] | 0.981648 | 0.766049 [0.763036-0.769433] | 0.333333 | 5/5 | discriminator 0.000010; dependence_random 0.498930; constraints 0.583138 |
-| nested | 0.696053 [0.695776-0.696381] | 0.987673 | 0.700032 [0.699752-0.700425] | 0.507937 | 5/5 | discriminator 0; dependence_declared 0.594756; keys 0.631424 |
-| edge | 0.871844 [0.870987-0.872543] | 0.997108 | 0.872679 [0.871820-0.873382] | 0.366667 | 5/5 | discriminator 0; marginal 0.733345; keys 0.815753 |
+| retail | 0.626697 [0.625573-0.629207] | 0.937465 | 0.659719 [0.658657-0.661770] | 0.286447 | 5/5 | discriminator 0.019740; constraints 0.485447; foreign_keys 0.532969 |
+| numeric | 0.861848 [0.855562-0.866435] | 0.990435 | 0.867684 [0.861150-0.872503] | 0.423077 | 5/5 | discriminator 0.299205; keys 0.631660; dependence_declared 0.785146 |
+| strings | 0.600300 [0.599019-0.601119] | 0.997216 | 0.601570 [0.600286-0.602389] | 0.235294 | 5/5 | discriminator 0; constraints 0.037698; marginal 0.593448 |
+| temporal | 0.765141 [0.762083-0.768386] | 0.981648 | 0.767285 [0.764214-0.770545] | 0.333333 | 5/5 | discriminator 0.000002; dependence_random 0.498140; constraints 0.583563 |
+| nested | 0.722738 [0.721890-0.723661] | 0.987673 | 0.726803 [0.725934-0.727905] | 0.722222 | 5/5 | discriminator 0; keys 0.631400; marginal 0.764437 |
+| edge | 0.882226 [0.881701-0.883302] | 0.997108 | 0.883099 [0.882579-0.884186] | 0.366667 | 5/5 | discriminator 0; marginal 0.760367; keys 0.815750 |
 
 ## Profiling speed
 
-Values are baseline-role medians over five fresh-process samples; brackets show min-max. Peak RSS measures the driver
-process, not Spark JVM/executor memory.
+Values are baseline-role medians over fifteen fresh-process samples; brackets show min-max. Peak RSS measures the
+driver process, not Spark JVM/executor memory. Config: `local[8]` / 8 GiB (policy 2.0.0).
 
 ### Tier s
 
 | Dataset | Wall seconds | CPU seconds | Peak RSS MiB |
 |---|---:|---:|---:|
-| retail | 3.539 [3.404-3.832] | 1.913 [1.887-1.997] | 240.2 [238.7-270.7] |
-| numeric | 15.281 [15.088-16.175] | 3.170 [3.136-3.187] | 262.2 [260.5-263.7] |
-| strings | 6.868 [6.557-7.126] | 3.297 [3.287-3.366] | 328.7 [326.2-387.2] |
-| temporal | 3.509 [3.488-3.540] | 1.436 [1.430-1.449] | 236.6 [235.4-237.6] |
-| nested | 191.438 [187.196-193.009] | 47.101 [46.340-48.608] | 392.1 [391.4-451.5] |
-| edge | 7.851 [7.670-7.955] | 2.570 [2.540-2.630] | 274.6 [268.1-275.6] |
+| retail | 6.097 [5.490-12.215] | 2.068 [1.971-2.679] | 245.9 [242.7-246.7] |
+| numeric | 25.420 [24.532-26.988] | 3.359 [3.291-3.434] | 268.3 [267.2-269.3] |
+| strings | 9.091 [8.727-15.935] | 3.181 [3.065-4.038] | 333.3 [331.1-391.7] |
+| temporal | 4.532 [4.409-4.707] | 1.479 [1.436-1.499] | 242.0 [240.4-243.5] |
+| nested | 271.654 [265.516-302.330] | 48.463 [46.847-52.813] | 399.1 [392.8-449.6] |
+| edge | 13.724 [13.250-14.658] | 2.853 [2.760-3.110] | 276.6 [272.0-284.0] |
 
 ### Tier m
 
-| Dataset | Wall seconds | CPU seconds | Peak RSS MiB |
-|---|---:|---:|---:|
-| retail | 9.057 [8.840-9.151] | 2.701 [2.644-2.703] | 666.3 [658.0-954.0] |
-| numeric | 239.572 [238.323-243.354] | 3.169 [3.148-3.195] | 905.3 [886.5-1317.4] |
-| nested | failed (0/5 baseline; 0/10 across both control roles) | - | - |
-| strings | not measured by the fallback run | - | - |
-| temporal | not measured by the fallback run | - | - |
-| edge | not measured by the fallback run | - | - |
+Not re-measured under policy 2.0.0. Measure only for speed proposals that target the 2M-row tier.
 
 ## Noise floor
 
-The paired tier-s control reports an accuracy-mean 95% CI of [0, 0], width 0, and every per-dataset
-reconstruction-difference CI is also [0, 0]. This is not measured noise. Both control roles run the same profiler, so
+The paired tier-s control reports an accuracy-mean difference of exactly 0 on every dataset (every
+reconstruction-difference CI is [0, 0]). This is not measured noise. Both control roles run the same profiler, so
 they emit byte-identical profiles, and the sampler seeds are paired, so every difference is exactly 0 by construction.
 The control shows only that the pipeline is deterministic. It says nothing about whether +0.005 sits above noise.
 
@@ -71,39 +67,33 @@ reconstruction table above):
 
 | Dataset | Seed-to-seed spread |
 |---|---:|
-| retail | 0.0030 |
-| numeric | 0.0033 |
-| strings | 0.0014 |
-| temporal | 0.0064 |
-| nested | 0.0006 |
+| retail | 0.0036 |
+| numeric | 0.0109 |
+| strings | 0.0021 |
+| temporal | 0.0063 |
+| nested | 0.0018 |
 | edge | 0.0016 |
 
 Because candidate and baseline are scored on the same seeds, the paired gate cancels much of this spread. Even so,
-temporal's spread exceeds the +0.005 threshold, so small accuracy gains on temporal will often come out inconclusive.
+numeric's and temporal's spreads meet or exceed the +0.005 threshold, so small accuracy gains on those datasets will
+often come out inconclusive.
 
 Wall-time intervals are paired-bootstrap 95% CIs for fractional improvement, `(baseline - candidate) / baseline`,
-using 2,000 draws. Percentage-point width is the policy-relevant noise measure; raw-seconds width is included for scale.
+using 2,000 draws at N=15 speed samples per build. Percentage-point width is the policy-relevant noise measure;
+raw-seconds width is included for scale.
 
 | Dataset | Fractional improvement CI | CI width | Raw-seconds width |
-|---|---:|---:|---:|
-| retail | [-15.23%, +10.76%] | 25.99 pp | 0.951 s |
-| numeric | [-2.07%, +5.61%] | 7.69 pp | 1.221 s |
-| strings | [-2.65%, +6.88%] | 9.53 pp | 0.664 s |
-| temporal | [-1.01%, +2.08%] | 3.09 pp | 0.109 s |
-| nested | [-3.83%, +2.55%] | 6.38 pp | 12.093 s |
-| edge | [-2.10%, +1.94%] | 4.05 pp | 0.320 s |
+|---|---|---:|---:|
+| retail | [-5.76%, +11.67%] | 17.43 pp | 1.062 s |
+| numeric | [-4.18%, +2.21%] | 6.39 pp | 1.624 s |
+| strings | [-1.78%, +1.68%] | 3.47 pp | 0.315 s |
+| temporal | [-0.78%, +2.65%] | 3.42 pp | 0.155 s |
+| nested | [-4.57%, +4.03%] | 8.60 pp | 23.364 s |
+| edge | [-3.08%, +1.69%] | 4.77 pp | 0.655 s |
 
-The 5% speed threshold exceeds the observed CI width only for temporal and edge. It is below the measured width for
-retail, numeric, strings, and nested. In practice, at N=5 speed samples per build most speed proposals will come out
-inconclusive on those four datasets even when the speedup is real, unless it is well above 5%. Raising N is a policy
-change: it would be a separate, logged benchmark change, not part of a profiler proposal. The policy is unchanged here.
-
-## Known baseline failures
-
-At the frozen 2 GiB / `local[2]` speed configuration, nested tier m failed 10/10 samples: 3 Java heap OOM errors and
-7 SparkContext shutdown errors (5 baseline-role and 5 candidate-role samples total). Tier-m speed comparisons exclude
-nested until a profiler change makes it complete. Making nested tier m complete at the frozen configuration is the top
-speed proposal.
+The 5% speed threshold exceeds the observed CI width for strings, temporal, and edge. It is **still too wide** for
+retail (17.43 pp), numeric (6.39 pp), and nested (8.60 pp): at N=15 under `local[8]`/8g, a true 5% speedup on those
+three datasets can still land inconclusive.
 
 ## Where the headroom is
 
@@ -113,17 +103,18 @@ Gaps are ceiling minus score, ranked across dataset/group means over five seeds.
 2. edge / discriminator: 0.971224
 3. strings / constraints: 0.962302
 4. nested / discriminator: 0.950961
-5. numeric / discriminator: 0.929350
-6. temporal / discriminator: 0.871837
-7. retail / discriminator: 0.569404
-8. retail / constraints: 0.531045
-9. numeric / dependence_declared: 0.498540
-10. temporal / dependence_random: 0.496664
-11. retail / foreign_keys: 0.470417
-12. retail / keys: 0.427359
-13. temporal / constraints: 0.416862
-14. strings / marginal: 0.403325
-15. nested / dependence_declared: 0.394305
+5. temporal / discriminator: 0.871845
+6. numeric / discriminator: 0.657109
+7. retail / discriminator: 0.560476
+8. retail / constraints: 0.514553
+9. temporal / dependence_random: 0.497455
+10. retail / foreign_keys: 0.462085
+11. retail / keys: 0.428275
+12. temporal / constraints: 0.416437
+13. strings / marginal: 0.402918
+14. nested / keys: 0.368600
+15. numeric / keys: 0.368340
 
-Discriminator fidelity dominates the headroom for five of six datasets. Retail structure and strings constraints are
-the next major accuracy targets; nested tier-m completion is the leading speed target.
+Discriminator fidelity dominates the headroom for five of six datasets. Retail structure/constraints and strings
+constraints remain major accuracy targets. Nested wall time (~272 s median at tier s) is the leading speed target at
+the measured tier; tier-m speed is deferred until a proposal targets it.

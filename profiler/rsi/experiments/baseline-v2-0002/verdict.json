@@ -1,0 +1,534 @@
+{
+  "gates": [
+    {
+      "detail": {
+        "expected_fidelity": 60,
+        "expected_speed": 180
+      },
+      "name": "sample_completeness",
+      "passed": true,
+      "reason": "all_samples_ok",
+      "status": "pass"
+    },
+    {
+      "detail": {},
+      "name": "privacy",
+      "passed": true,
+      "reason": "privacy_passed",
+      "status": "pass"
+    },
+    {
+      "detail": {
+        "baseline_hash": "bcbf63a7b5868756fd988b06190c6dcdacc338c17e33fe8cb845edae6a5c3161",
+        "candidate_hash": "bcbf63a7b5868756fd988b06190c6dcdacc338c17e33fe8cb845edae6a5c3161",
+        "control": true,
+        "same_profiler_src_hash": true
+      },
+      "name": "control",
+      "passed": false,
+      "reason": "control",
+      "status": "inconclusive"
+    },
+    {
+      "detail": {
+        "datasets": {
+          "edge": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 1,
+            "statistic": "mean"
+          },
+          "nested": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 1,
+            "statistic": "mean"
+          },
+          "numeric": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 1,
+            "statistic": "mean"
+          },
+          "retail": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 1,
+            "statistic": "mean"
+          },
+          "strings": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 1,
+            "statistic": "mean"
+          },
+          "temporal": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 1,
+            "statistic": "mean"
+          }
+        },
+        "max_regression": 0.01
+      },
+      "name": "accuracy_per_dataset",
+      "passed": true,
+      "reason": "no_reconstruction_regression",
+      "status": "pass"
+    },
+    {
+      "detail": {
+        "datasets": {
+          "edge": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          },
+          "nested": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          },
+          "numeric": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          },
+          "retail": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          },
+          "strings": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          },
+          "temporal": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0,
+            "low": 0.0,
+            "method": "pooled",
+            "n": 5,
+            "n_bootstrap": 2000,
+            "point": 0.0,
+            "seed": 2,
+            "statistic": "mean"
+          }
+        },
+        "max_regression": 0.02
+      },
+      "name": "structure",
+      "passed": true,
+      "reason": "no_structure_regression",
+      "status": "pass"
+    },
+    {
+      "detail": {
+        "hits": [
+          "retail@s:inconclusive"
+        ],
+        "targets": {
+          "edge@s": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.016868808742090124,
+            "low": -0.030812937576798892,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.009468385440345818,
+            "seed": 3,
+            "statistic": "median"
+          },
+          "nested@s": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.04034312649767743,
+            "low": -0.04566658919316667,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.006478783202309588,
+            "seed": 3,
+            "statistic": "median"
+          },
+          "numeric@s": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.022122171961787698,
+            "low": -0.0417594612367088,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.0036235510472693248,
+            "seed": 3,
+            "statistic": "median"
+          },
+          "retail@s": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.11666067845368985,
+            "low": -0.057635866595568776,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": 0.014660579024970947,
+            "seed": 3,
+            "statistic": "median"
+          },
+          "strings@s": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.016823860034191424,
+            "low": -0.017830247498003642,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.007327042018034786,
+            "seed": 3,
+            "statistic": "median"
+          },
+          "temporal@s": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.02648848525504364,
+            "low": -0.0077581230031502245,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": 0.003167150605986517,
+            "seed": 3,
+            "statistic": "median"
+          }
+        }
+      },
+      "name": "speed_target",
+      "passed": false,
+      "reason": "target_improvement_inconclusive",
+      "status": "inconclusive"
+    },
+    {
+      "detail": {
+        "edge@s": {
+          "cpu": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0075890469935335604,
+            "low": -0.01391353757744616,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.012065836595569092,
+            "seed": 4,
+            "statistic": "median"
+          },
+          "rss": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.00458984375,
+            "low": -0.0016845703125,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": 0.0001220703125,
+            "seed": 4,
+            "statistic": "median"
+          },
+          "rss_bound": "max(frac * baseline_rss, abs_mib)",
+          "wall": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.031603189031369806,
+            "low": -0.016868808742090124,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": 0.009468385440345818,
+            "seed": 4,
+            "statistic": "median"
+          }
+        },
+        "nested@s": {
+          "cpu": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.014880018099623351,
+            "low": -0.025947380163100726,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.0002722597910489838,
+            "seed": 4,
+            "statistic": "median"
+          },
+          "rss": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.00380859375,
+            "low": -0.0039306640625,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.00093994140625,
+            "seed": 4,
+            "statistic": "median"
+          },
+          "rss_bound": "max(frac * baseline_rss, abs_mib)",
+          "wall": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.04566658919316667,
+            "low": -0.0242606800717048,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": 0.006478783202309588,
+            "seed": 4,
+            "statistic": "median"
+          }
+        },
+        "numeric@s": {
+          "cpu": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.012588844443270375,
+            "low": -0.014212081296093342,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.0016717301678016655,
+            "seed": 4,
+            "statistic": "median"
+          },
+          "rss": {
+            "confidence": 0.95,
+            "crosses_zero": false,
+            "high": -2.44140625e-05,
+            "low": -0.0005529785156249935,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.00025634765625,
+            "seed": 4,
+            "statistic": "median"
+          },
+          "rss_bound": "max(frac * baseline_rss, abs_mib)",
+          "wall": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.02440852746095595,
+            "low": -0.022122171961788416,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": 0.0036235510472693248,
+            "seed": 4,
+            "statistic": "median"
+          }
+        },
+        "retail@s": {
+          "cpu": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.031850620668120194,
+            "low": -0.03733185398668111,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.009170820410224071,
+            "seed": 4,
+            "statistic": "median"
+          },
+          "rss": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.000562438964843745,
+            "low": -0.000439453125,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": 0.0002685546875,
+            "seed": 4,
+            "statistic": "median"
+          },
+          "rss_bound": "max(frac * baseline_rss, abs_mib)",
+          "wall": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.1052238680048582,
+            "low": -0.11666067845368985,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.014660579024970947,
+            "seed": 4,
+            "statistic": "median"
+          }
+        },
+        "strings@s": {
+          "cpu": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.031180146489210893,
+            "low": -0.0014236947445418467,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": 0.007282781687614857,
+            "seed": 4,
+            "statistic": "median"
+          },
+          "rss": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.001416015625,
+            "low": -0.00279541015625,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.0001708984375,
+            "seed": 4,
+            "statistic": "median"
+          },
+          "rss_bound": "max(frac * baseline_rss, abs_mib)",
+          "wall": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.017830247498003642,
+            "low": -0.016823860034191424,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": 0.007327042018034786,
+            "seed": 4,
+            "statistic": "median"
+          }
+        },
+        "temporal@s": {
+          "cpu": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.012458264472134578,
+            "low": -0.02029285871556668,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.016447848976566096,
+            "seed": 4,
+            "statistic": "median"
+          },
+          "rss": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0001708984375,
+            "low": -0.00037841796875,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.00015869140625,
+            "seed": 4,
+            "statistic": "median"
+          },
+          "rss_bound": "max(frac * baseline_rss, abs_mib)",
+          "wall": {
+            "confidence": 0.95,
+            "crosses_zero": true,
+            "high": 0.0077581230031502245,
+            "low": -0.02648848525504364,
+            "method": "pooled",
+            "n": 15,
+            "n_bootstrap": 2000,
+            "point": -0.003167150605986517,
+            "seed": 4,
+            "statistic": "median"
+          }
+        }
+      },
+      "name": "speed_guards",
+      "passed": false,
+      "reason": "wall_regression_inconclusive",
+      "status": "inconclusive"
+    }
+  ],
+  "interval_note": "Each gate uses a two-sided percentile CI at the policy confidence level; there is no family-wise coverage guarantee across gates.",
+  "proposal_type": "speed",
+  "reasons": [
+    "control",
+    "target_improvement_inconclusive",
+    "wall_regression_inconclusive"
+  ],
+  "verdict": "inconclusive"
+}
