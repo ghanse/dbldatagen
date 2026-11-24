@@ -73,8 +73,10 @@ def evaluate_gates(
     gates.append(_privacy_guard(fidelity_records, expected))
     gates.append(_control_guard(run))
 
+    accuracy_path: Literal["mean", "targeted"] | None = None
     if proposal_type == "accuracy":
-        gates.extend(_accuracy_gates(fidelity_records, policy))
+        targets = _accuracy_targets(proposal)
+        gates.extend(_accuracy_gates(fidelity_records, policy, targets))
     elif proposal_type == "speed":
         gates.extend(_accuracy_regression_gates(fidelity_records, policy))
         gates.extend(_speed_gates(speed_records, policy, proposal))
@@ -89,8 +91,11 @@ def evaluate_gates(
             )
         )
 
-    verdict = _combine(gates)
-    return {
+    if proposal_type == "accuracy":
+        verdict, accuracy_path = _combine_accuracy(gates, targeted=bool(targets))
+    else:
+        verdict = _combine(gates)
+    result = {
         "verdict": verdict,
         "proposal_type": proposal_type,
         "gates": [gate.to_dict() for gate in gates],
@@ -100,6 +105,9 @@ def evaluate_gates(
             "there is no family-wise coverage guarantee across gates."
         ),
     }
+    if accuracy_path is not None:
+        result["accuracy_path"] = accuracy_path
+    return result
 
 
 def expected_sample_keys(run: dict[str, Any]) -> dict[str, set[str]]:
@@ -238,12 +246,23 @@ def _control_guard(run: dict[str, Any]) -> GateResult:
     return GateResult(name="control", passed=True, status="pass", reason="distinct_builds")
 
 
-def _accuracy_gates(fidelity_records: Sequence[dict[str, Any]], policy: dict[str, Any]) -> list[GateResult]:
+def _accuracy_targets(proposal: dict[str, Any]) -> list[str]:
+    """Returns accuracy target datasets from the structured proposal form."""
+    targets = proposal.get("targets")
+    if not isinstance(targets, dict):
+        return []
+    datasets = targets.get("datasets") or []
+    return [str(dataset) for dataset in datasets]
+
+
+def _accuracy_gates(
+    fidelity_records: Sequence[dict[str, Any]], policy: dict[str, Any], targets: Sequence[str] = ()
+) -> list[GateResult]:
     cfg = policy.get("accuracy", {})
     boot = policy.get("bootstrap", {})
     paired = _paired_relative(fidelity_records)
     if not paired:
-        return [
+        gates = [
             GateResult(
                 name="accuracy_mean",
                 passed=False,
@@ -251,6 +270,9 @@ def _accuracy_gates(fidelity_records: Sequence[dict[str, Any]], policy: dict[str
                 reason="no_fidelity_pairs",
             )
         ]
+        if targets:
+            gates.append(_targeted_accuracy_gate({}, targets, cfg, boot))
+        return gates
     per_dataset_means = {dataset: float(sum(diffs) / len(diffs)) for dataset, diffs in paired.items()}
     mean_ci = stratified_dataset_mean_ci(
         paired,
@@ -268,6 +290,9 @@ def _accuracy_gates(fidelity_records: Sequence[dict[str, Any]], policy: dict[str
     )
     gates[0].detail["per_dataset_mean_improvement"] = per_dataset_means
     gates[0].detail["mean_across_datasets"] = float(sum(per_dataset_means.values()) / len(per_dataset_means))
+
+    if targets:
+        gates.append(_targeted_accuracy_gate(paired, targets, cfg, boot))
 
     max_reg = float(cfg.get("max_dataset_regression", 0.01))
     reg_details = {}
@@ -334,9 +359,73 @@ def _accuracy_gates(fidelity_records: Sequence[dict[str, Any]], policy: dict[str
     return gates
 
 
+def _targeted_accuracy_gate(
+    paired: dict[str, list[float]], targets: Sequence[str], cfg: dict[str, Any], boot: dict[str, Any]
+) -> GateResult:
+    """Requires every declared dataset to clear the targeted point and CI bounds."""
+    required = float(cfg.get("min_target_improvement", 0.01))
+    details: dict[str, Any] = {}
+    status: Literal["pass", "fail", "inconclusive"] = "pass"
+    reason = "targets_improved"
+    for target in targets:
+        diffs = paired.get(target)
+        if not diffs:
+            status = "fail"
+            reason = "target_missing"
+            details[target] = {"missing": True}
+            continue
+        ci = paired_bootstrap_ci(
+            diffs,
+            statistic="mean",
+            n_bootstrap=int(boot.get("samples", 2000)),
+            seed=int(boot.get("seed", 0)) + 5,
+            confidence=float(boot.get("confidence", 0.95)),
+        )
+        details[target] = ci.to_dict()
+        if ci.crosses_zero():
+            if status != "fail":
+                status = "inconclusive"
+                reason = "target_improvement_inconclusive"
+        elif ci.point < required or ci.low <= 0.0:
+            status = "fail"
+            reason = "target_improvement_insufficient"
+    return GateResult(
+        name="accuracy_targeted",
+        passed=status == "pass",
+        status=status,
+        reason=reason,
+        detail={"targets": details, "min_target_improvement": required, "ci_lower_must_exceed": 0.0},
+    )
+
+
 def _accuracy_regression_gates(fidelity_records: Sequence[dict[str, Any]], policy: dict[str, Any]) -> list[GateResult]:
     """Speed proposals still require reconstruction not to regress."""
     return [gate for gate in _accuracy_gates(fidelity_records, policy) if gate.name != "accuracy_mean"]
+
+
+def _combine_accuracy(
+    gates: Sequence[GateResult], *, targeted: bool
+) -> tuple[Verdict, Literal["mean", "targeted"] | None]:
+    """Combines unchanged common gates with mean-or-targeted accuracy paths."""
+    by_name = {gate.name: gate for gate in gates}
+    path_names = {"accuracy_mean", "accuracy_targeted"}
+    common = [gate for gate in gates if gate.name not in path_names]
+    common_verdict = _combine(common)
+    if common_verdict != "accepted":
+        return common_verdict, None
+
+    mean = by_name["accuracy_mean"]
+    if mean.status == "pass":
+        return "accepted", "mean"
+    if targeted:
+        target = by_name["accuracy_targeted"]
+        if target.status == "pass":
+            return "accepted", "targeted"
+        if target.status == "inconclusive":
+            return "inconclusive", None
+    if mean.status == "inconclusive":
+        return "inconclusive", None
+    return "rejected", None
 
 
 def _speed_gates(

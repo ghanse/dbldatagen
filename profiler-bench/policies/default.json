@@ -1,5 +1,5 @@
 {
-  "version": "2.0.0",
+  "version": "2.1.0",
   "bootstrap": {
     "samples": 2000,
     "seed": 0,
@@ -22,6 +22,7 @@
   "dataset_seed": 0,
   "accuracy": {
     "min_mean_improvement": 0.005,
+    "min_target_improvement": 0.01,
     "ci_lower_must_exceed": 0.0,
     "max_dataset_regression": 0.01,
     "max_structure_regression": 0.02
