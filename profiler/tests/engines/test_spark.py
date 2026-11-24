@@ -255,6 +255,13 @@ def test_profiles_strict_and_nonstrict_comparison_constraints(spark: SparkSessio
         {
             "satisfied_fraction": 1.0,
             "kind": "comparison",
+            "left": "weak_right",
+            "operator": "<",
+            "right": "strict_right",
+        },
+        {
+            "satisfied_fraction": 1.0,
+            "kind": "comparison",
             "left": "left",
             "operator": "<=",
             "right": "weak_right",
