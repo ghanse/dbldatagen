@@ -125,10 +125,11 @@ def _comparable(profile: Profile) -> dict[str, Any]:
     data = profile.model_dump(mode="json")
     data.pop("created_at")
     data.pop("engine")
-    # The streaming state does not retain cross-column moments, so dependencies
-    # are intentionally outside the documented batch/stream equivalence set.
+    # The streaming state does not retain cross-column moments or comparisons,
+    # so these are intentionally outside the documented equivalence set.
     for table in data["tables"]:
         table.pop("dependencies")
+        table.pop("check_constraints")
     return data
 
 

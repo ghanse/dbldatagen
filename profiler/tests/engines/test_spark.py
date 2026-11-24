@@ -11,8 +11,20 @@ from pyspark.sql import types as T
 
 from dbldatagen_profiler.engines.spark import engine as spark_engine
 from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
-from dbldatagen_profiler.engines.spark.engine import _histogram, _logical_type, _numeric_stats, _pearson_pairs
-from dbldatagen_profiler.model import LogicalType, PrivacyPolicy, ValueTreatment, profile_json_schema
+from dbldatagen_profiler.engines.spark.engine import (
+    _comparison_pairs,
+    _histogram,
+    _logical_type,
+    _numeric_stats,
+    _pearson_pairs,
+)
+from dbldatagen_profiler.model import (
+    ComparisonConstraint,
+    LogicalType,
+    PrivacyPolicy,
+    ValueTreatment,
+    profile_json_schema,
+)
 
 
 pytestmark = [pytest.mark.spark, pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")]
@@ -170,7 +182,15 @@ def test_profiles_pearson_dependencies_for_numeric_and_temporal_pairs(spark: Spa
     assert table.dependencies is not None
     actual = {(dependency.columns, dependency.method.value): dependency.value for dependency in table.dependencies}
     assert actual[(("x", "y"), "pearson")] == pytest.approx(0.9968, rel=1e-3)
-    assert (("day", "moment"), "pearson") not in actual
+    assert actual[(("day", "moment"), "pearson")] == pytest.approx(1.0)
+    assert table.check_constraints is not None
+    assert any(
+        isinstance(constraint, ComparisonConstraint)
+        and constraint.left == "day"
+        and constraint.operator == "<="
+        and constraint.right == "moment"
+        for constraint in table.check_constraints
+    )
 
 
 def test_pearson_dependencies_require_privacy_min_value_count_finite_pairs(spark: SparkSession) -> None:
@@ -209,17 +229,68 @@ def test_pearson_dependencies_use_a_separate_aggregate(spark: SparkSession, monk
 
     assert len(calls) == 2
     assert all("p0_" not in expression for expression in calls[0])
-    assert len(calls[1]) == 2
-    assert all("p0_" in expression for expression in calls[1])
+    assert len(calls[1]) == 5
+    assert sum("p0_" in expression for expression in calls[1]) == 2
+    assert sum("c0_" in expression for expression in calls[1]) == 3
 
 
-def test_pearson_dependencies_skip_near_deterministic_and_key_like_pairs(spark: SparkSession) -> None:
+def test_pearson_dependencies_keep_exact_and_skip_key_like_pairs(spark: SparkSession) -> None:
     rows = [(value, index, value * 3, value * 6) for index, value in enumerate(list(range(10)) * 2)]
     frame = spark.createDataFrame(rows, "order_id long, unique_key long, exact long, exact_copy long")
 
     table = profile_dataframe("guarded", frame, detect_pii=False).tables[0]
 
-    assert table.dependencies is None
+    assert table.dependencies is not None
+    assert [dependency.columns for dependency in table.dependencies] == [("exact", "exact_copy")]
+    assert table.dependencies[0].value == pytest.approx(1.0)
+
+
+def test_profiles_strict_and_nonstrict_comparison_constraints(spark: SparkSession) -> None:
+    rows = [(value, value + 1, value) for value in range(20)]
+    frame = spark.createDataFrame(rows, "left long, strict_right long, weak_right long")
+
+    table = profile_dataframe("ordered", frame, detect_pii=False).tables[0]
+
+    assert table.check_constraints is not None
+    assert [constraint.model_dump() for constraint in table.check_constraints] == [
+        {
+            "satisfied_fraction": 1.0,
+            "kind": "comparison",
+            "left": "left",
+            "operator": "<",
+            "right": "strict_right",
+        },
+        {
+            "satisfied_fraction": 1.0,
+            "kind": "comparison",
+            "left": "left",
+            "operator": "<=",
+            "right": "weak_right",
+        },
+    ]
+
+
+def test_comparison_constraints_require_support_and_skip_violations_keys_and_cross_family(
+    spark: SparkSession,
+) -> None:
+    rows = [(index, index + 1, float(index + 2), index - 1, index + 3) for index in range(9)] + [
+        (None, None, None, None, 12)
+    ]
+    frame = spark.createDataFrame(rows, "left long, low_support long, fractional double, violated long, order_id long")
+
+    table = profile_dataframe("guarded", frame, detect_pii=False).tables[0]
+
+    assert table.check_constraints is None
+
+
+def test_comparison_constraints_honor_custom_privacy_support(spark: SparkSession) -> None:
+    frame = spark.createDataFrame([(value, value + 1) for value in range(3)], "left long, right long")
+
+    table = profile_dataframe("supported", frame, privacy=PrivacyPolicy(min_value_count=3), detect_pii=False).tables[0]
+
+    assert table.check_constraints is not None
+    assert isinstance(table.check_constraints[0], ComparisonConstraint)
+    assert table.check_constraints[0].operator == "<"
 
 
 def test_pearson_pair_selection_is_deterministic_and_bounded_for_wide_tables(spark: SparkSession) -> None:
@@ -237,6 +308,15 @@ def test_pearson_pair_selection_is_deterministic_and_bounded_for_wide_tables(spa
         ("c002", "c003"),
     ]
     assert (pairs[-1][0], pairs[-1][1]) == ("c063", "c064")
+
+    comparison_pairs = _comparison_pairs(frame)
+    assert len(comparison_pairs) == 64
+    assert [(left, right) for left, right, _, _ in comparison_pairs[:3]] == [
+        ("c000", "c001"),
+        ("c001", "c002"),
+        ("c002", "c003"),
+    ]
+    assert (comparison_pairs[-1][0], comparison_pairs[-1][1]) == ("c063", "c064")
 
 
 def test_profiles_empty_table(spark: SparkSession) -> None:
