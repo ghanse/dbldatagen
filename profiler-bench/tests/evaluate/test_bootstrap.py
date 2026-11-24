@@ -70,8 +70,47 @@ def test_targeted_path_accepts_when_mean_fails() -> None:
     verdict = _accuracy_verdict(fidelity, targets=["target"])
     assert verdict["verdict"] == "accepted"
     assert verdict["accuracy_path"] == "targeted"
+    assert verdict["reasons"] == []
     target_gate = next(gate for gate in verdict["gates"] if gate["name"] == "accuracy_targeted")
     assert target_gate["detail"]["targets"]["target"]["low"] > 0
+    mean_gate = next(gate for gate in verdict["gates"] if gate["name"] == "accuracy_mean")
+    assert mean_gate["reason"] == "accuracy_insufficient"
+
+
+def test_unknown_target_is_reported_missing() -> None:
+    fidelity = _multi_dataset_fidelity({"numeric": [-0.005] * 6})
+    verdict = _accuracy_verdict(fidelity, targets=["unknown"])
+    target_gate = next(gate for gate in verdict["gates"] if gate["name"] == "accuracy_targeted")
+    assert verdict["verdict"] == "rejected"
+    assert target_gate["reason"] == "target_missing"
+    assert target_gate["detail"]["targets"]["unknown"] == {"missing": True}
+
+
+def test_structure_failure_blocks_targeted_accept() -> None:
+    fidelity = _multi_dataset_fidelity({"target": [0.02] * 6, "other-a": [-0.005] * 6, "other-b": [-0.005] * 6})
+    for record in fidelity:
+        if record["role"] == "candidate":
+            record["structure"] -= 0.03
+    verdict = _accuracy_verdict(fidelity, targets=["target"])
+    assert verdict["verdict"] == "rejected"
+    assert "structure_regression" in verdict["reasons"]
+
+
+def test_both_accuracy_paths_pass_with_mean_precedence() -> None:
+    fidelity = _multi_dataset_fidelity({"target": [0.02] * 6})
+    verdict = _accuracy_verdict(fidelity, targets=["target"])
+    assert verdict["verdict"] == "accepted"
+    assert verdict["accuracy_path"] == "mean"
+    assert verdict["reasons"] == []
+    assert next(gate for gate in verdict["gates"] if gate["name"] == "accuracy_targeted")["status"] == "pass"
+
+
+def test_targeted_ci_uses_policy_floor() -> None:
+    fidelity = _multi_dataset_fidelity({"target": [0.02] * 6})
+    verdict = _accuracy_verdict(fidelity, targets=["target"], ci_floor=0.025)
+    target_gate = next(gate for gate in verdict["gates"] if gate["name"] == "accuracy_targeted")
+    assert target_gate["status"] == "fail"
+    assert target_gate["detail"]["ci_lower_must_exceed"] == 0.025
 
 
 def test_targeted_path_rejects_other_dataset_regression() -> None:
@@ -377,10 +416,13 @@ def _multi_dataset_fidelity(differences: dict[str, list[float]]) -> list[dict[st
     return records
 
 
-def _accuracy_verdict(fidelity: list[dict[str, Any]], targets: list[str] | None) -> dict[str, Any]:
+def _accuracy_verdict(
+    fidelity: list[dict[str, Any]], targets: list[str] | None, *, ci_floor: float = 0.0
+) -> dict[str, Any]:
     datasets = sorted({str(record["dataset"]) for record in fidelity})
     seeds = max(int(record["seed"]) for record in fidelity) + 1
     policy = _policy(n_speed=1, n_fid=seeds)
+    policy["accuracy"]["ci_lower_must_exceed"] = ci_floor
     run = _run(control=False, n_speed=1, n_fid=seeds, distinct=True, policy=policy)
     run["datasets"] = datasets
     speed = [

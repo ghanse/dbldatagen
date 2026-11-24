@@ -99,7 +99,7 @@ def evaluate_gates(
         "verdict": verdict,
         "proposal_type": proposal_type,
         "gates": [gate.to_dict() for gate in gates],
-        "reasons": [gate.reason for gate in gates if gate.status != "pass"],
+        "reasons": _reasons(gates, accuracy_path=accuracy_path),
         "interval_note": (
             "Each gate uses a two-sided percentile CI at the policy confidence level; "
             "there is no family-wise coverage guarantee across gates."
@@ -364,6 +364,7 @@ def _targeted_accuracy_gate(
 ) -> GateResult:
     """Requires every declared dataset to clear the targeted point and CI bounds."""
     required = float(cfg.get("min_target_improvement", 0.01))
+    ci_floor = float(cfg.get("ci_lower_must_exceed", 0.0))
     details: dict[str, Any] = {}
     status: Literal["pass", "fail", "inconclusive"] = "pass"
     reason = "targets_improved"
@@ -382,11 +383,11 @@ def _targeted_accuracy_gate(
             confidence=float(boot.get("confidence", 0.95)),
         )
         details[target] = ci.to_dict()
-        if ci.crosses_zero():
+        if ci.low <= ci_floor < ci.high:
             if status != "fail":
                 status = "inconclusive"
                 reason = "target_improvement_inconclusive"
-        elif ci.point < required or ci.low <= 0.0:
+        elif ci.point < required or ci.low <= ci_floor:
             status = "fail"
             reason = "target_improvement_insufficient"
     return GateResult(
@@ -394,7 +395,7 @@ def _targeted_accuracy_gate(
         passed=status == "pass",
         status=status,
         reason=reason,
-        detail={"targets": details, "min_target_improvement": required, "ci_lower_must_exceed": 0.0},
+        detail={"targets": details, "min_target_improvement": required, "ci_lower_must_exceed": ci_floor},
     )
 
 
@@ -426,6 +427,14 @@ def _combine_accuracy(
     if mean.status == "inconclusive":
         return "inconclusive", None
     return "rejected", None
+
+
+def _reasons(gates: Sequence[GateResult], *, accuracy_path: Literal["mean", "targeted"] | None) -> list[str]:
+    """Returns blocking reasons, excluding an unused accuracy path after acceptance."""
+    unused_path = (
+        "accuracy_targeted" if accuracy_path == "mean" else "accuracy_mean" if accuracy_path == "targeted" else None
+    )
+    return [gate.reason for gate in gates if gate.status != "pass" and gate.name != unused_path]
 
 
 def _speed_gates(
