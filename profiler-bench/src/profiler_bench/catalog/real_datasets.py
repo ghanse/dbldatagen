@@ -165,6 +165,7 @@ TPCDS = RealDataset(
         "store_sales": "b5f72b617e325ffeb6a80eac1ab521f8feb6273268acd9166194dae4167c81cc",
         "web_sales": "7a32b4c9558c27ae68d0dc6aecd4b4f1c9674d92946dcda6f37953cf5d92ab18",
     },
+    split_roots=("customer",),
 )
 
 _W = "samples.wanderbricks"
@@ -353,6 +354,7 @@ WANDERBRICKS = RealDataset(
         "reviews": "0e361be7797d7b09b3e38e96c677e669ecd5b2396145226e7372fbd21731be36",
         "users": "25081d5491fb4f3c04ca68015acbf46a1c7a4a87847eeb5c74ba6338fe708492",
     },
+    split_roots=("users", "hosts"),
 )
 
 NYCTAXI = RealDataset(

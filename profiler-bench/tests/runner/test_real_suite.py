@@ -44,8 +44,8 @@ def test_uncached_real_datasets_offline_are_skipped_with_a_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv(WAREHOUSE_ENV, raising=False)
-    ready, skipped = prepare_real(sorted(REAL_DATASETS), "s", tmp_path)
-    assert ready == []
+    ready, skipped, reports = prepare_real(sorted(REAL_DATASETS), "s", tmp_path)
+    assert (ready, reports) == ([], {})
     assert set(skipped) == set(REAL_DATASETS)
     assert all(reason.startswith("Unavailable:") and WAREHOUSE_ENV in reason for reason in skipped.values())
     assert prepare_real([REAL], "xs", tmp_path)[1][REAL].startswith("KeyError:")
@@ -124,6 +124,7 @@ def test_real_suite_scores_cached_dataset_as_a_holdout(setup: dict[str, Any]) ->
     assert run["suite"] == "real"
     assert (run["datasets"], run["real_datasets"], run["real_skipped"]) == ([], [REAL], {})
     assert run["real_split"] == SPLIT
+    assert run["real_split_report"][REAL]["trips"]["profiled"]["copied"] == 0
     assert set(setup["speed"]) == {(REAL, "s")}
     records = [json.loads(p.read_text()) for p in sorted((out / "samples").glob(f"fidelity-*-{REAL}-*.json"))]
     assert len(records) == 4
@@ -155,3 +156,22 @@ def test_synthetic_suite_ignores_real_datasets(setup: dict[str, Any]) -> None:
     assert "real_holdout" not in [g["name"] for g in verdict["gates"]]
     cached = [json.loads(p.read_text())["components"] for p in (setup["tmp"] / "baseline-cache").glob("*.json")]
     assert cached and all("catalog_content_hash" in c and "real_split" not in c for c in cached)
+
+
+def test_cli_passes_suite_through(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from profiler_bench.rsi import __main__ as cli  # noqa: PLC0415
+
+    seen: list[str] = []
+
+    def fake_run(config: ExperimentConfig) -> Path:
+        seen.append(config.suite)
+        (tmp_path / "verdict.json").write_text(json.dumps({"verdict": "inconclusive"}))
+        return tmp_path
+
+    monkeypatch.setattr(cli, "run_experiment", fake_run)
+    base = ["run", "--baseline", ".", "--candidate", ".", "--experiment-id", "x"]
+    assert cli.main([*base, "--suite", "real"]) == 0
+    assert cli.main(base) == 0
+    assert seen == ["real", "synthetic"]
+    with pytest.raises(SystemExit):
+        cli.main([*base, "--suite", "every"])

@@ -74,7 +74,7 @@ def _profile_once(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str,
     if args.dataset in REAL_DATASETS:
         if args.fraction is not None:
             raise ValueError("data-volume subsets of real datasets are not supported")
-        tables = load_part(REAL_DATASETS[args.dataset], args.tier, "profiled", spark)
+        tables = load_part(REAL_DATASETS[args.dataset], args.tier, "profiled", spark, args.cache_dir)
     else:
         tables = load(args.dataset, args.tier, seed=args.seed, spark=spark, sample_seed=sample_seed)
     subset_meta = None

@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from profiler_bench.catalog import DATASETS, REAL_DATASETS, Unavailable, cache_dir
-from profiler_bench.catalog.real import PARTS, SPLIT, materialize_part
+from profiler_bench.catalog import DATASETS, REAL_DATASETS, Unavailable
+from profiler_bench.catalog.real import PARTS, SPLIT, SPLIT_REPORT, materialize_part, split_dir
 from profiler_bench.evaluate.evaluate import evaluate_experiment
 from profiler_bench.runner.baseline_cache import config_hash, dataset_identity, environment, load_entry, store_entry
 from profiler_bench.runner.fidelity_run import DEFAULT_FIDELITY_CELL_TIMEOUT_S, paired_seeds, run_fidelity_samples
@@ -95,13 +95,16 @@ def suite_datasets(suite: str, datasets: Sequence[str] | None) -> tuple[list[str
     return [n for n in datasets if n in synthetic], [n for n in datasets if n in real]
 
 
-def prepare_real(names: Sequence[str], tier: str, root: Path | None) -> tuple[list[str], dict[str, str]]:
-    """Materializes every benchmark part of each real dataset and returns `(ready, skipped)`.
+def prepare_real(
+    names: Sequence[str], tier: str, root: Path | None
+) -> tuple[list[str], dict[str, str], dict[str, Any]]:
+    """Materializes every benchmark part of each real dataset and returns `(ready, skipped, split_reports)`.
 
     A dataset is skipped, with the reason, when its export is neither cached nor exportable (no warehouse
-    configured, rejected credentials, offline), fails its pinned checks, or has no tier `tier`.
+    configured, rejected credentials, offline), fails its pinned checks, or has no tier `tier`. The split report
+    of each ready dataset gives its full-tier rows, shares, and copies per table and part (see `real.split_report`).
     """
-    ready, skipped = [], {}
+    ready, skipped, reports = [], {}, {}
     for name in names:
         try:
             for part in PARTS:
@@ -110,7 +113,9 @@ def prepare_real(names: Sequence[str], tier: str, root: Path | None) -> tuple[li
             skipped[name] = f"{type(reason).__name__}: {reason}"
         else:
             ready.append(name)
-    return ready, skipped
+            report = split_dir(REAL_DATASETS[name], root) / SPLIT_REPORT
+            reports[name] = json.loads(report.read_text()) if report.is_file() else None
+    return ready, skipped, reports
 
 
 def experiment_dir(experiment_id: str, repo_root: Path | None = None) -> Path:
@@ -178,8 +183,8 @@ def run_experiment(config: ExperimentConfig) -> Path:
         raise ValueError(f"fidelity tier {fidelity_tier!r} needs at least one speed sample for its profile")
     dataset_seed = int(policy.get("dataset_seed", 0))
     fidelity_parallelism = int(policy.get("fidelity_parallelism", 1))
-    real_root = config.cache_dir or cache_dir()
-    real_datasets, real_skipped = prepare_real(real_requested, fidelity_tier, real_root)
+    real_root = config.cache_dir
+    real_datasets, real_skipped, real_reports = prepare_real(real_requested, fidelity_tier, real_root)
     real_speed_n = {fidelity_tier: speed_n[fidelity_tier]}
 
     fidelity_spark = fidelity_spark_config(
@@ -230,6 +235,7 @@ def run_experiment(config: ExperimentConfig) -> Path:
         "real_datasets": real_datasets,
         "real_skipped": real_skipped,
         "real_split": SPLIT,
+        "real_split_report": real_reports,
         "real_speed_tiers": [fidelity_tier],
     }
     run_meta = {

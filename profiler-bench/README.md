@@ -95,7 +95,9 @@ parquet writer, but a new numpy version may change the generated values and so t
 `profiler_bench.catalog.real_datasets` registers four real datasets (`REAL_DATASETS`). Each declares its source
 tables, the export SQL (`SELECT * FROM <source> ORDER BY <primary key>`, or `ORDER BY ALL` without one), the expected
 row counts, the schema, and the logical hash of every exported table, pinned after the first export. Data is
-never committed: it lives in the gitignored cache under `real/<dataset>/<tier>`.
+never committed. It lives outside every checkout, so it survives worktree cleanup: under `$PROFILER_BENCH_REAL_CACHE`,
+or `~/.cache/profiler-bench/real` by default, as `<dataset>/<tier>` (`real.real_cache_dir`). An explicit cache root
+(`--cache-dir`, `ExperimentConfig.cache_dir`) uses `<root>/real` instead.
 
 ```bash
 export PROFILER_BENCH_DATABRICKS_PROFILE=<profile> PROFILER_BENCH_DATABRICKS_WAREHOUSE_ID=<warehouse id>
@@ -127,16 +129,26 @@ Real data has no planted truth. Its manifest is marked `ground_truth: none` and 
 documented primary, unique, and foreign keys that hold in the data, and privacy classes; it makes no distribution
 claims. `verify` checks just those, and structure scoring is skipped: it is recorded as `not_applicable`, never 0.
 
-For benchmarking, `real.split` divides each export into three disjoint parts (`real.SPLIT`, version 1, recorded in
-`run.json` and the baseline cache key). `profiled` is the only part the profiler sees; `holdout` is the privacy
-baseline; `ceiling` stands in for the synthetic data, so the ceiling is the reconstruction of `ceiling` against
-`profiled`. A row of a table without foreign keys goes to part `blake2b-64("split", table, key) mod 3`, where the key
-is the primary key (all non-nested columns without one). A row with non-null foreign keys takes the part of the parent
-rows it references, and is dropped when those parents are in different parts or were dropped, so each part satisfies
-the declared foreign keys. Tier `s` of a part is the tier-s subset of that part. Parts are cached under
-`real/<dataset>/split-v1/<part>/<tier>`. The rule is symmetric across parts, but child tables with several
-independently split parents lose rows: a row whose k parents must agree survives with probability about (1/3)^(k-1).
-This hits TPC-DS hardest, where `customer` references `customer_address` and three `date_dim` rows.
+For benchmarking, `real.split` divides each export into three parts (`real.SPLIT`, version 2, recorded in `run.json`
+and the baseline cache key). `profiled` is the only part the profiler sees; `holdout` is the privacy baseline;
+`ceiling` stands in for the synthetic data, so the ceiling is the reconstruction of `ceiling` against `profiled`. The
+split follows root entities (`RealDataset.split_roots`: `customer` for TPC-DS, `users` and `hosts` for Wanderbricks;
+by default, the tables that reference no other table). Every row has one home part:
+
+- a row of a root table, or of a table not connected to a root, gets the part `blake2b-64("split", table, key) mod 3`,
+  where the key is the primary key (all non-nested columns without one);
+- any other row takes the home of the parent row behind its first non-null foreign key, in declared order, to a table
+  connected to a root (a sale goes with its customer, a booking with its user).
+
+Then, children first, every parent row that a row of a part references is copied into that part. So each part
+satisfies the declared foreign keys and no row is dropped, but parts overlap on copied rows. `split_report.json` in
+`<dataset>/split-v2/` (and `run.json` `real_split_report`) gives each table's rows, share of the export, and copied
+rows per part. On the current exports, every table keeps at least 31.5% of its rows in every part. Copies are heavy in
+shared dimensions: TPC-DS `item` and Wanderbricks `properties`, `amenities`, and `destinations` are in every part in
+full, `customer_address` at 98%. They also reach sensitive tables: 28% of the holdout's TPC-DS `customer` rows, 42% of
+Wanderbricks `hosts`, and all of `properties` are also in `profiled`. The privacy checks that compare synth against
+the holdout are therefore weaker on those tables; restricting the privacy baseline to unseen rows is open work.
+Tier `s` of a part is the tier-s subset of that part. Parts are cached under `<dataset>/split-v2/<part>/<tier>`.
 
 | Dataset | Source | Licence and terms |
 |---|---|---|
@@ -394,7 +406,7 @@ and identical `profiler_src_hash` builds can never be `accepted`. Results land i
 
 ### Real holdout suite
 
-`ExperimentConfig.suite` picks the datasets: `synthetic` (default, the catalog generators; behaviour and cache keys
+`--suite` (`ExperimentConfig.suite`) picks the datasets: `synthetic` (default, the catalog generators; behaviour and cache keys
 as before), `real` (the four real datasets), or `all`. Before any timing, each requested real dataset's parts are
 materialized at the fidelity tier. A dataset whose export is neither cached nor exportable (no warehouse, rejected
 credentials, offline), fails its pinned checks, or has no such tier (real datasets have only `s` and `full`) is
@@ -413,7 +425,8 @@ verdict **inconclusive** (`real_holdout_regression`) instead of accepted; failed
 ```bash
 uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi run \
   --baseline /path/to/baseline --candidate /path/to/candidate \
-  --policy profiler-bench/policies/default.json --experiment-id demo [--datasets retail numeric] [--control]
+  --policy profiler-bench/policies/default.json --experiment-id demo [--datasets retail numeric] [--control] \
+  [--suite synthetic|real|all]
 uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi evaluate \
   profiler/rsi/experiments/demo
 ```

@@ -15,12 +15,18 @@ backoff. Each table's source `SELECT COUNT(*)` must match the rows received and 
 for the environment variables. Any network or authentication failure raises `Unavailable`; a cached instance
 needs no warehouse.
 
-Benchmark parts: `split` divides an export into the three disjoint parts of `PARTS` as described by `SPLIT`. The
-profiler sees only `profiled`; `holdout` is the privacy baseline and `ceiling` stands in for synthetic data in the
-real-vs-real ceiling. A row of a table with no foreign keys goes to the part its primary key (all non-nested columns
-when it has none) hashes to. A row with non-null foreign keys takes the part of the parent rows it references and is
-dropped when they are in different parts or were dropped, so every part satisfies the declared foreign keys. Tier `s`
-of a part is the tier-s subset of that part. Bump `SPLIT["version"]` whenever the method changes.
+Exports live under `real_cache_dir()`: `$PROFILER_BENCH_REAL_CACHE`, or `~/.cache/profiler-bench/real`, outside any
+checkout so they survive worktree cleanup. An explicit cache `root` uses `root/real` instead.
+
+Benchmark parts: `split` divides an export into the three parts of `PARTS` as described by `SPLIT`. The profiler
+sees only `profiled`; `holdout` is the privacy baseline and `ceiling` stands in for synthetic data in the real-vs-real
+ceiling. Every row has one home part. A row of a root table (`RealDataset.split_roots`, by default the tables that
+reference no other table) or of a table not connected to a root gets its home from the hash of its primary key (all
+non-nested columns when it has none). Any other row takes the home of the parent row behind its first non-null
+foreign key, in declared order, to a table connected to a root. Then, children first, every parent row that a row of a
+part references is copied into that part, so each part satisfies the declared foreign keys and no row is dropped.
+Copies make parts overlap; `split_report` gives each table's rows, share of the export, and copied rows per part.
+Tier `s` of a part is the tier-s subset of that part. Bump `SPLIT["version"]` whenever the method changes.
 """
 
 from __future__ import annotations
@@ -44,6 +50,7 @@ from graphlib import TopologicalSorter
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 from pyarrow import ipc
@@ -52,7 +59,7 @@ from pyspark.sql import DataFrame, SparkSession
 from profiler_bench.catalog.hashing import table_hash
 from profiler_bench.catalog.manifest import Column, ForeignKey, Manifest, Privacy, Table
 from profiler_bench.catalog.registry import TIER_FILES, TIERS, spark_type
-from profiler_bench.catalog.store import META_FILE, Materialized, cache_dir, is_intact, read_instance, write_instance
+from profiler_bench.catalog.store import META_FILE, Materialized, is_intact, read_instance, write_instance
 
 
 REAL_TIERS = ("s", "full")
@@ -65,15 +72,20 @@ PROFILE_ENV = "PROFILER_BENCH_DATABRICKS_PROFILE"
 TIMEOUT = 120.0
 _NULL = "\0"
 _SEPARATOR = "\x1f"
+REAL_CACHE_ENV = "PROFILER_BENCH_REAL_CACHE"
 PARTS = ("profiled", "holdout", "ceiling")
 SPLIT: dict[str, Any] = {
-    "version": 1,
+    "version": 2,
     "parts": list(PARTS),
-    "assignment": "blake2b-64 of 'split', the table, and the primary key (all non-nested columns without one), mod 3",
-    "foreign_keys": "a row with non-null foreign keys takes its parents' part; dropped when they differ or are dropped",
+    "roots": "RealDataset.split_roots, by default the tables that reference no other table",
+    "home": (
+        "roots and tables not connected to a root: blake2b-64 of 'split', the table, and the primary key (all "
+        "non-nested columns without one), mod 3; other rows: the home of the parent behind the first non-null "
+        "foreign key, in declared order, to a table connected to a root"
+    ),
+    "closure": "children first, parent rows referenced from a part are copied into it; no row is dropped",
     "tier_s": "the tier-s subset of each part",
 }
-_DROPPED = -1
 
 
 class Unavailable(Exception):
@@ -134,6 +146,8 @@ class RealDataset:
         tables: Exported tables.
         foreign_keys: Documented foreign keys that hold for every non-null child key.
         hashes: Pinned logical hash of each table of the full export (see `profiler_bench.catalog.hashing`).
+        split_roots: Root entity tables of the benchmark split (see `split`); empty means every table that
+            references no other table.
     """
 
     name: str
@@ -143,6 +157,7 @@ class RealDataset:
     tables: tuple[RealTable, ...]
     foreign_keys: tuple[ForeignKey, ...] = ()
     hashes: Mapping[str, str] = field(default_factory=dict)
+    split_roots: tuple[str, ...] = ()
 
     def manifest(self, tier: str = "full", tables: Mapping[str, pa.Table] | None = None) -> Manifest:
         """Returns the manifest of a tier; row counts and file counts come from `tables` when given."""
@@ -202,9 +217,17 @@ def _paths(column: Column, prefix: str) -> Iterator[str]:
         yield from _paths(child, f"{prefix}{column.name}.")
 
 
+def real_cache_dir(root: Path | None = None) -> Path:
+    """Returns the real-dataset cache: `root/real` when given, else `$PROFILER_BENCH_REAL_CACHE`, else
+    `~/.cache/profiler-bench/real`."""
+    if root is not None:
+        return root / "real"
+    return Path(os.environ.get(REAL_CACHE_ENV) or Path.home() / ".cache" / "profiler-bench" / "real")
+
+
 def instance_dir(dataset: RealDataset, tier: str, root: Path | None = None) -> Path:
     """Returns the cache directory of one tier of a real dataset."""
-    return (root or cache_dir()) / "real" / dataset.name / tier
+    return real_cache_dir(root) / dataset.name / tier
 
 
 def materialize(
@@ -215,7 +238,7 @@ def materialize(
     Args:
         dataset: Real dataset.
         tier: `s` (the subset) or `full` (the export).
-        root: Cache root; defaults to `cache_dir()`.
+        root: Cache root; defaults to `real_cache_dir()`.
         check_hash: Whether to recompute the logical hashes of a cached instance before using it.
 
     Raises:
@@ -251,9 +274,14 @@ def _write(target: Path, tables: Mapping[str, pa.Table], truth: Manifest) -> Non
         raise
 
 
+def split_dir(dataset: RealDataset, root: Path | None = None) -> Path:
+    """Returns the cache directory of the benchmark parts of a real dataset; it holds `split_report.json`."""
+    return real_cache_dir(root) / dataset.name / f"split-v{SPLIT['version']}"
+
+
 def part_dir(dataset: RealDataset, tier: str, part: str, root: Path | None = None) -> Path:
     """Returns the cache directory of one tier of one benchmark part of a real dataset."""
-    return (root or cache_dir()) / "real" / dataset.name / f"split-v{SPLIT['version']}" / part / tier
+    return split_dir(dataset, root) / part / tier
 
 
 def materialize_part(
@@ -275,11 +303,15 @@ def materialize_part(
         shutil.rmtree(target)
     if tier == "full":
         full = materialize(dataset, "full", root, check_hash)
-        for name, tables in split(dataset, {t.name: full.read_table(t.name) for t in full.manifest.tables}).items():
+        export_tables = {t.name: full.read_table(t.name) for t in full.manifest.tables}
+        home, members = _assign(dataset, export_tables)
+        for name, tables in _parts(export_tables, members).items():
             other = part_dir(dataset, tier, name, root)
             if name == part or not (other / META_FILE).exists():
                 shutil.rmtree(other, ignore_errors=True)
                 _write(other, tables, dataset.manifest(tier, tables))
+        report = json.dumps(_report(home, members), indent=2, sort_keys=True) + "\n"
+        (split_dir(dataset, root) / SPLIT_REPORT).write_text(report, encoding="utf-8")
     else:
         whole = materialize_part(dataset, "full", part, root, check_hash)
         tables = subset(dataset, {t.name: whole.read_table(t.name) for t in whole.manifest.tables}, TIERS["s"])
@@ -296,34 +328,92 @@ def load_part(
 
 
 def split(dataset: RealDataset, tables: Mapping[str, pa.Table]) -> dict[str, dict[str, pa.Table]]:
-    """Returns the disjoint benchmark parts of `tables` by part name, each closed under the declared foreign keys.
+    """Returns the benchmark parts of `tables` by part name, each closed under the declared foreign keys.
 
     Args:
         dataset: Real dataset the tables belong to.
         tables: Full tables by name.
     """
+    return _parts(tables, _assign(dataset, tables)[1])
+
+
+def split_report(dataset: RealDataset, tables: Mapping[str, pa.Table]) -> dict[str, dict[str, dict[str, Any]]]:
+    """Returns, by table and part, the rows, their share of the export, and how many are copies homed elsewhere."""
+    return _report(*_assign(dataset, tables))
+
+
+SPLIT_REPORT = "split_report.json"
+
+
+def _assign(
+    dataset: RealDataset, tables: Mapping[str, pa.Table]
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Returns each row's home part index and each table's membership mask of shape (parts, rows)."""
     specs = {t.name: t for t in dataset.tables}
     parents = {name: {fk.parent_table for fk in dataset.foreign_keys if fk.child_table == name} for name in specs}
-    assigned: dict[str, list[int]] = {}
-    for name in TopologicalSorter(parents).static_order():
+    roots = set(dataset.split_roots) or {name for name, found in parents.items() if not found}
+    order = list(TopologicalSorter(parents).static_order())
+    home: dict[str, np.ndarray] = {}
+    anchored: set[str] = set()
+    for name in order:
         table = tables[name]
         columns = specs[name].primary_key or [f.name for f in table.schema if not pa.types.is_nested(f.type)]
         own = [_bucket(f"split{_SEPARATOR}{name}{_SEPARATOR}{v}") for v in _key_text(table, columns).to_pylist()]
-        inherited: list[int | None] = [None] * table.num_rows
-        for fk in (fk for fk in dataset.foreign_keys if fk.child_table == name):
+        result, unset = np.array(own, dtype=np.int8), np.ones(table.num_rows, dtype=bool)
+        anchors = [] if name in roots else [fk for fk in _fks(dataset, name) if fk.parent_table in anchored]
+        for fk in anchors:
             parent = tables[fk.parent_table]
-            lookup = dict(zip(_key_text(parent, fk.parent_columns).to_pylist(), assigned[fk.parent_table], strict=True))
-            present = reduce(pc.and_, [pc.is_valid(table.column(c)) for c in fk.child_columns]).to_pylist()
-            references = _key_text(table, fk.child_columns).to_pylist()
-            for row, (valid, key) in enumerate(zip(present, references, strict=True)):
-                if valid:
-                    found = lookup.get(key, _DROPPED)
-                    inherited[row] = found if inherited[row] in (None, found) else _DROPPED
-        assigned[name] = [o if i is None else i for o, i in zip(own, inherited, strict=True)]
+            lookup = dict(zip(_key_text(parent, fk.parent_columns).to_pylist(), home[fk.parent_table], strict=True))
+            keys = _key_text(table, fk.child_columns).to_pylist()
+            present = _present(table, fk)
+            for row in np.flatnonzero(unset & present):
+                found = lookup.get(keys[row])
+                if found is not None:
+                    result[row], unset[row] = found, False
+        home[name] = result
+        if name in roots or anchors:
+            anchored.add(name)
+    members = {name: np.stack([home[name] == index for index in range(len(PARTS))]) for name in specs}
+    for name in reversed(order):
+        for fk in _fks(dataset, name):
+            child_keys, present = _key_text(tables[name], fk.child_columns), _present(tables[name], fk)
+            parent_keys = _key_text(tables[fk.parent_table], fk.parent_columns)
+            for index in range(len(PARTS)):
+                needed = pc.filter(child_keys, pa.array(members[name][index] & present)).combine_chunks()
+                found = pc.is_in(parent_keys, value_set=needed).to_numpy(zero_copy_only=False)
+                members[fk.parent_table][index] |= found
+    return home, members
+
+
+def _fks(dataset: RealDataset, child: str) -> list[ForeignKey]:
+    return [fk for fk in dataset.foreign_keys if fk.child_table == child]
+
+
+def _present(table: pa.Table, fk: ForeignKey) -> np.ndarray:
+    valid = reduce(pc.and_, [pc.is_valid(table.column(c)) for c in fk.child_columns])
+    return np.asarray(valid.to_numpy(zero_copy_only=False), dtype=bool)
+
+
+def _parts(tables: Mapping[str, pa.Table], members: Mapping[str, np.ndarray]) -> dict[str, dict[str, pa.Table]]:
     return {
-        part: {name: tables[name].filter(pc.equal(pa.array(assigned[name], pa.int8()), index)) for name in specs}
+        part: {name: tables[name].filter(pa.array(members[name][index])) for name in members}
         for index, part in enumerate(PARTS)
     }
+
+
+def _report(home: Mapping[str, np.ndarray], members: Mapping[str, np.ndarray]) -> dict[str, dict[str, dict[str, Any]]]:
+    report: dict[str, dict[str, dict[str, Any]]] = {}
+    for name, mask in members.items():
+        total = max(1, mask.shape[1])
+        report[name] = {
+            part: {
+                "rows": int(mask[index].sum()),
+                "share": round(float(mask[index].sum()) / total, 4),
+                "copied": int((mask[index] & (home[name] != index)).sum()),
+            }
+            for index, part in enumerate(PARTS)
+        }
+    return report
 
 
 def _bucket(text: str) -> int:

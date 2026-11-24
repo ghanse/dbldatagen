@@ -10,7 +10,7 @@ from pathlib import Path
 
 from profiler_bench.evaluate.evaluate import evaluate_experiment
 from profiler_bench.runner.data_volume import DataVolumeConfig, calibrate_targets, run_data_volume_experiment
-from profiler_bench.runner.experiment import ExperimentConfig, run_experiment
+from profiler_bench.runner.experiment import SUITES, ExperimentConfig, run_experiment
 from profiler_bench.runner.policy import DEFAULT_POLICY
 
 
@@ -30,6 +30,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument("--cache-dir", type=Path, default=None, help="Catalog cache directory.")
     run.add_argument("--proposal", type=Path, default=None, help="Optional proposal.json to copy.")
     run.add_argument("--speed-tiers", nargs="+", default=None, help="Override speed tiers.")
+    run.add_argument(
+        "--suite",
+        choices=SUITES,
+        default="synthetic",
+        help="Datasets to score: the synthetic catalog (default), the real holdout datasets, or all.",
+    )
     run.add_argument(
         "--no-baseline-cache",
         action="store_true",
@@ -84,6 +90,8 @@ def _run(args: argparse.Namespace) -> int:
     if args.proposal is not None:
         proposal = json.loads(Path(args.proposal).read_text())
     if args.mode == "data-volume":
+        if args.suite != "synthetic":
+            raise SystemExit("--suite applies only to the default mode")
         path = run_data_volume_experiment(
             DataVolumeConfig(
                 experiment_id=args.experiment_id,
@@ -116,6 +124,7 @@ def _run(args: argparse.Namespace) -> int:
                 speed_tiers=args.speed_tiers,
                 command_line=sys.argv,
                 baseline_cache=not args.no_baseline_cache,
+                suite=args.suite,
             )
         )
     verdict = json.loads((path / "verdict.json").read_text())
