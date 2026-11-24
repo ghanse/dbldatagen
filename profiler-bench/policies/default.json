@@ -1,5 +1,5 @@
 {
-  "version": "1.1.0",
+  "version": "2.0.0",
   "bootstrap": {
     "samples": 2000,
     "seed": 0,
@@ -10,8 +10,14 @@
     "s": 15,
     "m": 15
   },
+  "speed_samples_accuracy": {
+    "xs": 2,
+    "s": 2,
+    "m": 0
+  },
   "fidelity_seeds": 5,
   "fidelity_tier": "s",
+  "fidelity_parallelism": 3,
   "speed_tiers": ["s", "m"],
   "dataset_seed": 0,
   "accuracy": {
@@ -32,12 +38,12 @@
     "note": "Privacy cannot be disabled; every candidate dataset x seed must set privacy_passed=true."
   },
   "spark": {
-    "master": "local[2]",
+    "master": "local[8]",
     "configs": {
       "spark.sql.shuffle.partitions": "2",
       "spark.sql.session.timeZone": "UTC",
       "spark.ui.enabled": "false",
-      "spark.driver.memory": "2g"
+      "spark.driver.memory": "8g"
     }
   },
   "not_measured": [

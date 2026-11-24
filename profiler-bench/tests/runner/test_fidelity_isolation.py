@@ -464,8 +464,8 @@ def test_run_json_records_fidelity_spark_timeout_and_model_source(tmp_path: Path
         )
     )
     run = json.loads((out / "run.json").read_text())
-    assert run["fidelity_spark"] == fidelity_spark_config(driver_memory="8g")
-    assert run["policy"]["spark"]["configs"]["spark.driver.memory"] == "2g"
+    assert run["fidelity_spark"] == fidelity_spark_config(driver_memory="8g", master="local[4]")
+    assert run["policy"]["spark"]["configs"]["spark.driver.memory"] == "8g"
     assert run["fidelity_spark"]["configs"]["spark.driver.memory"] == "8g"
     assert run["fidelity_cell_timeout_s"] == 2700
     assert run["fidelity_model_source"] == "harness"

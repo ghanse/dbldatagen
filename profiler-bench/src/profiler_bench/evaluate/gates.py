@@ -103,12 +103,16 @@ def evaluate_gates(
 
 
 def expected_sample_keys(run: dict[str, Any]) -> dict[str, set[str]]:
-    """Derives the expected speed and fidelity sample keys from `run.json`."""
+    """Derives the expected speed and fidelity sample keys from `run.json`.
+
+    Speed counts come from the recorded `speed_samples_effective` (reduced for accuracy
+    proposals); runs recorded before that field fall back to the policy's `speed_samples`.
+    """
     policy = run.get("policy") or {}
     datasets = [str(name) for name in run.get("datasets") or []]
     speed_tiers = [str(tier) for tier in run.get("speed_tiers") or policy.get("speed_tiers") or ["s"]]
     fidelity_tier = str(run.get("fidelity_tier") or policy.get("fidelity_tier") or "s")
-    speed_n = policy.get("speed_samples") or {}
+    speed_n = run.get("speed_samples_effective") or policy.get("speed_samples") or {}
     fidelity_k = int(policy.get("fidelity_seeds", 5))
     roles = ("baseline", "candidate")
     speed: set[str] = set()
