@@ -1,0 +1,16 @@
+{
+  "proposal_id": "rsi-0003b",
+  "targets": {
+    "datasets": [
+      "numeric",
+      "nested",
+      "retail"
+    ],
+    "metrics": [
+      "dependence_declared",
+      "dependence_random",
+      "discriminator"
+    ]
+  },
+  "type": "accuracy"
+}
