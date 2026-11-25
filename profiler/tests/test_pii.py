@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from dbldatagen_profiler.cli import _read_key
-from dbldatagen_profiler.model import Semantic, load_profile, profile_json_schema
+from dbldatagen_profiler.model import EvidenceMethod, Semantic, load_profile, profile_json_schema
 
 
 def test_semantic_evidence_contains_only_method_and_rate() -> None:
@@ -97,6 +97,36 @@ def test_0_2_semantic_profile_validates_against_json_schema(minimal_profile: dic
     }
     parsed = load_profile(minimal_profile, strict=True)
     jsonschema.validate(parsed.model_dump(mode="json", exclude_none=True), profile_json_schema())
+
+
+@pytest.mark.parametrize("method", [member.value for member in EvidenceMethod])
+def test_evidence_method_round_trips_as_the_same_string(minimal_profile: dict[str, Any], method: str) -> None:
+    raw = {
+        "pii_class": "other",
+        "sensitivity": "direct_identifier",
+        "confidence": 1.0,
+        "evidence": [{"method": method, "match_rate": 1.0}],
+    }
+    minimal_profile["tables"][0]["columns"][0]["semantic"] = raw
+    semantic = load_profile(minimal_profile, strict=True).tables[0].columns[0].semantic
+    assert semantic is not None
+    assert semantic.evidence[0].method is EvidenceMethod(method)
+    assert semantic.model_dump(mode="json") == raw
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_unknown_evidence_method_is_rejected(minimal_profile: dict[str, Any], strict: bool) -> None:
+    semantic = {
+        "pii_class": "other",
+        "sensitivity": "direct_identifier",
+        "confidence": 1.0,
+        "evidence": [{"method": "sample_lastname", "match_rate": 1.0}],
+    }
+    minimal_profile["tables"][0]["columns"][0]["semantic"] = semantic
+    with pytest.raises(ValidationError, match="method"):
+        load_profile(minimal_profile, strict=strict)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(minimal_profile, profile_json_schema())
 
 
 def test_key_file_requires_32_bytes(tmp_path: Path) -> None:

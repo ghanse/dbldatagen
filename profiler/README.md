@@ -149,8 +149,10 @@ A profile contains:
   dates to UTC epoch days; timestamps, timestamp-without-time-zone, and times to UTC epoch seconds. The profile
   contains only the aggregate coefficient and column names, never source values or row samples. Dependencies are
   batch-only.
-- `semantic`: optional PII class, sensitivity, confidence, and value-free detection evidence. Tables may also record
-  sampled pairs and triples that behave as quasi-identifiers.
+- `semantic`: optional PII class, sensitivity, confidence, and value-free detection evidence. Each evidence entry is a
+  `method` from a fixed set (`EvidenceMethod`, e.g. `column_name`, `email`, `luhn`, `sample_uniqueness`) and its sampled
+  `match_rate`; unknown methods are rejected. Tables may also record sampled pairs and triples that behave as
+  quasi-identifiers.
 
 Only the basic schema, row count, and null information are required; engines can add the other blocks over time.
 
@@ -317,6 +319,15 @@ release):
   readers keep working with newer minor versions.
 - **major**: any other change, including new enum values or constraint kinds. A reader rejects a profile whose major
   version differs from its own.
+
+Before 1.0 the major version stays at 0, so a minor bump may also narrow the spec, for example by turning a string
+field into an enum. Profiles the profiler wrote under an earlier minor version still load.
+
+Spec changes:
+
+- **0.3.0**: `semantic.evidence[].method` is the `EvidenceMethod` enum instead of a free string. Every method earlier
+  profilers wrote is in the enum, so their profiles still load; an unknown method is rejected.
+- **0.2.0**: adds `semantic` and table quasi-identifier sets.
 
 Producers should validate their output strictly, which rejects any field the spec does not define:
 

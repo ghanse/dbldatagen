@@ -28,6 +28,7 @@ from dbldatagen_profiler.model import (
     Sensitivity,
     TableProfile,
     dump_profile,
+    load_profile,
     profile_json_schema,
 )
 from dbldatagen_profiler.pii import (
@@ -224,6 +225,19 @@ def test_detected_profile_validates_against_schema(spark: SparkSession) -> None:
     frame = spark.createDataFrame([("alice@example.com",), ("bob@example.org",)], "email string")
     profile = profile_dataframe("customers", frame)
     jsonschema.validate(profile.model_dump(mode="json", exclude_none=True), profile_json_schema())
+
+
+def test_detected_evidence_serializes_methods_as_plain_strings(spark: SparkSession) -> None:
+    rows = [(f"user{i}@example.com", f"acct-{i}", date(1970 + i % 40, 1 + i % 12, 1 + i % 28)) for i in range(50)]
+    frame = spark.createDataFrame(rows, "email string, account_id string, birth_date date")
+    text = dump_profile(profile_dataframe("customers", frame))
+    evidence = {column["name"]: column["semantic"]["evidence"] for column in json.loads(text)["tables"][0]["columns"]}
+    assert {name: [item["method"] for item in items] for name, items in evidence.items()} == {
+        "email": ["column_name", "email"],
+        "account_id": ["column_name", "sample_uniqueness"],
+        "birth_date": ["column_name", "plausible_age"],
+    }
+    assert dump_profile(load_profile(text, strict=True)) == text
 
 
 def test_profiles_nested_columns_without_using_them_as_quasi_identifiers(spark: SparkSession) -> None:
@@ -2080,7 +2094,7 @@ def _semantic(pii_class: str, sensitivity: str) -> dict[str, object]:
         "pii_class": pii_class,
         "sensitivity": sensitivity,
         "confidence": 1.0,
-        "evidence": [{"method": "test_fixture", "match_rate": 1.0}],
+        "evidence": [{"method": "column_name", "match_rate": 1.0}],
     }
 
 

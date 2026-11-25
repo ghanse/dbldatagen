@@ -22,7 +22,15 @@ from pyspark.sql import functions as F
 from pyspark.sql import types as T
 from pyspark.sql.window import Window
 
-from dbldatagen_profiler.model import ColumnProfile, PiiClass, Profile, Semantic, Sensitivity
+from dbldatagen_profiler.model import (
+    ColumnProfile,
+    EvidenceMethod,
+    PiiClass,
+    Profile,
+    Semantic,
+    SemanticEvidence,
+    Sensitivity,
+)
 from dbldatagen_profiler.pii.policy import (
     PiiAction,
     PiiPolicy,
@@ -329,12 +337,12 @@ def _rule_semantic(rule: PiiRule) -> Semantic | None:
         sensitivity = Sensitivity.QUASI_IDENTIFIER
     else:
         sensitivity = Sensitivity.DIRECT_IDENTIFIER
-    method = "policy_column" if rule.pii_class is not None else "policy_column_generic"
+    method = EvidenceMethod.POLICY_COLUMN if rule.pii_class is not None else EvidenceMethod.POLICY_COLUMN_GENERIC
     return Semantic(
         pii_class=pii_class,
         sensitivity=sensitivity,
         confidence=1.0,
-        evidence=[{"method": method, "match_rate": 1.0}],
+        evidence=[SemanticEvidence(method=method, match_rate=1.0)],
     )
 
 
@@ -636,7 +644,7 @@ def _mapping_surrogate(
 
 
 def _is_generic_semantic(semantic: Semantic) -> bool:
-    return any(item.method == "policy_column_generic" for item in semantic.evidence)
+    return any(item.method == EvidenceMethod.POLICY_COLUMN_GENERIC for item in semantic.evidence)
 
 
 def _mapping_value(  # noqa: PLR0911, PLR0912
