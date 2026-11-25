@@ -336,7 +336,7 @@ def _cache_keys(
     common = {
         "baseline_profiler_src_hash": baseline.profiler_src_hash,
         "harness_hash": harness.harness_hash,
-        "policy_hash": harness.policy_hash,
+        "policy_hash": _sampling_policy_hash(policy),
         "metrics_config_hash": harness.metrics_config_hash,
         "dataset_seed": dataset_seed,
     }
@@ -382,6 +382,20 @@ def _merged_keys(
 ) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
     """Returns the union of several `(speed, fidelity)` cache key sets."""
     return {k: v for speed, _ in parts for k, v in speed.items()}, {k: v for _, fid in parts for k, v in fid.items()}
+
+
+def _sampling_policy_hash(policy: dict[str, Any]) -> str:
+    """Hashes only policy inputs that change which baseline samples are produced."""
+    sampling_keys = (
+        "speed_samples",
+        "speed_samples_accuracy",
+        "fidelity_seeds",
+        "fidelity_tier",
+        "speed_tiers",
+        "dataset_seed",
+        "spark",
+    )
+    return config_hash({key: policy.get(key) for key in sampling_keys})
 
 
 def _role_scorers(scorer: Scorer) -> tuple[Scorer, Scorer]:

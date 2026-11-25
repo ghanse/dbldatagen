@@ -40,6 +40,7 @@ from dbldatagen_profiler.engines.streaming.checkpoint import (
 from dbldatagen_profiler.engines.streaming.profiler import PII_WARMUP_ROWS, STATE_FILE
 from dbldatagen_profiler.engines.streaming.state import ColumnState, analyze_sample
 from dbldatagen_profiler.model import (
+    EvidenceMethod,
     PiiClass,
     PrivacyPolicy,
     Profile,
@@ -414,6 +415,19 @@ def test_checkpoint_json_round_trips(spark: SparkSession) -> None:
     assert isinstance(float_column, ColumnState) and math.isnan(float_column.max)
     assert decoded.state.columns[:-1] == state.columns[:-1]
     assert data["columns"][1]["min"] == str(-(2**63)) and data["columns"][2]["max"] == str(DECIMAL38_MAX)
+
+
+def test_checkpoint_written_before_evidence_enum_decodes() -> None:
+    path = Path(__file__).parent / "fixtures" / "checkpoint_v1_pre_evidence_enum.json"
+    checkpoint = read_checkpoint(path)
+    assert checkpoint.pii is not None
+    semantics, _ = checkpoint.pii
+    assert {name: [item.method for item in semantic.evidence] for name, semantic in semantics.items()} == {
+        "email": [EvidenceMethod.COLUMN_NAME, EvidenceMethod.EMAIL],
+        "account_id": [EvidenceMethod.COLUMN_NAME, EvidenceMethod.SAMPLE_UNIQUENESS],
+        "birth_date": [EvidenceMethod.COLUMN_NAME, EvidenceMethod.PLAUSIBLE_AGE],
+    }
+    assert encode_checkpoint(checkpoint)["pii"] == json.loads(path.read_text(encoding="utf-8"))["pii"]
 
 
 @pytest.mark.parametrize(

@@ -28,9 +28,10 @@ from profiler_bench.runner.spark_conf import fidelity_spark_config
 DATASETS = ["numeric", "retail"]
 
 
-def test_default_policy_is_2_0_0_with_fast_defaults() -> None:
+def test_default_policy_is_2_1_0_with_fast_defaults() -> None:
     policy = load_policy(DEFAULT_POLICY)
-    assert policy["version"] == "2.0.0"
+    assert policy["version"] == "2.1.0"
+    assert policy["accuracy"]["min_target_improvement"] == 0.01
     assert policy["spark"]["master"] == "local[8]"
     assert policy["spark"]["configs"] == {
         "spark.sql.shuffle.partitions": "2",
@@ -515,6 +516,33 @@ def test_policy_change_misses_cache(
     changed = tmp_path / "changed-policy.json"
     changed.write_text(json.dumps(policy))
     assert _run(setup, "changed", policy_path=changed)["baseline_cached"] is False
+
+
+def test_gate_threshold_change_hits_cache(
+    setup: dict[str, Path], speed_log: list[dict[str, Any]], fidelity_log: list[dict[str, Any]], tmp_path: Path
+) -> None:
+    _run(setup, "first")
+    policy = json.loads(setup["policy"].read_text())
+    policy["accuracy"]["min_target_improvement"] = 0.02
+    changed = tmp_path / "changed-gate-policy.json"
+    changed.write_text(json.dumps(policy))
+    run = _run(setup, "changed-gate", policy_path=changed)
+    assert run["baseline_cache_parts"] == {
+        "speed_cache_allowed": True,
+        "speed_cached": True,
+        "fidelity_cached": True,
+    }
+
+
+def test_sample_count_change_misses_cache(
+    setup: dict[str, Path], speed_log: list[dict[str, Any]], fidelity_log: list[dict[str, Any]], tmp_path: Path
+) -> None:
+    _run(setup, "first")
+    policy = json.loads(setup["policy"].read_text())
+    policy["speed_samples_accuracy"]["s"] += 1
+    changed = tmp_path / "changed-samples-policy.json"
+    changed.write_text(json.dumps(policy))
+    assert _run(setup, "changed-samples", policy_path=changed)["baseline_cached"] is False
 
 
 def test_no_baseline_cache_recomputes(

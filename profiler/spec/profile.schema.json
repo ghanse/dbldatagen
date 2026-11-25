@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "dbldatagen profile spec 0.2.0. Generated from dbldatagen_profiler.model; do not edit.",
+  "$comment": "dbldatagen profile spec 0.3.0. Generated from dbldatagen_profiler.model; do not edit.",
   "$defs": {
     "BooleanStats": {
       "description": "Statistics for a boolean column.\n\nAttributes:\n    true_fraction: Fraction of non-null values that are true.",
@@ -392,6 +392,27 @@
       ],
       "title": "EnumerationConstraint",
       "type": "object"
+    },
+    "EvidenceMethod": {
+      "description": "Detection method behind a semantic classification.",
+      "enum": [
+        "column_name",
+        "email",
+        "phone",
+        "luhn",
+        "iban_mod97",
+        "us_ssn",
+        "ip_address",
+        "uuid",
+        "opaque_token_entropy",
+        "plausible_age",
+        "sample_uniqueness",
+        "pii_span",
+        "policy_column",
+        "policy_column_generic"
+      ],
+      "title": "EvidenceMethod",
+      "type": "string"
     },
     "ExpressionConstraint": {
       "description": "Boolean SQL expression that rows satisfy.\n\nAttributes:\n    kind: Discriminator; always \"expression\".\n    expression: Boolean SQL expression over the table's columns.\n    dialect: SQL dialect of `expression` (default \"spark\").\n    satisfied_fraction: Fraction of rows that satisfy the constraint.",
@@ -1115,9 +1136,7 @@
       "description": "Detection method and its sampled match rate, without source values.",
       "properties": {
         "method": {
-          "minLength": 1,
-          "title": "Method",
-          "type": "string"
+          "$ref": "#/$defs/EvidenceMethod"
         },
         "match_rate": {
           "maximum": 1.0,

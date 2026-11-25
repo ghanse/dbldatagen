@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from profiler_bench.evaluate.gates import evaluate_gates
 from profiler_bench.runner.policy import DEFAULT_POLICY, load_policy
 
@@ -217,3 +219,51 @@ def test_regression_at_exactly_the_limit_is_not_a_regression() -> None:
     assert at_limit["reason"] == "real_holdout_passed"
     above = _gate(_verdict_with(fidelity, speed, max_dataset_regression=limit / 2), "real_holdout")
     assert above["reason"] == "real_holdout_regression"
+
+
+TARGETED = {"numeric": 0.02, "retail": -0.005, "strings": -0.005}
+
+
+def _targeted_verdict(real_candidate: float, real_privacy: str) -> dict[str, Any]:
+    run = _run() | {"datasets": sorted(TARGETED)}
+    speed = [record for dataset in [*TARGETED, *REAL] for record in _speed(dataset)]
+    fidelity = []
+    for seed in SEEDS:
+        for dataset, difference in TARGETED.items():
+            fidelity += [
+                _fidelity(dataset, "baseline", seed, 0.7),
+                _fidelity(dataset, "candidate", seed, 0.7 + difference),
+            ]
+        candidate = _fidelity("nyctaxi_trips", "candidate", seed, real_candidate, real_privacy == "pass")
+        fidelity += [_fidelity("nyctaxi_trips", "baseline", seed, 0.8), candidate | {"privacy_status": real_privacy}]
+    return evaluate_gates(
+        speed_records=speed,
+        fidelity_records=fidelity,
+        policy=_policy(),
+        proposal={"type": "accuracy", "targets": {"datasets": ["numeric"]}},
+        run=run,
+    )
+
+
+@pytest.mark.parametrize(
+    ("real_candidate", "real_privacy", "verdict", "reason"),
+    [
+        (0.8, "pass", "accepted", None),
+        (0.7, "pass", "inconclusive", "real_holdout_regression"),
+        (0.8, "fail", "rejected", "real_holdout_privacy_failed"),
+        (0.8, "unmeasured", "inconclusive", "real_holdout_privacy_unmeasured"),
+    ],
+)
+def test_targeted_accept_is_bound_by_the_real_holdout(
+    real_candidate: float, real_privacy: str, verdict: str, reason: str | None
+) -> None:
+    result = _targeted_verdict(real_candidate, real_privacy)
+    assert _gate(result, "accuracy_targeted")["status"] == "pass"
+    assert _gate(result, "accuracy_mean")["status"] == "fail"
+    assert result["verdict"] == verdict
+    if verdict == "accepted":
+        assert (result["accuracy_path"], result["reasons"]) == ("targeted", [])
+    else:
+        assert "accuracy_path" not in result
+        assert reason in result["reasons"]
+        assert _gate(result, "real_holdout")["reason"] == reason
