@@ -264,6 +264,13 @@ def test_real_dataset_scores_parts_and_skips_structure(monkeypatch: Any, tmp_pat
 
     monkeypatch.setattr("profiler_bench.catalog.real.load_part", load_part)
     monkeypatch.setattr("profiler_bench.fidelity.privacy.independent_rows", independent_rows)
+    shuffles: list[tuple[object, int, str]] = []
+
+    def shuffled_columns(frame: Any, seed: int, salt: str) -> Any:
+        shuffles.append((frame, seed, salt))
+        return SimpleNamespace(of=f"shuffled-{frame.part}")
+
+    monkeypatch.setattr("profiler_bench.fidelity.privacy.shuffled_columns", shuffled_columns)
     monkeypatch.setattr(
         "profiler_bench.catalog.real.materialize_part", lambda *args, **kwargs: SimpleNamespace(manifest=manifest)
     )
@@ -291,7 +298,8 @@ def test_real_dataset_scores_parts_and_skips_structure(monkeypatch: Any, tmp_pat
     args, kwargs = privacy_calls[0]
     assert args == (parts["profiled"], synth, loaded_profile, manifest)
     assert kwargs["holdout"]["trips"].of == "holdout"
-    assert kwargs["chance"]["trips"].of == "ceiling"
+    assert kwargs["chance"]["trips"].of == "shuffled-profiled"
+    assert shuffles == [(parts["profiled"]["trips"], 3, "trips")]
     assert kwargs["min_independent_rows"] == 100
     assert scores.detail["holdout_overlap"]["trips"]["holdout_overlap_share"] == 1 / 3
     assert scores.relative_reconstruction == 0.75

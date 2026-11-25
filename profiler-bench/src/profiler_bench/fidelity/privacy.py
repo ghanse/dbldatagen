@@ -4,10 +4,19 @@ Data checks compare the synth with a real holdout: another row sample of the sam
 never reached the profiler, so the rate at which it matches the real data is the rate expected by chance.
 Every check is pass/fail against a threshold of the metrics configuration; values themselves are never reported.
 
-Real datasets (no planted truth) pass `holdout` and `chance` frames that hold only rows absent from `real` (see
-`independent_rows`) and `min_independent_rows`. Copy and partial-copy checks then use `chance` (the real ceiling
-part) as the chance control, and a baseline table with fewer rows than `min_independent_rows` makes its checks
+Real datasets (no planted truth) pass a `holdout` of rows absent from `real` (see `independent_rows`), a `chance`
+control of `real` with each column shuffled independently (see `shuffled_columns`), and `min_independent_rows`.
+Copy and partial-copy checks then become a membership test on the non-key columns: the synth's match rate against
+`real` minus its match rate against the holdout, with both references cut to the same size by a seeded sample. A
+sampler that knows only the distribution, dependencies included, matches seen and unseen rows alike; one that
+copied the profiled rows matches them more. Tables with no non-key columns compare the synth with the shuffle
+instead (`shuffled_control` in the detail). A baseline with fewer rows than `min_independent_rows` makes its checks
 unmeasured (`GuardCheck.measured` false): recorded, neither a pass nor a fail.
+
+Real-dataset copy checks also pass a power check. Match rates are means over synth rows, so a synth that is
+`POWER_COPY_SHARE` verbatim profiled rows and otherwise at chance has `POWER_COPY_SHARE` times the excess of an exact
+copy. When that excess cannot exceed the threshold plus the noise allowance, a pass of the check could not rule out
+such a copy; it is reported unmeasured with `underpowered` in its detail, never as a pass. Failed checks stay failed.
 
 The profile scans skip only canonical structural strings verified against the real schema and the model (see
 `_structural_paths`); a sensitive value found in the profile counts once per profile string that holds it.
@@ -28,6 +37,7 @@ from urllib.parse import unquote
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyspark
 from pydantic import ValidationError
 from pyspark.sql import DataFrame, SparkSession
@@ -109,10 +119,10 @@ def score_privacy(
             the catalog's default sample seed.
         seed: Seed of the distance-to-closest-record samples.
         config: Metrics configuration; defaults to the packaged one.
-        chance: Real rows the profiler never saw, used instead of `holdout` as the chance rate of the copy and
-            partial-copy checks; None keeps the holdout.
-        min_independent_rows: When set, a table whose baseline (`holdout`, or `chance` for copy checks) has fewer
-            rows makes those checks unmeasured instead of passed or failed.
+        chance: Rows at the chance level of copying for tables with no non-key columns in the real-dataset mode,
+            e.g. `real` with each column shuffled (`shuffled_columns`); None uses `holdout`.
+        min_independent_rows: Turns on the real-dataset mode (membership copy checks, see the module docstring); a
+            table whose baseline has fewer rows makes those checks unmeasured instead of passed or failed.
 
     Raises:
         ValueError: If the Spark session time zone is not UTC.
@@ -198,6 +208,18 @@ def _hits(detail: Mapping[str, float]) -> float:
     return float(sum(value for key, value in detail.items() if ":" not in key))
 
 
+def shuffled_columns(frame: DataFrame, seed: int, salt: str = "") -> DataFrame:
+    """Returns `frame` with each column permuted independently by a seeded shuffle.
+
+    Every marginal, key domains included, is kept and the joint is broken, so copy rates of the result measure what
+    a sampler that knows only marginals matches by chance.
+    """
+    table = frame.toArrow()
+    rng = np.random.default_rng([seed, zlib.crc32(salt.encode())])
+    columns = [column.take(pa.array(rng.permutation(table.num_rows))) for column in table.columns]
+    return frame.sparkSession.createDataFrame(pa.Table.from_arrays(columns, schema=table.schema))
+
+
 def independent_rows(rows: DataFrame, seen: DataFrame) -> DataFrame:
     """Returns the rows of `rows` equal to no row of `seen` (all columns compared)."""
     columns = list(rows.columns)
@@ -249,9 +271,7 @@ def _table_checks(
     min_rows: int | None = None,
 ) -> list[GuardCheck]:
     limits = config.privacy
-    control = holdout if chance is None else chance
     holdout_short = _short(holdout, min_rows)
-    control_short = holdout_short if chance is None else _short(chance, min_rows)
     real_types = {f.name: f.dataType.simpleString() for f in real.schema.fields}
     synth_types = {f.name: f.dataType.simpleString() for f in synth.schema.fields}
     shared = [n for n, t in real_types.items() if synth_types.get(n) == t]
@@ -268,7 +288,7 @@ def _table_checks(
         checks += [_unmeasured(f"{truth.name}.{n}", t) for n, t in zip(names, thresholds, strict=True)]
     else:
         values = [c for c in shared if c not in keys]
-        checks += _copy_checks(truth.name, real, synth, control, shared, values, seed, config, control_short)
+        checks += _row_copy_checks(truth.name, real, synth, holdout, chance, shared, values, seed, config, min_rows)
         # Sample full synth rows inside `_dcr` (not a projection of `shared`) so low-cardinality shared
         # columns do not collapse the bounded sample to distinct value tuples.
         if holdout_short is not None:
@@ -314,12 +334,52 @@ def _table_checks(
     return checks
 
 
+def _row_copy_checks(
+    table: str,
+    real: DataFrame,
+    synth: DataFrame,
+    holdout: DataFrame,
+    chance: DataFrame | None,
+    shared: Sequence[str],
+    values: Sequence[str],
+    seed: int,
+    config: MetricsConfig,
+    min_rows: int | None,
+) -> list[GuardCheck]:
+    """Returns the copy and partial-copy checks: against the holdout, or in the real-dataset mode (`min_rows` set) the
+    membership test on non-key columns, with the shuffled control for tables that have none."""
+    if min_rows is None:
+        return _copy_checks(table, real, synth, holdout, shared, values, seed, config)
+    if values:
+        return _membership_checks(table, real, synth, holdout, values, seed, config, _short(holdout, min_rows))
+    control = holdout if chance is None else chance
+    return _copy_checks(
+        table, real, synth, control, shared, values, seed, config, _short(control, min_rows), shuffled=True
+    )
+
+
 def _short(baseline: DataFrame, min_rows: int | None) -> int | None:
     """Returns the row count of `baseline` when it is below `min_rows`, else None (also when `min_rows` is None)."""
     if min_rows is None:
         return None
     rows = baseline.count()
     return rows if rows < min_rows else None
+
+
+POWER_COPY_SHARE = 0.05
+
+
+def _powered(check: GuardCheck, copy_excess: float) -> GuardCheck:
+    """Returns `check`, or an unmeasured `underpowered` check when it passed but a `POWER_COPY_SHARE` copy could not
+    have failed it; a failed check stays failed."""
+    detectable = POWER_COPY_SHARE * copy_excess
+    required = check.threshold + check.detail.get("noise_allowance", 0.0)
+    if detectable > required or not check.passed:
+        return check.model_copy(update={"detail": {**check.detail, "detectable_copy_excess": detectable}})
+    detail = {"unmeasured": 1.0, "underpowered": 1.0, "detectable_copy_excess": detectable, "required_excess": required}
+    return GuardCheck(
+        name=check.name, value=0.0, threshold=check.threshold, passed=False, measured=False, detail=detail
+    )
 
 
 def _copy_checks(
@@ -331,9 +391,14 @@ def _copy_checks(
     values: Sequence[str],
     seed: int,
     config: MetricsConfig,
-    short: int | None,
+    short: int | None = None,
+    *,
+    shuffled: bool = False,
 ) -> list[GuardCheck]:
-    """Returns the copy and partial-copy checks against the chance rate of `control`, or unmeasured ones when short."""
+    """Returns the copy and partial-copy checks against the chance rate of `control`, or unmeasured ones when short.
+
+    With `shuffled`, `control` is the shuffled-columns control and the checks say so in their detail.
+    """
     limit = config.privacy.max_copy_rate_excess
     if short is not None:
         names = ["copy_rate_excess", *(["partial_copy_rate_excess"] if len(values) > 1 else [])]
@@ -345,19 +410,78 @@ def _copy_checks(
         limit,
         config.privacy.noise_z,
     )
-    return [copy, *_partial_copy(table, real, synth, control, values, seed, config)]
+    if not shuffled:
+        return [copy, *_partial_copy(table, (synth, real), (control, real), values, seed, config)]
+    exact = 1.0 - _match_rate(control, real, shared)[0]
+    partial = _partial_copy(
+        table, (synth, real), (control, real), values, seed, config, ((real, real), (control, real))
+    )
+    return [
+        c.model_copy(update={"detail": {**c.detail, "shuffled_control": 1.0}})
+        for c in [_powered(copy, exact), *partial]
+    ]
+
+
+def _membership_checks(
+    table: str,
+    real: DataFrame,
+    synth: DataFrame,
+    unseen: DataFrame,
+    values: Sequence[str],
+    seed: int,
+    config: MetricsConfig,
+    short: int | None,
+) -> list[GuardCheck]:
+    """Returns copy and partial-copy checks that compare the synth's match rate on seen and unseen rows.
+
+    `real` (seen by the profiler) and `unseen` (independent holdout rows) are cut to the same size by a seeded sample,
+    and both rates are over the synth's `values` (non-key) columns.
+    """
+    limit = config.privacy.max_copy_rate_excess
+    if short is not None:
+        names = ["copy_rate_excess", *(["partial_copy_rate_excess"] if len(values) > 1 else [])]
+        return [_too_few_rows(f"{table}.{name}", limit, short) for name in names]
+    size = min(real.count(), unseen.count())
+    seen_rows, unseen_rows = _seeded_rows(real, size, seed, "seen"), _seeded_rows(unseen, size, seed, "unseen")
+    copy = _excess(
+        f"{table}.copy_rate_excess",
+        _match_rate(synth, seen_rows, values),
+        _match_rate(synth, unseen_rows, values),
+        limit,
+        config.privacy.noise_z,
+    )
+    exact = _match_rate(real, seen_rows, values)[0] - _match_rate(real, unseen_rows, values)[0]
+    copied = ((real, seen_rows), (real, unseen_rows))
+    partial = _partial_copy(table, (synth, seen_rows), (synth, unseen_rows), values, seed, config, copied)
+    checks = [_powered(copy, exact), *partial]
+    return [
+        c.model_copy(update={"detail": {**c.detail, "membership": 1.0, "reference_rows": float(size)}}) for c in checks
+    ]
+
+
+def _seeded_rows(frame: DataFrame, size: int, seed: int, salt: str) -> DataFrame:
+    """Returns `size` rows of `frame` chosen by a seeded hash of their content (all of them when it has `size`)."""
+    if frame.count() <= size:
+        return frame
+    key = F.xxhash64(F.lit(seed), F.lit(salt), F.to_json(F.struct(*(F.col(identifier(c)) for c in frame.columns))))
+    return frame.orderBy(key).limit(size)
 
 
 def _partial_copy(
     table: str,
-    real: DataFrame,
-    synth: DataFrame,
-    holdout: DataFrame,
+    measured: tuple[DataFrame, DataFrame],
+    baseline: tuple[DataFrame, DataFrame],
     shared: Sequence[str],
     seed: int,
     config: MetricsConfig,
+    copied: tuple[tuple[DataFrame, DataFrame], tuple[DataFrame, DataFrame]] | None = None,
 ) -> list[GuardCheck]:
-    """Returns a check that no column pair reproduces real-unique value pairs more often than the holdout does.
+    """Returns a check that no column pair reproduces reference-unique value pairs more often than the baseline does.
+
+    `measured` and `baseline` are `(rows, reference)`: usually `(synth, real)` and `(holdout, real)`, and
+    `(synth, real)` and `(synth, unseen)` for the membership test. With `copied`, the same two rates for an exact
+    copy, each pair passes the power check (`_powered`); the check covers only powered pairs and is unmeasured
+    `underpowered` when none is.
 
     A synth row that copies some columns of a real row, row-aligned, reproduces the real row's combination of values
     in every pair of copied columns; combinations unique in the real table do not recur by chance. Primary key and
@@ -371,21 +495,33 @@ def _partial_copy(
     if len(pairs) > limit:
         rng = np.random.default_rng([seed, zlib.crc32(table.encode())])
         pairs = [pairs[i] for i in sorted(rng.choice(len(pairs), size=limit, replace=False))]
-    synth_rates, holdout_rates = _pair_match_rates(synth, real, pairs), _pair_match_rates(holdout, real, pairs)
+    synth_rates, holdout_rates = _pair_match_rates(*measured, pairs), _pair_match_rates(*baseline, pairs)
     checks = [
         _excess("", synth_rate, holdout_rate, config.privacy.max_copy_rate_excess, config.privacy.noise_z)
         for synth_rate, holdout_rate in zip(synth_rates, holdout_rates, strict=True)
     ]
-    worst = max(range(len(pairs)), key=lambda i: checks[i].value)
+    name = f"{table}.partial_copy_rate_excess"
+    if copied is not None:
+        exact = [
+            a[0] - b[0]
+            for a, b in zip(_pair_match_rates(*copied[0], pairs), _pair_match_rates(*copied[1], pairs), strict=True)
+        ]
+        powered = [_powered(c, e) for c, e in zip(checks, exact, strict=True)]
+        checks = [c for c in powered if c.measured]
+        if not checks:
+            best = max(powered, key=lambda c: c.detail["detectable_copy_excess"])
+            return [best.model_copy(update={"name": name, "detail": {**best.detail, "pairs": float(len(pairs))}})]
+    worst = max(range(len(checks)), key=lambda i: checks[i].value)
     return [
         GuardCheck(
-            name=f"{table}.partial_copy_rate_excess",
+            name=name,
             value=checks[worst].value,
             threshold=config.privacy.max_copy_rate_excess,
             passed=all(c.passed for c in checks),
             detail={
                 **checks[worst].detail,
                 "pairs": float(len(pairs)),
+                **({} if copied is None else {"powered_pairs": float(len(checks))}),
                 "failed_pairs": float(sum(not c.passed for c in checks)),
             },
         )

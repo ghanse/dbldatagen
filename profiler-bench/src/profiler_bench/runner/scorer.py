@@ -47,7 +47,7 @@ class FidelityScores:
         return asdict(self)
 
 
-_RealParts = tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, dict[str, float]]]
+_RealParts = tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, float]]]
 
 
 @runtime_checkable
@@ -468,7 +468,10 @@ def _score_real_dataset(
     spark.conf.set("spark.sql.session.timeZone", "UTC")
     spec = REAL_DATASETS[dataset]
     manifest = materialize_part(spec, tier, "profiled", scorer.real_root).manifest
-    real, holdout, chance, overlap = _real_parts(scorer, dataset, tier, spark)
+    from profiler_bench.fidelity.privacy import shuffled_columns  # noqa: PLC0415
+
+    real, holdout, overlap = _real_parts(scorer, dataset, tier, spark)
+    chance = {table: shuffled_columns(frame, seed, table) for table, frame in real.items()}
     loaded = load_profile(profile, strict=False)
     synth = scorer.sample(loaded, spark, seed=seed).tables
     reconstruction = scorer.score_reconstruction(real, synth, manifest, seed=seed)
@@ -505,7 +508,8 @@ def _score_real_dataset(
             "parts": {
                 "profiled": "profiled",
                 "privacy_holdout": "holdout rows not in profiled",
-                "copy_chance_control": "ceiling rows not in profiled",
+                "copy_check": "membership on non-key columns: profiled vs equal-size independent holdout rows",
+                "key_only_copy_control": "profiled with each column shuffled, seeded by the sampler seed",
                 "ceiling": "ceiling vs profiled",
             },
             "privacy_min_independent_rows": min_rows,
@@ -520,9 +524,9 @@ MIN_INDEPENDENT_ROWS = 100
 
 
 def _real_parts(scorer: _RealScorer, dataset: str, tier: str, spark: SparkSession) -> _RealParts:
-    """Returns the profiled part, its independent holdout and ceiling rows, and their overlap with it per table.
+    """Returns the profiled part, its independent holdout rows, and the holdout's overlap with it per table.
 
-    Independent rows are the rows of a part equal to no profiled row; they are cached on the scorer per cell.
+    Independent rows are the holdout rows equal to no profiled row; they are cached on the scorer per cell.
     """
     from profiler_bench.catalog.real import load_part  # noqa: PLC0415
     from profiler_bench.fidelity.privacy import independent_rows  # noqa: PLC0415
@@ -531,18 +535,15 @@ def _real_parts(scorer: _RealScorer, dataset: str, tier: str, spark: SparkSessio
     if key not in scorer._real_parts:
         spec = REAL_DATASETS[dataset]
         real = load_part(spec, tier, "profiled", spark, scorer.real_root)
-        parts = {name: load_part(spec, tier, name, spark, scorer.real_root) for name in ("holdout", "ceiling")}
-        independent = {
-            name: {t: independent_rows(frame, real[t]).cache() for t, frame in tables.items()}
-            for name, tables in parts.items()
-        }
+        holdout = load_part(spec, tier, "holdout", spark, scorer.real_root)
+        independent = {t: independent_rows(frame, real[t]).cache() for t, frame in holdout.items()}
         overlap: dict[str, dict[str, float]] = {}
         for table in real:
-            entry: dict[str, float] = {}
-            for name in parts:
-                rows, kept = parts[name][table].count(), independent[name][table].count()
-                entry |= {f"{name}_rows": float(rows), f"{name}_independent_rows": float(kept)}
-                entry[f"{name}_overlap_share"] = (rows - kept) / rows if rows else 0.0
-            overlap[table] = entry
-        scorer._real_parts[key] = (real, independent["holdout"], independent["ceiling"], overlap)
+            rows, kept = holdout[table].count(), independent[table].count()
+            overlap[table] = {
+                "holdout_rows": float(rows),
+                "holdout_independent_rows": float(kept),
+                "holdout_overlap_share": (rows - kept) / rows if rows else 0.0,
+            }
+        scorer._real_parts[key] = (real, independent, overlap)
     return scorer._real_parts[key]

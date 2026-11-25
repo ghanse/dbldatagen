@@ -270,14 +270,26 @@ holds, the sampled text scan counts only values the full scan missed, and a chec
 
 **Real datasets** (`--suite real`) adjust the data checks:
 - The holdout baseline is the holdout part's rows that equal no profiled row (`privacy.independent_rows`).
-- Copy and partial-copy checks use the ceiling part's independent rows as the chance control: excess is the synth
-  rate minus the ceiling rate, both measured against the profiled rows, with the same threshold and noise allowance.
+- Copy and partial-copy checks are a membership test on the non-key columns: the synth's match rate against the
+  profiled rows minus its match rate against the independent holdout rows. The larger reference is first cut to the
+  size of the smaller one by a seeded sample. A sampler that knows only the distribution, dependencies between
+  columns included, matches seen and unseen rows alike; one that memorised profiled rows matches them more.
+- Tables with no non-key columns (key-only bridge tables) compare the synth with the profiled part with each column
+  shuffled independently (`privacy.shuffled_columns`, seeded by the sampler seed), labelled `shuffled_control`.
+- **Power check.** Match rates are means over synth rows, so a synth that is 5% verbatim profiled rows and otherwise
+  at chance has 5% of an exact copy's excess. When that cannot exceed the threshold plus the noise allowance, the check
+  could not catch such a copy: a pass is reported unmeasured with `underpowered` (never as a pass), and a failure stays
+  a failure. This happens on tiny tables, on tables whose non-key columns repeat across rows, and when few
+  independent holdout rows remain.
 - A table whose baseline has fewer than max(k, 100) independent rows reports those checks as unmeasured
   (`GuardCheck.measured` false): recorded in `privacy_unmeasured`, neither a pass nor a fail.
-- Each record's `holdout_overlap` gives, per table, the holdout and ceiling rows and the share also in `profiled`.
+- Each record's `holdout_overlap` gives, per table, the holdout rows and the share also in `profiled`. The
+  `real_holdout` gate lists each dataset's unmeasured, underpowered, and shuffled-control checks.
 
-The synthetic suite is unchanged. The scorer tests check that a synth with 5% verbatim real rows fails, and so does
-an exact copy.
+Known gap: on a key-only table, a 5% copy can stay below the shuffled chance level when the rest of the synth matches
+real key pairs less often than the shuffle does (Wanderbricks `property_amenities`); exact copies are caught. The
+profile carries only aggregates, so reproducing key edges requires memorising rows, which the exact-copy control
+catches. The synthetic suite is unchanged.
 
 Profile regex and text privacy is layered (synth-data leakage is the last):
 

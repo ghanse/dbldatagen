@@ -173,7 +173,9 @@ def _real_holdout(
 
     Reports, per real dataset, each build's relative reconstruction and the paired regression with CIs, whether
     privacy passed, the privacy checks left unmeasured (too few independent baseline rows: recorded, neither a pass
-    nor a fail), and the holdout and ceiling overlap with the profiled part per table. Fails (rejects the candidate) when a candidate sample fails privacy. Otherwise it
+    nor a fail), the copy checks that were underpowered (a 5% verbatim copy could not fail them; also unmeasured),
+    the copy checks of key-only tables that used the shuffled control, and the holdout's overlap with the profiled
+    part per table. Fails (rejects the candidate) when a candidate sample fails privacy. Otherwise it
     is inconclusive when a dataset's regression CI reaches `accuracy.max_dataset_regression`
     (`real_holdout_regression`) or when samples are failed or missing (`real_holdout_incomplete`).
     """
@@ -212,6 +214,11 @@ def _real_holdout(
         detail["candidate_privacy_unmeasured"] = sorted(
             {n for r in candidate for n in r.get("privacy_unmeasured") or []}
         )
+        checks = [c for r in candidate for c in ((r.get("detail") or {}).get("privacy") or {}).get("checks", [])]
+        for label, flag in (("shuffled_control", "shuffled_control"), ("underpowered", "underpowered")):
+            detail[f"candidate_privacy_{label}"] = sorted(
+                {c["name"] for c in checks if (c.get("detail") or {}).get(flag)}
+            )
         overlap = next(
             (r["detail"]["holdout_overlap"] for r in candidate if "holdout_overlap" in (r.get("detail") or {})), None
         )
