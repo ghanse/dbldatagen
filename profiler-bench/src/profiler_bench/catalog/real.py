@@ -50,6 +50,7 @@ from profiler_bench.catalog.store import META_FILE, Materialized, cache_dir, is_
 
 REAL_TIERS = ("s", "full")
 REAL_SUBSET_CAP = 50_000
+REAL_SUBSET_METHOD = "fk_preserving_hash"
 FULL_FILE_ROWS = 1_000_000
 POLL_SECONDS = 2.0
 RETRY_SECONDS = 2.0
@@ -212,25 +213,46 @@ def materialize(
         raise KeyError(f"unknown tier {tier!r}; expected one of {list(REAL_TIERS)}")
     target = instance_dir(dataset, tier, root)
     if (target / META_FILE).exists():
-        cached = is_intact(target, check_hash) and (tier != "full" or _pinned(dataset, read_instance(target)))
+        cached = (
+            is_intact(target, check_hash)
+            and _subset_meta_matches(target, tier)
+            and (tier != "full" or _pinned(dataset, read_instance(target)))
+        )
         if cached:
             return read_instance(target)
         shutil.rmtree(target)
     if tier == "full":
         tables = export(dataset, connect())
+        extra_meta = None
     else:
         full = materialize(dataset, "full", root, check_hash)
         tables = subset(dataset, {t.name: full.read_table(t.name) for t in full.manifest.tables}, REAL_SUBSET_CAP)
+        extra_meta = {"subset_cap": REAL_SUBSET_CAP, "subset_method": REAL_SUBSET_METHOD}
     truth = dataset.manifest(tier, tables)
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(dir=target.parent, prefix=".tmp-"))
     try:
-        write_instance(staging, tables, truth, 0)
+        write_instance(staging, tables, truth, 0, extra_meta=extra_meta)
         staging.rename(target)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
     return read_instance(target)
+
+
+def _subset_meta_matches(target: Path, tier: str) -> bool:
+    """Returns whether a cached real instance was built with the current subset cap and method.
+
+    Full exports have no subset metadata. Tier-s materializations without a recorded cap (pre-50k
+    caches) or with a different cap/method must be rematerialized.
+    """
+    if tier == "full":
+        return True
+    try:
+        meta = json.loads((target / META_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    return bool(meta.get("subset_cap") == REAL_SUBSET_CAP and meta.get("subset_method") == REAL_SUBSET_METHOD)
 
 
 def _pinned(dataset: RealDataset, instance: Materialized) -> bool:

@@ -1,3 +1,5 @@
+import hashlib
+import inspect
 import itertools
 import json
 import os
@@ -5,6 +7,7 @@ import struct
 import subprocess
 import sys
 from decimal import Decimal
+from importlib.metadata import version
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +16,7 @@ import pyarrow.parquet as pq
 import pytest
 from pyspark.sql import SparkSession
 
-from profiler_bench.catalog import DATASETS, generate, materialize, registry
+from profiler_bench.catalog import DATASETS, gen, generate, manifest, materialize, registry
 from profiler_bench.catalog.gen import rng_factory
 from profiler_bench.catalog.hashing import little_endian, table_hash
 from profiler_bench.catalog.store import content_hash
@@ -115,6 +118,31 @@ def test_fingerprint_includes_library_versions(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(registry, "version", lambda package: "0.0.0" if package == "pyarrow" else "1")
     assert DATASETS["numeric"].fingerprint() != before
     assert set(registry.FINGERPRINT_PACKAGES) == {"numpy", "pandas", "pyarrow", "pyspark"}
+
+
+def test_xs_s_m_fingerprints_match_base_commit() -> None:
+    """Adding tier `r` must not invalidate existing xs/s/m catalog and baseline caches."""
+    root = Path(__file__).resolve().parents[2]
+    base = subprocess.check_output(
+        ["git", "show", "81d86e1:profiler-bench/src/profiler_bench/catalog/registry.py"],
+        cwd=root,
+    )
+    assert registry._registry_fingerprint_bytes() == base
+
+    def expected(dataset: registry.Dataset) -> str:
+        digest = hashlib.sha256()
+        for source in [inspect.getsourcefile(dataset.build), gen.__file__, manifest.__file__]:
+            digest.update(Path(str(source)).read_bytes())
+        digest.update(base)
+        for package in registry.FINGERPRINT_PACKAGES:
+            digest.update(f"{package}=={version(package)}\n".encode())
+        return digest.hexdigest()[:16]
+
+    for dataset in DATASETS.values():
+        want = expected(dataset)
+        for tier in ("xs", "s", "m"):
+            assert dataset.fingerprint(tier) == want
+        assert dataset.fingerprint("r") != want
 
 
 def test_streams_are_independent_of_request_order() -> None:

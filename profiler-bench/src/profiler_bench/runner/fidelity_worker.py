@@ -119,19 +119,23 @@ def _score_seeds(
             app_name=f"rsi-fidelity-{role}-{dataset}-{tier}",
         )
         spark.conf.set("spark.sql.session.timeZone", "UTC")
-        records = [
-            score_one_seed(
-                role=role,
-                dataset=dataset,
-                tier=tier,
-                seed=seed,
-                profile=profile,
-                scorer=scorer,
-                dataset_seed=dataset_seed,
+        records = []
+        session_id = str(id(spark))
+        for index, seed in enumerate(seeds):
+            records.append(
+                score_one_seed(
+                    role=role,
+                    dataset=dataset,
+                    tier=tier,
+                    seed=seed,
+                    profile=profile,
+                    scorer=scorer,
+                    dataset_seed=dataset_seed,
+                )
             )
-            for seed in seeds
-        ]
-        return records, [str(id(spark))] * len(seeds), spark
+            if index + 1 < len(seeds):
+                _reset_spark_between_seeds(spark)
+        return records, [session_id] * len(seeds), spark
 
     records = []
     session_ids: list[str] = []
@@ -163,6 +167,18 @@ def _score_seeds(
                 with contextlib.suppress(Exception):
                     seed_spark.stop()
     return records, session_ids, None
+
+
+def _reset_spark_between_seeds(spark: SparkSession) -> None:
+    """Clears cached frames, temp views, and session conf drift between reused-session seeds."""
+    with contextlib.suppress(Exception):
+        spark.catalog.clearCache()
+    with contextlib.suppress(Exception):
+        for table in spark.catalog.listTables():
+            if getattr(table, "isTemporary", False):
+                spark.catalog.dropTempView(table.name)
+    # Scorer and fidelity paths set UTC; restore it in case a seed left another zone.
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
 
 
 def _harness_profiler_module_file() -> str | None:

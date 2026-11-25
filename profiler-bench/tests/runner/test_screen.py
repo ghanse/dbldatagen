@@ -9,11 +9,15 @@ from typing import Any
 
 import pyarrow as pa
 import pytest
+from pyspark.sql import SparkSession
 
+from dbldatagen_profiler.engines.spark import profile_tables
+from profiler_bench.catalog import load
 from profiler_bench.catalog.real import REAL_SUBSET_CAP, RealDataset, RealTable, subset
 from profiler_bench.evaluate.evaluate import evaluate_experiment
 from profiler_bench.evaluate.gates import evaluate_gates
 from profiler_bench.rsi import __main__ as rsi_cli
+from profiler_bench.runner import fidelity_worker
 from profiler_bench.runner.experiment import ExperimentConfig, run_experiment
 from profiler_bench.runner.fidelity_run import run_fidelity_samples, score_one_seed
 from profiler_bench.runner.policy import (
@@ -22,7 +26,7 @@ from profiler_bench.runner.policy import (
     load_policy,
     screened_accuracy_thresholds,
 )
-from profiler_bench.runner.scorer import FakeScorer
+from profiler_bench.runner.scorer import FakeScorer, try_real_scorer
 from profiler_bench.runner.spark_conf import fidelity_spark_config
 
 
@@ -415,3 +419,97 @@ def test_seed_raise_still_records_per_seed_failures(tmp_path: Path) -> None:
     assert baseline[1]["ok"] is False
     assert baseline[1]["error_class"] == "RuntimeError"
     assert "seed-boom" in baseline[1]["error"]
+
+
+def _numeric_xs_profile(spark: SparkSession) -> dict[str, Any]:
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    real = load("numeric", "xs", seed=0, spark=spark, sample_seed=0)
+    dumped = profile_tables(real, detect_pii=False).model_dump(mode="json")
+    assert isinstance(dumped, dict)
+    return dumped
+
+
+def test_real_spark_session_reuse_matches_fresh_score_json(tmp_path: Path, spark: SparkSession) -> None:
+    """Reuse vs fresh must be byte-identical with a real scorer (Spark exercised, cache cleared between seeds)."""
+    profile = _numeric_xs_profile(spark)
+    cache = tmp_path / "ceilings"
+    scorer = try_real_scorer(cache_dir=cache, harness_hash="screen-reuse", metrics_config_hash="screen")
+    assert scorer is not None
+    speed = [
+        {"kind": "speed", "role": role, "dataset": "numeric", "tier": "xs", "ok": True, "profile": profile}
+        for role in ("baseline", "candidate")
+    ]
+    policy = {"fidelity_tier": "xs", "fidelity_seeds": 3}
+    spark_conf = fidelity_spark_config(driver_memory="8g")
+    reused = run_fidelity_samples(
+        speed_records=speed,
+        scorer_baseline=scorer,
+        scorer_candidate=scorer,
+        datasets=["numeric"],
+        policy=policy,
+        samples_dir=tmp_path / "reuse",
+        fidelity_spark=spark_conf,
+        cache_dir=cache,
+        harness_hash="screen-reuse",
+        metrics_config_hash="screen",
+        parallelism=1,
+    )
+    fresh = run_fidelity_samples(
+        speed_records=speed,
+        scorer_baseline=scorer,
+        scorer_candidate=scorer,
+        datasets=["numeric"],
+        policy=policy,
+        samples_dir=tmp_path / "fresh",
+        fidelity_spark=spark_conf,
+        cache_dir=cache,
+        harness_hash="screen-reuse",
+        metrics_config_hash="screen",
+        parallelism=1,
+        worker_prefix=[sys.executable, "-c", _fresh_worker_launcher()],
+    )
+    baseline_reused = [record for record in reused if record["role"] == "baseline"]
+    baseline_fresh = [record for record in fresh if record["role"] == "baseline"]
+    assert len(baseline_reused) == 3 and len(baseline_fresh) == 3
+    assert all(record["ok"] for record in baseline_reused)
+    assert all(record["ok"] for record in baseline_fresh)
+    assert json.dumps(baseline_reused, sort_keys=True, separators=(",", ":")) == json.dumps(
+        baseline_fresh, sort_keys=True, separators=(",", ":")
+    )
+
+
+def test_real_spark_seed_raise_continues_remaining_seeds(
+    tmp_path: Path, spark: SparkSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One seed raising under a reused real Spark session must not drop the other seeds' records."""
+    profile = _numeric_xs_profile(spark)
+    scorer = try_real_scorer(cache_dir=tmp_path / "ceilings", harness_hash="screen-raise", metrics_config_hash="screen")
+    assert scorer is not None
+    real_score = scorer.score
+
+    def score_or_raise(profile_arg: dict[str, Any], **kwargs: Any) -> Any:  # noqa: ANN401
+        if kwargs.get("seed") == 1:
+            raise RuntimeError("seed-boom-real")
+        return real_score(profile_arg, **kwargs)
+
+    monkeypatch.setattr(scorer, "score", score_or_raise)
+    # Reuse the session-scoped Spark via getOrCreate; do not stop it.
+    records, session_ids, _held = fidelity_worker._score_seeds(
+        role="baseline",
+        dataset="numeric",
+        tier="xs",
+        seeds=[0, 1, 2],
+        profile=profile,
+        scorer=scorer,
+        dataset_seed=0,
+        fidelity_spark=fidelity_spark_config(driver_memory="8g"),
+        use_spark=True,
+        session_mode=fidelity_worker.SESSION_REUSE,
+    )
+    assert len(records) == 3
+    assert len(set(session_ids)) == 1
+    assert records[0]["ok"] is True
+    assert records[1]["ok"] is False
+    assert records[1]["error_class"] == "RuntimeError"
+    assert "seed-boom-real" in records[1]["error"]
+    assert records[2]["ok"] is True
