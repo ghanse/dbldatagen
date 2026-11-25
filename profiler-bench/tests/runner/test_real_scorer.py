@@ -222,3 +222,89 @@ def test_cli_and_factory_default_to_real_scorer(monkeypatch: Any, tmp_path: Path
         == 0
     )
     assert captured[0].scorer is None
+
+
+def test_real_dataset_scores_parts_and_skips_structure(monkeypatch: Any, tmp_path: Path) -> None:
+    from profiler_bench.runner.scorer import _real_ceiling  # noqa: PLC0415
+
+    parts = {
+        part: {"trips": SimpleNamespace(part=part, count=lambda: 300)} for part in ("profiled", "holdout", "ceiling")
+    }
+    synth = {"trips": object()}
+    manifest = object()
+    loaded_profile = SimpleNamespace(privacy=SimpleNamespace(min_value_count=5))
+    roots: list[Any] = []
+
+    def independent_rows(rows: Any, seen: Any) -> Any:
+        assert seen is parts["profiled"]["trips"]
+        kept = SimpleNamespace(of=rows.part, count=lambda: 200)
+        kept.cache = lambda: kept
+        return kept
+
+    def load_part(dataset: Any, tier: str, part: str, spark: Any, root: Any) -> dict[str, SimpleNamespace]:
+        assert (dataset.name, tier) == ("nyctaxi_trips", "s")
+        roots.append(root)
+        return parts[part]
+
+    def score_structure(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("structure must not be scored on a real dataset")
+
+    privacy_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def score_privacy(*args: Any, **kwargs: Any) -> Any:
+        privacy_calls.append((args, kwargs))
+        return SimpleNamespace(passed=True, status="pass", checks=[], model_dump=lambda mode: {"passed": True})
+
+    reconstruction_calls: list[tuple[object, object]] = []
+
+    def score_reconstruction(real: Any, generated: Any, truth: Any, seed: int) -> _Score:
+        assert truth is manifest
+        reconstruction_calls.append((real, generated))
+        return _Score(0.8, {"score": 0.8})
+
+    monkeypatch.setattr("profiler_bench.catalog.real.load_part", load_part)
+    monkeypatch.setattr("profiler_bench.fidelity.privacy.independent_rows", independent_rows)
+    shuffles: list[tuple[object, int, str]] = []
+
+    def shuffled_columns(frame: Any, seed: int, salt: str) -> Any:
+        shuffles.append((frame, seed, salt))
+        return SimpleNamespace(of=f"shuffled-{frame.part}")
+
+    monkeypatch.setattr("profiler_bench.fidelity.privacy.shuffled_columns", shuffled_columns)
+    monkeypatch.setattr(
+        "profiler_bench.catalog.real.materialize_part", lambda *args, **kwargs: SimpleNamespace(manifest=manifest)
+    )
+    monkeypatch.setattr("dbldatagen_profiler.model.load_profile", lambda value, strict: loaded_profile)
+    monkeypatch.setattr(
+        "pyspark.sql.SparkSession.getActiveSession",
+        lambda: SimpleNamespace(conf=SimpleNamespace(set=lambda *args: None)),
+    )
+    scorer = _real_scorer(
+        tmp_path,
+        sample=lambda value, spark, seed: SimpleNamespace(tables=synth),
+        score_reconstruction=score_reconstruction,
+        score_structure=score_structure,
+        score_privacy=score_privacy,
+        real_root=tmp_path / "catalog",
+    )
+    ceiling = cast(ReconstructionScore, SimpleNamespace(score=0.9, model_dump=lambda mode: {"score": 0.9}))
+    scorer._ceiling_cache[("nyctaxi_trips", "s", 0, "harness-a", "metrics-a")] = ceiling
+
+    scores = scorer.score({}, dataset="nyctaxi_trips", tier="s", seed=3, structure_seed=0, sample_seed=0)
+
+    assert scores.structure is None
+    assert scores.detail["structure"]["status"] == "not_applicable"
+    assert reconstruction_calls == [(parts["profiled"], synth)]
+    args, kwargs = privacy_calls[0]
+    assert args == (parts["profiled"], synth, loaded_profile, manifest)
+    assert kwargs["holdout"]["trips"].of == "holdout"
+    assert kwargs["chance"]["trips"].of == "shuffled-profiled"
+    assert shuffles == [(parts["profiled"]["trips"], 3, "trips")]
+    assert kwargs["min_independent_rows"] == 100
+    assert scores.detail["holdout_overlap"]["trips"]["holdout_overlap_share"] == 1 / 3
+    assert (scores.relative_reconstruction, scores.privacy_status) == (0.75, "pass")
+
+    reconstruction_calls.clear()
+    _real_ceiling(scorer, "nyctaxi_trips", "s", cast(Any, None))
+    assert reconstruction_calls == [(parts["profiled"], parts["ceiling"])]
+    assert set(roots) == {tmp_path / "catalog"}

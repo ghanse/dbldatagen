@@ -281,6 +281,8 @@ class GuardCheck(_Score):
         threshold: Threshold from the configuration.
         passed: Whether the value is on the safe side of the threshold.
         detail: Measured values behind `value`, e.g. the synth and holdout rates.
+        measured: False when the check had too few independent baseline rows to be measured; it is then neither
+            a pass nor a fail and does not decide `PrivacyScore.passed`.
     """
 
     name: str
@@ -288,6 +290,7 @@ class GuardCheck(_Score):
     threshold: float
     passed: bool
     detail: dict[str, float] = {}
+    measured: bool = True
 
 
 class PrivacyScore(_Score):
@@ -298,7 +301,9 @@ class PrivacyScore(_Score):
         config_version: Metrics configuration version.
         config_hash: Metrics configuration hash.
         checks: Every guard check, named `<table>.<check>` or `profile.<check>`.
-        passed: Whether every check passed.
+        passed: Whether `status` is `pass`.
+        status: `fail` when a measured check failed; `unmeasured` on a real dataset where no copy, partial-copy, or
+            distance-to-closest-record check was measured; `pass` otherwise.
     """
 
     dataset: str
@@ -306,6 +311,7 @@ class PrivacyScore(_Score):
     config_hash: str
     checks: list[GuardCheck]
     passed: bool
+    status: Literal["pass", "fail", "unmeasured"] = "pass"
 
 
 class OverallScore(_Score):

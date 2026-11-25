@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from pyspark.sql import SparkSession
 
+from profiler_bench.catalog.real import REAL_CACHE_ENV
 from profiler_bench.catalog.store import CACHE_ENV
 
 
@@ -13,6 +14,7 @@ def catalog_cache(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
     root = tmp_path_factory.mktemp("catalog")
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv(CACHE_ENV, str(root))
+        patch.setenv(REAL_CACHE_ENV, str(root / "real"))
         yield root
 
 
