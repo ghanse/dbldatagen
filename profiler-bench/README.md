@@ -96,7 +96,9 @@ parquet writer, but a new numpy version may change the generated values and so t
 `profiler_bench.catalog.real_datasets` registers four real datasets (`REAL_DATASETS`). Each declares its source
 tables, the export SQL (`SELECT * FROM <source> ORDER BY <primary key>`, or `ORDER BY ALL` without one), the expected
 row counts, the schema, and the logical hash of every exported table, pinned after the first export. Data is
-never committed: it lives in the gitignored cache under `real/<dataset>/<tier>`.
+never committed. It lives outside every checkout, so it survives worktree cleanup: under `$PROFILER_BENCH_REAL_CACHE`,
+or `~/.cache/profiler-bench/real` by default, as `<dataset>/<tier>` (`real.real_cache_dir`). An explicit cache root
+(`--cache-dir`, `ExperimentConfig.cache_dir`) uses `<root>/real` instead.
 
 ```bash
 export PROFILER_BENCH_DATABRICKS_PROFILE=<profile> PROFILER_BENCH_DATABRICKS_WAREHOUSE_ID=<warehouse id>
@@ -122,12 +124,32 @@ any network or authentication failure, the export raises `Unavailable` with the 
 | Tier | Contents |
 |---|---|
 | `full` | the export (pinned logical hashes unchanged) |
-| `s` | a deterministic subset capped at `REAL_SUBSET_CAP` (~50,000 rows): a table over that cap keeps the rows whose primary key (all non-nested columns without one) hashes below `cap / rows`; then, parents first, rows that reference a dropped parent through a declared foreign key are dropped |
+| `s` | a deterministic root-entity subset capped at `REAL_SUBSET_CAP` (~50,000 rows): each root table over that cap keeps the rows whose primary key (all non-nested columns without one) hashes below `cap / rows`; descendants are not independently capped and remain only when they still reference a kept parent through a declared foreign key. After the benchmark root-entity split, the same cap applies to each part's root set |
 
 Real data has no planted truth. Its manifest is marked `ground_truth: none` and claims only the schema, row counts,
 documented primary, unique, and foreign keys that hold in the data, and privacy classes; it makes no distribution
-claims. `verify` checks just those. Structure scoring must skip these manifests. Reconstruction and privacy can still
-run, but each real dataset has one sample, so there is no independent holdout or ceiling (see COVERAGE.md).
+claims. `verify` checks just those, and structure scoring is skipped: it is recorded as `not_applicable`, never 0.
+
+For benchmarking, `real.split` divides each export into three parts (`real.SPLIT`, version 2, recorded in `run.json`
+and the baseline cache key). `profiled` is the only part the profiler sees; `holdout` is the privacy baseline;
+`ceiling` stands in for the synthetic data, so the ceiling is the reconstruction of `ceiling` against `profiled`. The
+split follows root entities (`RealDataset.split_roots`: `customer` for TPC-DS, `users` and `hosts` for Wanderbricks;
+by default, the tables that reference no other table). Every row has one home part:
+
+- a row of a root table, or of a table not connected to a root, gets the part `blake2b-64("split", table, key) mod 3`,
+  where the key is the primary key (all non-nested columns without one);
+- any other row takes the home of the parent row behind its first non-null foreign key, in declared order, to a table
+  connected to a root (a sale goes with its customer, a booking with its user).
+
+Then, children first, every parent row that a row of a part references is copied into that part. So each part
+satisfies the declared foreign keys and no row is dropped, but parts overlap on copied rows. `split_report.json` in
+`<dataset>/split-v2/` (and `run.json` `real_split_report`) gives each table's rows, share of the export, and copied
+rows per part. On the current exports, every table keeps at least 31.5% of its rows in every part. Copies are heavy in
+shared dimensions: TPC-DS `item` and Wanderbricks `properties`, `amenities`, and `destinations` are in every part in
+full, `customer_address` at 98%. They also reach sensitive tables: 28% of the holdout's TPC-DS `customer` rows, 42% of
+Wanderbricks `hosts`, and all of `properties` are also in `profiled`. The privacy checks that compare synth against
+the holdout use only holdout rows absent from `profiled` (see the privacy guard below).
+Tier `s` of a part is the tier-s subset of that part. Parts are cached under `<dataset>/split-v2/<part>/<tier>`.
 
 | Dataset | Source | Licence and terms |
 |---|---|---|
@@ -232,6 +254,49 @@ standard errors. Reports carry counts and rates, never values.
 | `<table>.quasi_identifiers[...].match_rate_excess` | share of rows matching a real-unique quasi-identifier combination exceeds the holdout's by at most 0.01 |
 | `profile.sensitive_value_leaks` | no sensitive real value equals a string of the profile JSON or appears in a scanned profile-text blob; every sensitive value (all rows) is checked against a bounded profile candidate set (decoded strings, concat, required literals, and fully enumerated small branch languages) and fails with `sensitive_value_in_profile` on a hit; every profile string is closed (below); every profile regex is in the allowlisted dialect; sensitive-column patterns pass the structural rule below; and no sensitive value in a seeded sample of 2,000 per column is fully matched by a small-language alternation branch of any other profile regex or contains a rare required literal of one |
 | `profile.k_threshold` | the profile validates; every `top_values` entry and enumeration value occurs in at least `privacy.min_value_count` (k) real rows; closed-string, dialect, and structural pattern rules pass; and on non-sensitive columns no alternation branch is a small-language match or rare required literal against that column's values |
+
+The profile scans (`profile.sensitive_value_leaks` and `profile.k_threshold`) skip only canonical structural
+strings, each verified on its own terms (`privacy._structural_paths`):
+- a table or column name equal to the real schema, including references to one (key, dependency,
+  quasi-identifier, relationship, and constraint columns);
+- a `source_type` equal to the real column's `simpleString()`;
+- a value the model defines for that enum or `Literal` field;
+- the running engine's name and version.
+
+Everything else is scanned, including patterns, top values, enumerations, extrema, and free strings, so a real value
+planted in a pattern, a top value, or a column name the real schema lacks still fails. A sensitive value counts once
+for each profile string that holds it. The concatenation of all strings counts only for values no single string
+holds, the sampled text scan counts only values the full scan missed, and a check's value counts hits, not the
+`<reason>:<path>` detail keys that locate them.
+
+**Real datasets** (`--suite real`) adjust the data checks:
+- The holdout baseline is the holdout part's rows that equal no profiled row (`privacy.independent_rows`).
+- Copy and partial-copy checks are a membership test on the non-key columns: the synth's match rate against the
+  profiled rows minus its match rate against the independent holdout rows. The larger reference is first cut to the
+  size of the smaller one by a seeded sample. A sampler that knows only the distribution, dependencies between
+  columns included, matches seen and unseen rows alike; one that memorised profiled rows matches them more.
+- Tables with no non-key columns (key-only bridge tables) compare the synth with the profiled part with each column
+  shuffled independently (`privacy.shuffled_columns`, seeded by the sampler seed), labelled `shuffled_control`.
+- **Power check.** Match rates are means over synth rows, so replacing 5% of the synth's rows with verbatim profiled
+  rows gives each rate `0.95 * rate + 0.05 * copied rate` (the shuffled control's rate does not move). The check is
+  rerun on those expected rates, with the pooled rate and noise allowance recomputed under that alternative. If it
+  would still pass, a pass could not rule out such a copy: the check is reported unmeasured with `underpowered`
+  (never as a pass), and a failure stays a failure. This happens on tiny tables, on tables whose non-key columns
+  repeat across rows, and when few independent holdout rows remain.
+- A table whose baseline has fewer than max(k, 100) independent rows reports those checks as unmeasured
+  (`GuardCheck.measured` false): recorded in `privacy_unmeasured`, neither a pass nor a fail.
+- **Privacy status** (`PrivacyScore.status`, the record's `privacy_status`): `fail` when a measured check failed;
+  `pass` only when, in addition, at least one copy, partial-copy, or distance-to-closest-record check was measured;
+  otherwise `unmeasured`. A guard that measured nothing about the rows never passes.
+- Each record's `holdout_overlap` gives, per table, the holdout rows and the share also in `profiled`. The
+  `real_holdout` gate lists each dataset's privacy status and its unmeasured, underpowered, and shuffled-control
+  checks.
+
+Known gap: on a key-only table, a 5% copy can stay below the shuffled chance level when the rest of the synth matches
+real key pairs less often than the shuffle does (Wanderbricks `property_amenities`). The power check then reports
+the check underpowered rather than passed; exact copies are caught. The profile carries only aggregates, so
+reproducing key edges requires memorising rows, which the exact-copy control catches. The synthetic suite is
+unchanged: its status is `pass` or `fail` as before.
 
 Profile regex and text privacy is layered (synth-data leakage is the last):
 
@@ -366,7 +431,7 @@ scores) are reused for any proposal type. Speed entries (all N baseline samples 
 only for accuracy proposals; speed and data-volume proposals always time both builds fresh in the same run, with
 rotated order. Keys cover the baseline `profiler/src` hash, harness hash, sampling-policy hash, metrics config hash, dataset,
 tier, dataset seed, Spark config hash, the catalog generator fingerprint and instance content hash (or the pinned
-hashes of a real dataset), and the Python, PySpark, NumPy, pandas, scikit-learn, and pyarrow versions. Speed keys add
+hashes and split method of a real dataset), and the Python, PySpark, NumPy, pandas, scikit-learn, and pyarrow versions. Speed keys add
 the Java version, sample count, and machine; fidelity keys add the sampler seeds and scorer. Any mismatch, corrupt
 file, or failed sample recomputes. Gate thresholds are excluded from the sampling-policy hash, so cached samples can be
 reevaluated under new gates; sample counts, seeds, tiers, dataset seed, and Spark configuration remain key inputs. Writes
@@ -392,10 +457,30 @@ and identical `profiler_src_hash` builds can never be `accepted`. Results land i
 `run.json`, `samples/*.json`, `summary.json`, `verdict.json`, `REPORT.md`, and `benchmark_entry.json` (shaped for
 `rsi_log.py append` kind `benchmark`).
 
+### Real holdout suite
+
+`--suite` (`ExperimentConfig.suite`) picks the datasets: `synthetic` (default, the catalog generators; behaviour and cache keys
+as before), `real` (the four real datasets), or `all`. Before any timing, each requested real dataset's parts are
+materialized at the fidelity tier. A dataset whose export is neither cached nor exportable (no warehouse, rejected
+credentials, offline), fails its pinned checks, or has no such tier (real datasets have only `s` and `full`) is
+skipped with the reason in `run.json` `real_skipped`; the run continues. Scored real datasets are listed in
+`real_datasets` and take speed samples only at the fidelity tier, for their profile.
+
+The evaluator treats the real suite as a **holdout**, not part of acceptance: real samples are excluded from
+completeness, privacy, accuracy mean, per-dataset, structure, and speed gates, and checked only by the `real_holdout`
+gate. It reports each real dataset's baseline and candidate relative reconstruction with bootstrap CIs, the paired
+regression CI, and the candidate's privacy status. A candidate sample that fails privacy on a real dataset
+**rejects** (`real_holdout_privacy_failed`). A candidate sample whose privacy is `unmeasured` makes the verdict
+**inconclusive** (`real_holdout_privacy_unmeasured`), never accepted. So does a regression CI whose upper bound
+exceeds `accuracy.max_dataset_regression` (`real_holdout_regression`), and failed or missing real samples
+(`real_holdout_incomplete`). With every real dataset skipped the gate passes as `real_holdout_skipped`. A
+`real`-only run has no synthetic pairs, so it can measure but never accept.
+
 ```bash
 uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi run \
   --baseline /path/to/baseline --candidate /path/to/candidate \
-  --policy profiler-bench/policies/default.json --experiment-id demo [--datasets retail numeric] [--control]
+  --policy profiler-bench/policies/default.json --experiment-id demo [--datasets retail numeric] [--control] \
+  [--suite synthetic|real|all]
 uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi screen \
   --baseline /path/to/baseline --candidate /path/to/candidate \
   --policy profiler-bench/policies/default.json --experiment-id demo-screen

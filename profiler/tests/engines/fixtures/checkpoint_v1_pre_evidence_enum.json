@@ -1,0 +1,402 @@
+{
+ "batches": [
+  [
+   0,
+   0
+  ]
+ ],
+ "columns": [
+  {
+   "children": [],
+   "count": 20,
+   "distinct": 20,
+   "lengths": [
+    20,
+    "350",
+    "6130",
+    17,
+    18
+   ],
+   "max": null,
+   "min": null,
+   "moments": null,
+   "non_null": 20,
+   "sketch": "AwEHDAUAAAkUAAAAAAAAAOH13wcAAAAAAAAAAAAAAAAAAAAAJpayC8eTpgcAAAAAaWBwB8ph8QWrOh0K7MpbBI0HIAkAAAAAr+yuCQAAAAAAAAAAAAAAANM87gUUgLkKAAAAALbU0wr4N7wK2MRPB1aUAQUAAAAAm+7ECe8d0QTTrgQGHrNdG6p2jw8=",
+   "true_count": null
+  },
+  {
+   "children": [],
+   "count": 20,
+   "distinct": 20,
+   "lengths": [
+    20,
+    "130",
+    "850",
+    6,
+    7
+   ],
+   "max": null,
+   "min": null,
+   "moments": null,
+   "non_null": 20,
+   "sketch": "AwEHDAUAAAkUAAAAAAAAACHGngSlR0QOTZPEBQAAAABl87kaZiazDQAAAACoTPwGAAAAABlKjwoAAAAAAAAAAKgUWAWOb5QFbz7vB0U9RQ8tAC8KAAAAAAAAAAAAAAAA1bsACIE28wgAAAAAGN0KC1mw/AUAAAAA29SnDI+Vpwj4vuYJz0UMCQAAAAA=",
+   "true_count": null
+  },
+  {
+   "children": [],
+   "count": 20,
+   "distinct": 20,
+   "lengths": null,
+   "max": [
+    7171,
+    "1989-08-20"
+   ],
+   "min": [
+    0,
+    "1970-01-01"
+   ],
+   "moments": null,
+   "non_null": 20,
+   "sketch": "AwEHDAUAAAkUAAAAID0gBQAAAAAAAAAAUJ6PCQAAAADF+OoPZnu9CwAAAACDbGMFAAAAAIpYhgbc2dcEAAAAAAAAAAAAAAAAAAAAAPkmJRP6/jYJEnatCgAAAAAAAAAAdcj/BBakdQR3yg4MAAAAALlzigb6el8EOwhBCNz5Rgh9X2cEHHTNBcCfUQc=",
+   "true_count": null
+  }
+ ],
+ "pii": {
+  "quasi_identifier_sets": [],
+  "semantics": {
+   "account_id": {
+    "confidence": 0.85,
+    "evidence": [
+     {
+      "match_rate": 1.0,
+      "method": "column_name"
+     },
+     {
+      "match_rate": 1.0,
+      "method": "sample_uniqueness"
+     }
+    ],
+    "pii_class": "account_id",
+    "sensitivity": "direct_identifier"
+   },
+   "birth_date": {
+    "confidence": 0.95,
+    "evidence": [
+     {
+      "match_rate": 1.0,
+      "method": "column_name"
+     },
+     {
+      "match_rate": 1.0,
+      "method": "plausible_age"
+     }
+    ],
+    "pii_class": "date_of_birth",
+    "sensitivity": "quasi_identifier"
+   },
+   "email": {
+    "confidence": 1.0,
+    "evidence": [
+     {
+      "match_rate": 1.0,
+      "method": "column_name"
+     },
+     {
+      "match_rate": 1.0,
+      "method": "email"
+     }
+    ],
+    "pii_class": "email",
+    "sensitivity": "direct_identifier"
+   }
+  }
+ },
+ "row_count": 20,
+ "sample": [
+  {
+   "key": [
+    -8913136953481178114,
+    "user8@example.com",
+    "acct-8",
+    "1978-09-09"
+   ],
+   "row": {
+    "account_id": "acct-8",
+    "birth_date": "1978-09-09",
+    "email": "user8@example.com"
+   }
+  },
+  {
+   "key": [
+    -8397045344151290552,
+    "user1@example.com",
+    "acct-1",
+    "1971-02-02"
+   ],
+   "row": {
+    "account_id": "acct-1",
+    "birth_date": "1971-02-02",
+    "email": "user1@example.com"
+   }
+  },
+  {
+   "key": [
+    -7364859569033742394,
+    "user7@example.com",
+    "acct-7",
+    "1977-08-08"
+   ],
+   "row": {
+    "account_id": "acct-7",
+    "birth_date": "1977-08-08",
+    "email": "user7@example.com"
+   }
+  },
+  {
+   "key": [
+    -7112235781332742107,
+    "user6@example.com",
+    "acct-6",
+    "1976-07-07"
+   ],
+   "row": {
+    "account_id": "acct-6",
+    "birth_date": "1976-07-07",
+    "email": "user6@example.com"
+   }
+  },
+  {
+   "key": [
+    -6639385488106959741,
+    "user14@example.com",
+    "acct-14",
+    "1984-03-15"
+   ],
+   "row": {
+    "account_id": "acct-14",
+    "birth_date": "1984-03-15",
+    "email": "user14@example.com"
+   }
+  },
+  {
+   "key": [
+    -5502491922368102702,
+    "user15@example.com",
+    "acct-15",
+    "1985-04-16"
+   ],
+   "row": {
+    "account_id": "acct-15",
+    "birth_date": "1985-04-16",
+    "email": "user15@example.com"
+   }
+  },
+  {
+   "key": [
+    -4318177389488615698,
+    "user12@example.com",
+    "acct-12",
+    "1982-01-13"
+   ],
+   "row": {
+    "account_id": "acct-12",
+    "birth_date": "1982-01-13",
+    "email": "user12@example.com"
+   }
+  },
+  {
+   "key": [
+    -3751082727635315831,
+    "user11@example.com",
+    "acct-11",
+    "1981-12-12"
+   ],
+   "row": {
+    "account_id": "acct-11",
+    "birth_date": "1981-12-12",
+    "email": "user11@example.com"
+   }
+  },
+  {
+   "key": [
+    -3303203753895612035,
+    "user3@example.com",
+    "acct-3",
+    "1973-04-04"
+   ],
+   "row": {
+    "account_id": "acct-3",
+    "birth_date": "1973-04-04",
+    "email": "user3@example.com"
+   }
+  },
+  {
+   "key": [
+    -1204479046773801070,
+    "user16@example.com",
+    "acct-16",
+    "1986-05-17"
+   ],
+   "row": {
+    "account_id": "acct-16",
+    "birth_date": "1986-05-17",
+    "email": "user16@example.com"
+   }
+  },
+  {
+   "key": [
+    -1154994062352783863,
+    "user4@example.com",
+    "acct-4",
+    "1974-05-05"
+   ],
+   "row": {
+    "account_id": "acct-4",
+    "birth_date": "1974-05-05",
+    "email": "user4@example.com"
+   }
+  },
+  {
+   "key": [
+    -1058789658455103226,
+    "user5@example.com",
+    "acct-5",
+    "1975-06-06"
+   ],
+   "row": {
+    "account_id": "acct-5",
+    "birth_date": "1975-06-06",
+    "email": "user5@example.com"
+   }
+  },
+  {
+   "key": [
+    -399762771180876285,
+    "user17@example.com",
+    "acct-17",
+    "1987-06-18"
+   ],
+   "row": {
+    "account_id": "acct-17",
+    "birth_date": "1987-06-18",
+    "email": "user17@example.com"
+   }
+  },
+  {
+   "key": [
+    1841873056093828547,
+    "user18@example.com",
+    "acct-18",
+    "1988-07-19"
+   ],
+   "row": {
+    "account_id": "acct-18",
+    "birth_date": "1988-07-19",
+    "email": "user18@example.com"
+   }
+  },
+  {
+   "key": [
+    2012662427451584952,
+    "user2@example.com",
+    "acct-2",
+    "1972-03-03"
+   ],
+   "row": {
+    "account_id": "acct-2",
+    "birth_date": "1972-03-03",
+    "email": "user2@example.com"
+   }
+  },
+  {
+   "key": [
+    3188660101971141378,
+    "user9@example.com",
+    "acct-9",
+    "1979-10-10"
+   ],
+   "row": {
+    "account_id": "acct-9",
+    "birth_date": "1979-10-10",
+    "email": "user9@example.com"
+   }
+  },
+  {
+   "key": [
+    3271392522317056252,
+    "user0@example.com",
+    "acct-0",
+    "1970-01-01"
+   ],
+   "row": {
+    "account_id": "acct-0",
+    "birth_date": "1970-01-01",
+    "email": "user0@example.com"
+   }
+  },
+  {
+   "key": [
+    3824291825581588132,
+    "user13@example.com",
+    "acct-13",
+    "1983-02-14"
+   ],
+   "row": {
+    "account_id": "acct-13",
+    "birth_date": "1983-02-14",
+    "email": "user13@example.com"
+   }
+  },
+  {
+   "key": [
+    6435217111242135595,
+    "user10@example.com",
+    "acct-10",
+    "1980-11-11"
+   ],
+   "row": {
+    "account_id": "acct-10",
+    "birth_date": "1980-11-11",
+    "email": "user10@example.com"
+   }
+  },
+  {
+   "key": [
+    7587384144845026472,
+    "user19@example.com",
+    "acct-19",
+    "1989-08-20"
+   ],
+   "row": {
+    "account_id": "acct-19",
+    "birth_date": "1989-08-20",
+    "email": "user19@example.com"
+   }
+  }
+ ],
+ "sample_size": 10000,
+ "schema": {
+  "fields": [
+   {
+    "metadata": {},
+    "name": "email",
+    "nullable": true,
+    "type": "string"
+   },
+   {
+    "metadata": {},
+    "name": "account_id",
+    "nullable": true,
+    "type": "string"
+   },
+   {
+    "metadata": {},
+    "name": "birth_date",
+    "nullable": true,
+    "type": "date"
+   }
+  ],
+  "type": "struct"
+ },
+ "version": 1
+}

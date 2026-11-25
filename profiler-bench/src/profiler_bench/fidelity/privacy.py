@@ -3,21 +3,44 @@
 Data checks compare the synth with a real holdout: another row sample of the same dataset structure. The holdout
 never reached the profiler, so the rate at which it matches the real data is the rate expected by chance.
 Every check is pass/fail against a threshold of the metrics configuration; values themselves are never reported.
+
+Real datasets (no planted truth) pass a `holdout` of rows absent from `real` (see `independent_rows`), a `chance`
+control of `real` with each column shuffled independently (see `shuffled_columns`), and `min_independent_rows`.
+Copy and partial-copy checks then become a membership test on the non-key columns: the synth's match rate against
+`real` minus its match rate against the holdout, with both references cut to the same size by a seeded sample. A
+sampler that knows only the distribution, dependencies included, matches seen and unseen rows alike; one that
+copied the profiled rows matches them more. Tables with no non-key columns compare the synth with the shuffle
+instead (`shuffled_control` in the detail). A baseline with fewer rows than `min_independent_rows` makes its checks
+unmeasured (`GuardCheck.measured` false): recorded, neither a pass nor a fail.
+
+Real-dataset copy checks also pass a power check. Match rates are means over synth rows, so replacing a
+`POWER_COPY_SHARE` of the synth's rows with verbatim profiled rows gives rates `(1 - share) * rate + share * copied`.
+The check is rerun on the expected rates of that mix, which recomputes the pooled rate and noise allowance
+under the alternative; when it would still pass, a pass could not rule out such a copy and the check is reported
+unmeasured with `underpowered` in its detail, never as a pass. Failed checks stay failed.
+
+The profile scans skip only canonical structural strings verified against the real schema and the model (see
+`_structural_paths`); a sensitive value found in the profile counts once per profile string that holds it.
 """
 
 from __future__ import annotations
 
 import codecs
+import enum
 import itertools
 import math
 import re
+import typing
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 from urllib.parse import unquote
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyspark
 from pydantic import ValidationError
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -82,6 +105,8 @@ def score_privacy(
     sample_seed: int | None = None,
     seed: int = 0,
     config: MetricsConfig | None = None,
+    chance: Mapping[str, DataFrame] | None = None,
+    min_independent_rows: int | None = None,
 ) -> PrivacyScore:
     """Runs the privacy guard on a profile and the synthetic data generated from it.
 
@@ -96,6 +121,10 @@ def score_privacy(
             the catalog's default sample seed.
         seed: Seed of the distance-to-closest-record samples.
         config: Metrics configuration; defaults to the packaged one.
+        chance: Rows at the chance level of copying for tables with no non-key columns in the real-dataset mode,
+            e.g. `real` with each column shuffled (`shuffled_columns`); None uses `holdout`.
+        min_independent_rows: Turns on the real-dataset mode (membership copy checks, see the module docstring); a
+            table whose baseline has fewer rows makes those checks unmeasured instead of passed or failed.
 
     Raises:
         ValueError: If the Spark session time zone is not UTC.
@@ -123,7 +152,17 @@ def score_privacy(
         keys = set(table.primary_key) | {
             c for fk in manifest.foreign_keys if fk.child_table == table.name for c in fk.child_columns
         }
-        checks += _table_checks(table, real[table.name], synth[table.name], holdout[table.name], keys, seed, config)
+        checks += _table_checks(
+            table,
+            real[table.name],
+            synth[table.name],
+            holdout[table.name],
+            keys,
+            seed,
+            config,
+            chance=None if chance is None else chance[table.name],
+            min_rows=min_independent_rows,
+        )
     sensitive = {
         (table.name, path)
         for table in manifest.tables
@@ -133,11 +172,12 @@ def score_privacy(
     risks = _pattern_risks(profile, config, sensitive)
     leaks = _profile_leaks(profile, manifest, real, risks, seed, config)
     violations = _k_violations(profile, real, risks, seed, config, sensitive)
-    text_hits = _sensitive_values_in_profile_text(profile, manifest, real, seed, config)
+    structural = _structural_paths(profile.model_dump(mode="json"), real)
+    profile_hits, found = _sensitive_values_in_profile(profile, manifest, real, risks, config, structural)
+    text_hits = _sensitive_values_in_profile_text(profile, manifest, real, seed, config, structural, found)
     if text_hits:
         leaks = {**leaks, "sensitive_value_in_profile_text": text_hits}
         violations = {**violations, "sensitive_value_in_profile_text": text_hits}
-    profile_hits = _sensitive_values_in_profile(profile, manifest, real, risks, config)
     if profile_hits:
         leaks = {**leaks, **profile_hits}
         violations = {**violations, **profile_hits}
@@ -154,20 +194,65 @@ def score_privacy(
         if hits:
             leaks = {**leaks, reason: leaks.get(reason, 0.0) + hits}
             violations = {**violations, reason: violations.get(reason, 0.0) + hits}
-    checks.append(_at_most("profile.sensitive_value_leaks", sum(leaks.values()), limits.max_profile_leaks, leaks))
-    checks.append(_at_most("profile.k_threshold", sum(violations.values()), limits.max_k_violations, violations))
+    checks.append(_at_most("profile.sensitive_value_leaks", _hits(leaks), limits.max_profile_leaks, leaks))
+    checks.append(_at_most("profile.k_threshold", _hits(violations), limits.max_k_violations, violations))
+    status = _status(checks, real_dataset=min_independent_rows is not None)
     return PrivacyScore(
         dataset=manifest.dataset,
         config_version=config.version,
         config_hash=config.hash(),
         checks=checks,
-        passed=all(c.passed for c in checks),
+        passed=status == "pass",
+        status=status,
     )
+
+
+COPY_CHECKS = ("copy_rate_excess", "partial_copy_rate_excess", "dcr_ratio")
+
+
+def _status(checks: Sequence[GuardCheck], *, real_dataset: bool) -> Literal["pass", "fail", "unmeasured"]:
+    """Returns `fail` when a measured check failed. On real datasets, `pass` also needs at least one measured
+    copy-type check (`COPY_CHECKS`); with none the guard measured nothing about the rows and is `unmeasured`."""
+    if any(c.measured and not c.passed for c in checks):
+        return "fail"
+    copy_measured = any(c.measured and c.name.endswith(COPY_CHECKS) for c in checks)
+    return "unmeasured" if real_dataset and not copy_measured else "pass"
+
+
+def _hits(detail: Mapping[str, float]) -> float:
+    """Returns the number of hits: counters only, since `<reason>:<path>` keys locate hits a counter already holds."""
+    return float(sum(value for key, value in detail.items() if ":" not in key))
+
+
+def shuffled_columns(frame: DataFrame, seed: int, salt: str = "") -> DataFrame:
+    """Returns `frame` with each column permuted independently by a seeded shuffle.
+
+    Every marginal, key domains included, is kept and the joint is broken, so copy rates of the result measure what
+    a sampler that knows only marginals matches by chance.
+    """
+    table = frame.toArrow()
+    rng = np.random.default_rng([seed, zlib.crc32(salt.encode())])
+    columns = [column.take(pa.array(rng.permutation(table.num_rows))) for column in table.columns]
+    return frame.sparkSession.createDataFrame(pa.Table.from_arrays(columns, schema=table.schema))
+
+
+def independent_rows(rows: DataFrame, seen: DataFrame) -> DataFrame:
+    """Returns the rows of `rows` equal to no row of `seen` (all columns compared)."""
+    columns = list(rows.columns)
+    keyed = rows.withColumn("__row", F.to_json(F.struct(*(F.col(identifier(c)) for c in columns))))
+    known = seen.select(F.to_json(F.struct(*(F.col(identifier(c)) for c in columns))).alias("__row"))
+    return keyed.join(known, "__row", "left_anti").drop("__row")
 
 
 def _unmeasured(name: str, threshold: float) -> GuardCheck:
     """Returns a failed check for something the synth lacks, so a missing table or column can never pass."""
     return GuardCheck(name=name, value=0.0, threshold=threshold, passed=False, detail={"unmeasured": 1.0})
+
+
+def _too_few_rows(name: str, threshold: float, rows: int) -> GuardCheck:
+    """Returns an unmeasured check: its baseline has too few independent rows; neither a pass nor a fail."""
+    detail = {"unmeasured": 1.0, "insufficient_independent_rows": 1.0, "baseline_rows": float(rows)}
+    return GuardCheck(name=name, value=0.0, threshold=threshold, passed=False, measured=False, detail=detail)
 
 
 def _at_most(name: str, value: float, threshold: float, detail: Mapping[str, float] | None = None) -> GuardCheck:
@@ -197,8 +282,12 @@ def _table_checks(
     keys: set[str],
     seed: int,
     config: MetricsConfig,
+    *,
+    chance: DataFrame | None = None,
+    min_rows: int | None = None,
 ) -> list[GuardCheck]:
     limits = config.privacy
+    holdout_short = _short(holdout, min_rows)
     real_types = {f.name: f.dataType.simpleString() for f in real.schema.fields}
     synth_types = {f.name: f.dataType.simpleString() for f in synth.schema.fields}
     shared = [n for n, t in real_types.items() if synth_types.get(n) == t]
@@ -214,26 +303,23 @@ def _table_checks(
         thresholds = (limits.max_copy_rate_excess, limits.min_dcr_ratio, limits.max_copy_rate_excess)
         checks += [_unmeasured(f"{truth.name}.{n}", t) for n, t in zip(names, thresholds, strict=True)]
     else:
-        checks.append(
-            _excess(
-                f"{truth.name}.copy_rate_excess",
-                _match_rate(synth, real, shared),
-                _match_rate(holdout, real, shared),
-                limits.max_copy_rate_excess,
-                limits.noise_z,
-            )
-        )
+        values = [c for c in shared if c not in keys]
+        checks += _row_copy_checks(truth.name, real, synth, holdout, chance, shared, values, seed, config, min_rows)
         # Sample full synth rows inside `_dcr` (not a projection of `shared`) so low-cardinality shared
         # columns do not collapse the bounded sample to distinct value tuples.
-        checks.append(_dcr(truth, real, synth, holdout, seed, config, shared=shared))
-        values = [c for c in shared if c not in keys]
-        checks += _partial_copy(truth.name, real, synth, holdout, values, seed, config)
+        if holdout_short is not None:
+            checks.append(_too_few_rows(f"{truth.name}.dcr_ratio", limits.min_dcr_ratio, holdout_short))
+        else:
+            checks.append(_dcr(truth, real, synth, holdout, seed, config, shared=shared))
     for path, category in sensitive_columns(truth).items():
         if category not in VALUE_LEAK_CATEGORIES:
             continue
         name = f"{truth.name}.{path}.value_leak_rate_excess"
         if path.split(".")[0] not in shared:
             checks.append(_unmeasured(name, limits.max_synth_leak_rate_excess))
+            continue
+        if holdout_short is not None:
+            checks.append(_too_few_rows(name, limits.max_synth_leak_rate_excess, holdout_short))
             continue
         checks.append(
             _excess(
@@ -249,6 +335,9 @@ def _table_checks(
         if not set(columns) <= set(shared):
             checks.append(_unmeasured(name, limits.max_qi_match_rate_excess))
             continue
+        if holdout_short is not None:
+            checks.append(_too_few_rows(name, limits.max_qi_match_rate_excess, holdout_short))
+            continue
         checks.append(
             _excess(
                 name,
@@ -261,16 +350,160 @@ def _table_checks(
     return checks
 
 
-def _partial_copy(
+def _row_copy_checks(
     table: str,
     real: DataFrame,
     synth: DataFrame,
     holdout: DataFrame,
+    chance: DataFrame | None,
+    shared: Sequence[str],
+    values: Sequence[str],
+    seed: int,
+    config: MetricsConfig,
+    min_rows: int | None,
+) -> list[GuardCheck]:
+    """Returns the copy and partial-copy checks: against the holdout, or in the real-dataset mode (`min_rows` set) the
+    membership test on non-key columns, with the shuffled control for tables that have none."""
+    if min_rows is None:
+        return _copy_checks(table, real, synth, holdout, shared, values, seed, config)
+    if values:
+        return _membership_checks(table, real, synth, holdout, values, seed, config, _short(holdout, min_rows))
+    control = holdout if chance is None else chance
+    return _copy_checks(
+        table, real, synth, control, shared, values, seed, config, _short(control, min_rows), shuffled=True
+    )
+
+
+def _short(baseline: DataFrame, min_rows: int | None) -> int | None:
+    """Returns the row count of `baseline` when it is below `min_rows`, else None (also when `min_rows` is None)."""
+    if min_rows is None:
+        return None
+    rows = baseline.count()
+    return rows if rows < min_rows else None
+
+
+POWER_COPY_SHARE = 0.05
+
+
+Rate = tuple[float, int]
+
+
+def _powered(
+    check: GuardCheck, measured: tuple[Rate, Rate], copied: tuple[float, float | None], z: float
+) -> GuardCheck:
+    """Returns `check`, or an unmeasured `underpowered` check when it passed but would also pass with a
+    `POWER_COPY_SHARE` verbatim copy mixed into the synth; a failed check stays failed.
+
+    `measured` is the check's two `(rate, rows)`; `copied` the same two rates for verbatim profiled rows, with None
+    for a side the synth does not enter (the shuffled control). Rates are means over synth rows, so the mix has rate
+    `(1 - share) * rate + share * copied`; the check is rerun on those expected rates, which recomputes the pooled
+    rate and the noise allowance under the alternative.
+    """
+    share = POWER_COPY_SHARE
+    (a, a_rows), (b, b_rows) = measured
+    mixed_a = (1 - share) * a + share * copied[0]
+    mixed_b = b if copied[1] is None else (1 - share) * b + share * copied[1]
+    alternative = _excess(check.name, (mixed_a, a_rows), (mixed_b, b_rows), check.threshold, z)
+    power = {
+        "alternative_excess": alternative.value,
+        "alternative_required": check.threshold + alternative.detail["noise_allowance"],
+    }
+    if not alternative.passed or not check.passed:
+        return check.model_copy(update={"detail": {**check.detail, **power}})
+    detail = {"unmeasured": 1.0, "underpowered": 1.0, **power}
+    return GuardCheck(
+        name=check.name, value=0.0, threshold=check.threshold, passed=False, measured=False, detail=detail
+    )
+
+
+def _copy_checks(
+    table: str,
+    real: DataFrame,
+    synth: DataFrame,
+    control: DataFrame,
+    shared: Sequence[str],
+    values: Sequence[str],
+    seed: int,
+    config: MetricsConfig,
+    short: int | None = None,
+    *,
+    shuffled: bool = False,
+) -> list[GuardCheck]:
+    """Returns the copy and partial-copy checks against the chance rate of `control`, or unmeasured ones when short.
+
+    With `shuffled`, `control` is the shuffled-columns control and the checks say so in their detail.
+    """
+    limit = config.privacy.max_copy_rate_excess
+    if short is not None:
+        names = ["copy_rate_excess", *(["partial_copy_rate_excess"] if len(values) > 1 else [])]
+        return [_too_few_rows(f"{table}.{name}", limit, short) for name in names]
+    rates = (_match_rate(synth, real, shared), _match_rate(control, real, shared))
+    copy = _excess(f"{table}.copy_rate_excess", *rates, limit, config.privacy.noise_z)
+    if not shuffled:
+        return [copy, *_partial_copy(table, (synth, real), (control, real), values, seed, config)]
+    partial = _partial_copy(table, (synth, real), (control, real), values, seed, config, ((real, real), None))
+    return [
+        c.model_copy(update={"detail": {**c.detail, "shuffled_control": 1.0}})
+        for c in [_powered(copy, rates, (1.0, None), config.privacy.noise_z), *partial]
+    ]
+
+
+def _membership_checks(
+    table: str,
+    real: DataFrame,
+    synth: DataFrame,
+    unseen: DataFrame,
+    values: Sequence[str],
+    seed: int,
+    config: MetricsConfig,
+    short: int | None,
+) -> list[GuardCheck]:
+    """Returns copy and partial-copy checks that compare the synth's match rate on seen and unseen rows.
+
+    `real` (seen by the profiler) and `unseen` (independent holdout rows) are cut to the same size by a seeded sample,
+    and both rates are over the synth's `values` (non-key) columns.
+    """
+    limit = config.privacy.max_copy_rate_excess
+    if short is not None:
+        names = ["copy_rate_excess", *(["partial_copy_rate_excess"] if len(values) > 1 else [])]
+        return [_too_few_rows(f"{table}.{name}", limit, short) for name in names]
+    size = min(real.count(), unseen.count())
+    seen_rows, unseen_rows = _seeded_rows(real, size, seed, "seen"), _seeded_rows(unseen, size, seed, "unseen")
+    rates = (_match_rate(synth, seen_rows, values), _match_rate(synth, unseen_rows, values))
+    copy = _excess(f"{table}.copy_rate_excess", *rates, limit, config.privacy.noise_z)
+    copied = (_match_rate(real, seen_rows, values)[0], _match_rate(real, unseen_rows, values)[0])
+    partial = _partial_copy(
+        table, (synth, seen_rows), (synth, unseen_rows), values, seed, config, ((real, seen_rows), (real, unseen_rows))
+    )
+    checks = [_powered(copy, rates, copied, config.privacy.noise_z), *partial]
+    return [
+        c.model_copy(update={"detail": {**c.detail, "membership": 1.0, "reference_rows": float(size)}}) for c in checks
+    ]
+
+
+def _seeded_rows(frame: DataFrame, size: int, seed: int, salt: str) -> DataFrame:
+    """Returns `size` rows of `frame` chosen by a seeded hash of their content (all of them when it has `size`)."""
+    if frame.count() <= size:
+        return frame
+    key = F.xxhash64(F.lit(seed), F.lit(salt), F.to_json(F.struct(*(F.col(identifier(c)) for c in frame.columns))))
+    return frame.orderBy(key).limit(size)
+
+
+def _partial_copy(
+    table: str,
+    measured: tuple[DataFrame, DataFrame],
+    baseline: tuple[DataFrame, DataFrame],
     shared: Sequence[str],
     seed: int,
     config: MetricsConfig,
+    copied: tuple[tuple[DataFrame, DataFrame], tuple[DataFrame, DataFrame] | None] | None = None,
 ) -> list[GuardCheck]:
-    """Returns a check that no column pair reproduces real-unique value pairs more often than the holdout does.
+    """Returns a check that no column pair reproduces reference-unique value pairs more often than the baseline does.
+
+    `measured` and `baseline` are `(rows, reference)`: usually `(synth, real)` and `(holdout, real)`, and
+    `(synth, real)` and `(synth, unseen)` for the membership test. With `copied`, the `(rows, reference)` giving the
+    same two rates for verbatim profiled rows (None for a side the synth does not enter), each pair passes the power
+    check (`_powered`); the check covers only powered pairs and is unmeasured `underpowered` when none is.
 
     A synth row that copies some columns of a real row, row-aligned, reproduces the real row's combination of values
     in every pair of copied columns; combinations unique in the real table do not recur by chance. Primary key and
@@ -284,21 +517,36 @@ def _partial_copy(
     if len(pairs) > limit:
         rng = np.random.default_rng([seed, zlib.crc32(table.encode())])
         pairs = [pairs[i] for i in sorted(rng.choice(len(pairs), size=limit, replace=False))]
-    synth_rates, holdout_rates = _pair_match_rates(synth, real, pairs), _pair_match_rates(holdout, real, pairs)
+    synth_rates, holdout_rates = _pair_match_rates(*measured, pairs), _pair_match_rates(*baseline, pairs)
     checks = [
         _excess("", synth_rate, holdout_rate, config.privacy.max_copy_rate_excess, config.privacy.noise_z)
         for synth_rate, holdout_rate in zip(synth_rates, holdout_rates, strict=True)
     ]
-    worst = max(range(len(pairs)), key=lambda i: checks[i].value)
+    name = f"{table}.partial_copy_rate_excess"
+    if copied is not None:
+        copied_a = [rate for rate, _ in _pair_match_rates(*copied[0], pairs)]
+        copied_b: list[float | None] = [None] * len(pairs)
+        if copied[1] is not None:
+            copied_b = [r for r, _ in _pair_match_rates(*copied[1], pairs)]
+        powered = [
+            _powered(c, (a, b), (ca, cb), config.privacy.noise_z)
+            for c, a, b, ca, cb in zip(checks, synth_rates, holdout_rates, copied_a, copied_b, strict=True)
+        ]
+        checks = [c for c in powered if c.measured]
+        if not checks:
+            best = max(powered, key=lambda c: c.detail["alternative_excess"] - c.detail["alternative_required"])
+            return [best.model_copy(update={"name": name, "detail": {**best.detail, "pairs": float(len(pairs))}})]
+    worst = max(range(len(checks)), key=lambda i: checks[i].value)
     return [
         GuardCheck(
-            name=f"{table}.partial_copy_rate_excess",
+            name=name,
             value=checks[worst].value,
             threshold=config.privacy.max_copy_rate_excess,
             passed=all(c.passed for c in checks),
             detail={
                 **checks[worst].detail,
                 "pairs": float(len(pairs)),
+                **({} if copied is None else {"powered_pairs": float(len(checks))}),
                 "failed_pairs": float(sum(not c.passed for c in checks)),
             },
         )
@@ -604,9 +852,12 @@ def _profile_string_list(data: object) -> list[str]:
     return found
 
 
-def _scan_blobs(data: object) -> list[str]:
-    """Returns the text blobs searched for sensitive values: each string, each decoded string, and concatenations."""
-    strings = _profile_string_list(data)
+def _scan_blobs(data: object, skip: frozenset[str] = frozenset()) -> list[str]:
+    """Returns the text blobs searched for sensitive values: each string, each decoded string, and concatenations.
+
+    Strings at the JSON paths in `skip` (structural text, see `_structural_paths`) are left out.
+    """
+    strings = [raw for path, raw in _string_entries(data) if path not in skip]
     decoded = [_decode_profile_text(s) for s in strings]
     blobs = [*strings, *decoded, "".join(strings), "".join(decoded)]
     return [blob.casefold().replace("\\", "") for blob in blobs]
@@ -648,6 +899,95 @@ _CONSTRAINT_FIELDS = {
     "comparison": _OBJECT_FIELDS["ComparisonConstraint"],
     "expression": _OBJECT_FIELDS["ExpressionConstraint"],
 }
+
+
+_MODEL_CLASSES = (
+    Profile, EngineInfo, PrivacyPolicy, SourceInfo, SamplingInfo, TableProfile, ColumnProfile, DistinctCount,
+    NumericStats, StringStats, TemporalStats, BooleanStats, LengthStats, Pattern, ValueFrequency, Quantile, Histogram,
+    KeyCandidate, RangeConstraint, EnumerationConstraint, ComparisonConstraint, ExpressionConstraint, Dependency,
+    Relationship, FanOutStats, Semantic, SemanticEvidence,
+)  # fmt: skip
+_REFERENCE_RE = re.compile(
+    r"\.(columns|column|child_columns|parent_columns|child_table|parent_table|left|right)(\[\d+\])?$"
+)
+
+
+def _choices(annotation: object) -> frozenset[str]:
+    """Returns the string values an annotation allows when it is an enum or a `Literal`, else nothing."""
+    if isinstance(annotation, type) and issubclass(annotation, enum.Enum):
+        return frozenset(str(member.value) for member in annotation)
+    if typing.get_origin(annotation) is typing.Literal:
+        return frozenset(a for a in typing.get_args(annotation) if isinstance(a, str))
+    return frozenset().union(*(_choices(a) for a in typing.get_args(annotation)))
+
+
+_FIELD_CHOICES: dict[tuple[frozenset[str], str], frozenset[str]] = {
+    (frozenset(cls.model_fields), name): choices
+    for cls in _MODEL_CLASSES
+    for name, info in cls.model_fields.items()
+    if (choices := _choices(info.annotation))
+}
+
+
+def _structural_paths(dump: object, real: Mapping[str, DataFrame]) -> frozenset[str]:
+    """Returns JSON paths of profile strings that are canonical structural text, verified independently.
+
+    A string is structural only when it is a table or column name equal to the real schema (including references
+    to them), a `source_type` equal to the real column's `simpleString()`, a value the model defines for that
+    enum or `Literal` field, or the engine name and version of the running engine. Every other string, including
+    patterns, top values, enumerations, and extrema, is scanned.
+    """
+    if not real:
+        return frozenset()
+    names, source_types = _schema_names_and_source_types(real)
+    referable = names | {path for _, path in source_types}
+    engine = {"$.engine.name": "pyspark", "$.engine.version": pyspark.__version__}
+    found: set[str] = set()
+
+    def structural(path: str, value: str, fields: frozenset[str] | None, table: str | None, column: str | None) -> bool:
+        key = path.rsplit(".", 1)[-1].split("[", 1)[0]
+        if path in engine:
+            return engine[path] == value
+        if fields == _OBJECT_FIELDS["TableProfile"] and key == "name":
+            return value in real
+        if fields == _OBJECT_FIELDS["ColumnProfile"] and key == "name":
+            return (table, column) in source_types
+        if key == "source_type":
+            return table is not None and column is not None and source_types.get((table, column)) == value
+        if _REFERENCE_RE.search(path):
+            return value in referable
+        return fields is not None and value in _FIELD_CHOICES.get((fields, key), frozenset())
+
+    def walk(
+        node: object, path: str, fields: frozenset[str] | None, table: str | None, column: str | None, depth: int
+    ) -> None:
+        if isinstance(node, str):
+            if structural(path, node, fields, table, column):
+                found.add(path)
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                item_fields, item_depth = _list_item_context(path, fields, depth)
+                walk(
+                    item,
+                    f"{path}[{index}]",
+                    item_fields if isinstance(item, dict) else fields,
+                    table,
+                    column,
+                    item_depth,
+                )
+        elif isinstance(node, dict):
+            kind = node.get("kind")
+            if fields is None and isinstance(kind, str) and kind in _CONSTRAINT_FIELDS:
+                fields = _CONSTRAINT_FIELDS[kind]
+            if fields == _OBJECT_FIELDS["TableProfile"] and isinstance(node.get("name"), str):
+                table, column = node["name"], None
+            if fields == _OBJECT_FIELDS["ColumnProfile"] and isinstance(node.get("name"), str):
+                column = node["name"] if depth <= 1 else f"{column}.{node['name']}"
+            for key, value in node.items():
+                walk(value, f"{path}.{key}", _NESTED_OBJECT_FIELDS.get(key, fields), table, column, depth)
+
+    walk(dump, "$", _OBJECT_FIELDS["Profile"], None, None, 0)
+    return frozenset(found)
 
 
 def _allow_closed_string(  # noqa: PLR0911
@@ -941,16 +1281,18 @@ def _sensitive_values_in_profile_text(
     real: Mapping[str, DataFrame],
     seed: int,
     config: MetricsConfig,
+    structural: frozenset[str] = frozenset(),
+    found: frozenset[str] = frozenset(),
 ) -> float:
     """Returns how many sampled sensitive values appear in the profile's string blobs.
 
-    Searches each string alone and the concatenation of all strings in document order, after case-folding and
-    backslash stripping, and again after percent-decoding and unicode-unescaping. Values shorter than
-    `privacy.min_literal_len` are ignored.
+    Searches each non-structural string alone and the concatenation of those strings in document order, after
+    case-folding and backslash stripping, and again after percent-decoding and unicode-unescaping. Values shorter than
+    `privacy.min_literal_len` are ignored, and so are values in `found`, which the full scan already counted.
     """
     if not real:
         return 0.0
-    blobs = _scan_blobs(profile.model_dump(mode="json"))
+    blobs = _scan_blobs(profile.model_dump(mode="json"), structural)
     min_len = config.privacy.min_literal_len
     cap = config.sampling.privacy_rows
     hits = 0
@@ -967,7 +1309,7 @@ def _sensitive_values_in_profile_text(
                 if len(value) < min_len:
                     continue
                 key = value.casefold().replace("\\", "")
-                if key in seen:
+                if key in seen or value.lower() in found:
                     continue
                 seen.add(key)
                 if any(key in blob for blob in blobs):
@@ -1008,12 +1350,18 @@ def _string_entries(data: object, path: str = "$") -> list[tuple[str, str]]:
 
 
 def _build_candidate_set(
-    profile: Profile, risks: Mapping[tuple[str, str, int], _PatternRisk], config: MetricsConfig
+    profile: Profile,
+    risks: Mapping[tuple[str, str, int], _PatternRisk],
+    config: MetricsConfig,
+    structural: frozenset[str] = frozenset(),
 ) -> _CandidateSet:
-    """Builds the bounded candidate set: decoded strings, concat, required literals, and small branch languages."""
+    """Builds the bounded candidate set: decoded strings, concat, required literals, and small branch languages.
+
+    Strings at the JSON paths in `structural` are left out of the decoded strings and the concatenation.
+    """
     limits = config.privacy
     dump = profile.model_dump(mode="json")
-    entries = _string_entries(dump)
+    entries = [(path, raw) for path, raw in _string_entries(dump) if path not in structural]
     texts: list[_TextCandidate] = []
     for json_path, raw in entries:
         decoded = _decode_profile_text(raw).casefold().replace("\\", "")
@@ -1052,6 +1400,8 @@ def _build_candidate_set(
 
 
 def _record_profile_hit(detail: dict[str, float], key: str) -> None:
+    if key in detail:
+        return
     detail[key] = 1.0
     detail["sensitive_value_in_profile"] = detail.get("sensitive_value_in_profile", 0.0) + 1.0
 
@@ -1063,16 +1413,18 @@ def _candidate_substring_hits(
     texts: list[tuple[str, str]],
     factors: list[tuple[str, str]],
     min_len: int,
-) -> set[str]:
-    """Returns JSON paths of candidate-set exact/substring hits against lowercased sensitive `values` (columns v, n)."""
-    hit_paths: set[str] = set()
+) -> dict[str, set[str]]:
+    """Returns, for each lowercased sensitive value (columns v, n) found in the candidate set, the JSON paths holding it.
+
+    The concatenation (`$`) is kept for a value only when no single string holds it.
+    """
+    hits: dict[str, set[str]] = {}
     if exacts:
         exact_df = F.broadcast(session.createDataFrame(exacts, "text string, path string"))
-        for row in values.join(exact_df, values.v == exact_df.text, "inner").select("path").distinct().collect():
-            hit_paths.add(row["path"])
+        for row in values.join(exact_df, values.v == exact_df.text, "inner").select("v", "path").distinct().collect():
+            hits.setdefault(row["v"], set()).add(row["path"])
     if texts:
         blob = "\x1e".join(text for text, _ in texts)
-        text_paths = dict(texts)
         matched = [
             r["v"]
             for r in values.where(F.col("n") >= min_len)
@@ -1083,16 +1435,15 @@ def _candidate_substring_hits(
             .collect()
         ]
         for value in matched:
-            for text, json_path in text_paths.items():
+            for text, json_path in texts:
                 if value in text:
-                    hit_paths.add(json_path)
+                    hits.setdefault(value, set()).add(json_path)
     if factors:
         factor_df = F.broadcast(session.createDataFrame(factors, "text string, path string"))
-        for row in (
-            values.join(factor_df, F.instr(values.v, factor_df.text) > 0, "inner").select("path").distinct().collect()
-        ):
-            hit_paths.add(row["path"])
-    return hit_paths
+        joined = values.join(factor_df, F.instr(values.v, factor_df.text) > 0, "inner")
+        for row in joined.select("v", "path").distinct().collect():
+            hits.setdefault(row["v"], set()).add(row["path"])
+    return {value: (paths - {"$"}) or paths for value, paths in hits.items()}
 
 
 def _branch_length_pairs(
@@ -1157,8 +1508,12 @@ def _sensitive_values_in_profile(
     real: Mapping[str, DataFrame],
     risks: Mapping[tuple[str, str, int], _PatternRisk],
     config: MetricsConfig,
-) -> dict[str, float]:
+    structural: frozenset[str] = frozenset(),
+) -> tuple[dict[str, float], frozenset[str]]:
     """Checks every sensitive value (all rows) against the profile candidate set and small-language branches.
+
+    Returns the hits and the lowercased sensitive values found in the candidate set. A hit counts once per sensitive
+    column and JSON path, whatever the number of values behind it.
 
     Candidate-set exact and substring hits, plus pattern branches whose language at a matched value's length is
     smaller than max(k, `privacy.min_regex_language`), fail with `sensitive_value_in_profile` naming the sensitive
@@ -1166,8 +1521,9 @@ def _sensitive_values_in_profile(
     distinct `(branch, length)` under the shared regex work budget; exhaustion fails conservatively.
     """
     if not real:
-        return {}
-    candidates = _build_candidate_set(profile, risks, config)
+        return {}, frozenset()
+    candidates = _build_candidate_set(profile, risks, config, structural)
+    found: set[str] = set()
     detail: dict[str, float] = {}
     if candidates.budget_exceeded:
         detail["regex_budget_exceeded"] = detail.get("regex_budget_exceeded", 0.0) + 1.0
@@ -1197,7 +1553,9 @@ def _sensitive_values_in_profile(
                     F.length("raw").alias("n"),
                 )
             )
-            for json_path in sorted(_candidate_substring_hits(values, session, exacts, texts, factors, min_len)):
+            hits = _candidate_substring_hits(values, session, exacts, texts, factors, min_len)
+            found.update(hits)
+            for json_path in sorted(set().union(*hits.values())):
                 _record_profile_hit(detail, f"sensitive_value_in_profile:{column}:{json_path}")
             pairs = _branch_length_pairs(values, risks, limits.max_regex_length)
             _language_size_hits(
@@ -1207,7 +1565,7 @@ def _sensitive_values_in_profile(
                 max_dfa_states=limits.max_dfa_states,
                 detail=detail,
             )
-    return detail
+    return detail, frozenset(found)
 
 
 def _language_vs_value(
@@ -1482,8 +1840,14 @@ def _pattern_literals(
 
 
 def _literal_columns(df: DataFrame, columns: Sequence[ColumnProfile]) -> Iterator[tuple[str, DataFrame, ColumnProfile]]:
+    """Yields the literal-bearing columns of the profile that exist in `df`.
+
+    A profile column the real table lacks has no real rows to audit; its name fails the closed-string check and its
+    strings stay in the raw scans.
+    """
     for column in columns:
-        yield from _walk(df, column, identifier(column.name), column.name)
+        if column.name in df.columns:
+            yield from _walk(df, column, identifier(column.name), column.name)
 
 
 def _walk(

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from profiler_bench.evaluate.evaluate import evaluate_experiment
 from profiler_bench.runner.data_volume import DataVolumeConfig, calibrate_targets, run_data_volume_experiment
-from profiler_bench.runner.experiment import ExperimentConfig, run_experiment
+from profiler_bench.runner.experiment import SUITES, ExperimentConfig, run_experiment
 from profiler_bench.runner.policy import DEFAULT_POLICY
 
 
@@ -25,7 +25,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--stage",
         choices=("official", "screen"),
         default="official",
-        help="official (default) or screen (tier-r screening; accuracy only).",
+        help="official (default) or screen (tier-r screening; accuracy only; synthetic only).",
+    )
+    run.add_argument(
+        "--suite",
+        choices=SUITES,
+        default="synthetic",
+        help="Datasets to score: the synthetic catalog (default), the real holdout datasets, or all.",
     )
     run.add_argument(
         "--mode",
@@ -98,9 +104,13 @@ def _add_compare_args(parser: argparse.ArgumentParser) -> None:
 
 def _run(args: argparse.Namespace) -> int:
     proposal = _load_proposal(args.proposal)
-    if getattr(args, "mode", "default") == "data-volume":
-        if getattr(args, "stage", "official") == "screen":
+    stage = getattr(args, "stage", "official")
+    suite = getattr(args, "suite", "synthetic")
+    if args.mode == "data-volume":
+        if stage == "screen":
             raise SystemExit("screening stage does not support --mode data-volume")
+        if suite != "synthetic":
+            raise SystemExit("--suite applies only to the default mode")
         path = run_data_volume_experiment(
             DataVolumeConfig(
                 experiment_id=args.experiment_id,
@@ -119,6 +129,8 @@ def _run(args: argparse.Namespace) -> int:
             )
         )
     else:
+        if stage == "screen" and suite != "synthetic":
+            raise SystemExit("screening stage is synthetic-only")
         path = run_experiment(
             ExperimentConfig(
                 experiment_id=args.experiment_id,
@@ -133,7 +145,8 @@ def _run(args: argparse.Namespace) -> int:
                 speed_tiers=args.speed_tiers,
                 command_line=sys.argv,
                 baseline_cache=not args.no_baseline_cache,
-                stage=getattr(args, "stage", "official"),
+                stage=stage,
+                suite=suite,
             )
         )
     verdict = json.loads((path / "verdict.json").read_text())
@@ -143,6 +156,7 @@ def _run(args: argparse.Namespace) -> int:
 
 def _screen(args: argparse.Namespace) -> int:
     args.stage = "screen"
+    args.suite = "synthetic"
     args.mode = "default"
     args.fractions = None
     args.subset_seeds = None

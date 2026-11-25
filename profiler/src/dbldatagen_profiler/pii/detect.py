@@ -14,7 +14,7 @@ from pyspark.sql import DataFrame, Row
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-from dbldatagen_profiler.model import PiiClass, Semantic, SemanticEvidence, Sensitivity
+from dbldatagen_profiler.model import EvidenceMethod, PiiClass, Semantic, SemanticEvidence, Sensitivity
 
 
 VALUE_MATCH_THRESHOLD = 0.80
@@ -136,16 +136,31 @@ def _classify(field: T.StructField, values: list[object]) -> Semantic | None:
     hint = next(((kind, sensitivity) for kind, sensitivity, pattern in _HINTS if pattern.search(name)), None)
     evidence: list[SemanticEvidence] = []
     if hint:
-        evidence.append(SemanticEvidence(method="column_name", match_rate=1.0))
-    validators: list[tuple[PiiClass, Sensitivity, str, Callable[[object], bool]]] = [
-        (PiiClass.EMAIL, Sensitivity.DIRECT_IDENTIFIER, "email", lambda value: bool(_EMAIL.fullmatch(str(value)))),
-        (PiiClass.PHONE, Sensitivity.DIRECT_IDENTIFIER, "phone", lambda value: bool(_PHONE.fullmatch(str(value)))),
-        (PiiClass.CREDIT_CARD, Sensitivity.DIRECT_IDENTIFIER, "luhn", _is_card),
-        (PiiClass.IBAN, Sensitivity.DIRECT_IDENTIFIER, "iban_mod97", _is_iban),
-        (PiiClass.NATIONAL_ID, Sensitivity.DIRECT_IDENTIFIER, "us_ssn", lambda value: bool(_SSN.fullmatch(str(value)))),
-        (PiiClass.IP_ADDRESS, Sensitivity.DIRECT_IDENTIFIER, "ip_address", _is_ip),
-        (PiiClass.ACCOUNT_ID, Sensitivity.DIRECT_IDENTIFIER, "uuid", _is_uuid),
-        (PiiClass.SECRET_TOKEN, Sensitivity.SECRET, "opaque_token_entropy", _is_opaque_token),
+        evidence.append(SemanticEvidence(method=EvidenceMethod.COLUMN_NAME, match_rate=1.0))
+    validators: list[tuple[PiiClass, Sensitivity, EvidenceMethod, Callable[[object], bool]]] = [
+        (
+            PiiClass.EMAIL,
+            Sensitivity.DIRECT_IDENTIFIER,
+            EvidenceMethod.EMAIL,
+            lambda value: bool(_EMAIL.fullmatch(str(value))),
+        ),
+        (
+            PiiClass.PHONE,
+            Sensitivity.DIRECT_IDENTIFIER,
+            EvidenceMethod.PHONE,
+            lambda value: bool(_PHONE.fullmatch(str(value))),
+        ),
+        (PiiClass.CREDIT_CARD, Sensitivity.DIRECT_IDENTIFIER, EvidenceMethod.LUHN, _is_card),
+        (PiiClass.IBAN, Sensitivity.DIRECT_IDENTIFIER, EvidenceMethod.IBAN_MOD97, _is_iban),
+        (
+            PiiClass.NATIONAL_ID,
+            Sensitivity.DIRECT_IDENTIFIER,
+            EvidenceMethod.US_SSN,
+            lambda value: bool(_SSN.fullmatch(str(value))),
+        ),
+        (PiiClass.IP_ADDRESS, Sensitivity.DIRECT_IDENTIFIER, EvidenceMethod.IP_ADDRESS, _is_ip),
+        (PiiClass.ACCOUNT_ID, Sensitivity.DIRECT_IDENTIFIER, EvidenceMethod.UUID, _is_uuid),
+        (PiiClass.SECRET_TOKEN, Sensitivity.SECRET, EvidenceMethod.OPAQUE_TOKEN_ENTROPY, _is_opaque_token),
     ]
     matches = [
         (kind, sensitivity, method, _rate(values, validator)) for kind, sensitivity, method, validator in validators
@@ -162,7 +177,7 @@ def _classify(field: T.StructField, values: list[object]) -> Semantic | None:
     if isinstance(field.dataType, T.DateType) and hint and hint[0] == PiiClass.DATE_OF_BIRTH:
         rate = _rate(values, _plausible_birth_date)
         if rate >= VALUE_MATCH_THRESHOLD:
-            evidence.append(SemanticEvidence(method="plausible_age", match_rate=rate))
+            evidence.append(SemanticEvidence(method=EvidenceMethod.PLAUSIBLE_AGE, match_rate=rate))
             return Semantic(
                 pii_class=PiiClass.DATE_OF_BIRTH,
                 sensitivity=Sensitivity.QUASI_IDENTIFIER,
@@ -171,12 +186,12 @@ def _classify(field: T.StructField, values: list[object]) -> Semantic | None:
             )
     if hint and hint[0] == PiiClass.ACCOUNT_ID and values:
         uniqueness = len({str(value) for value in values}) / len(values)
-        evidence.append(SemanticEvidence(method="sample_uniqueness", match_rate=uniqueness))
+        evidence.append(SemanticEvidence(method=EvidenceMethod.SAMPLE_UNIQUENESS, match_rate=uniqueness))
         if uniqueness >= ACCOUNT_UNIQUENESS_THRESHOLD:
             return Semantic(pii_class=hint[0], sensitivity=hint[1], confidence=0.85, evidence=evidence)
     span_rate = _rate(values, _contains_pii_span)
     if span_rate >= FREE_TEXT_MATCH_THRESHOLD:
-        evidence.append(SemanticEvidence(method="pii_span", match_rate=span_rate))
+        evidence.append(SemanticEvidence(method=EvidenceMethod.PII_SPAN, match_rate=span_rate))
         return Semantic(
             pii_class=PiiClass.FREE_TEXT_PII,
             sensitivity=Sensitivity.FREE_TEXT,

@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from profiler_bench.catalog import REAL_DATASETS
-from profiler_bench.catalog.real import REAL_SUBSET_CAP, REAL_SUBSET_METHOD
+from profiler_bench.catalog.real import REAL_SUBSET_CAP, REAL_SUBSET_METHOD, SPLIT
 from profiler_bench.evaluate.evaluate import evaluate_experiment
 from profiler_bench.evaluate.gates import evaluate_gates, expected_sample_keys
 from profiler_bench.rsi import __main__ as rsi_cli
@@ -260,6 +260,7 @@ def test_dataset_identity_uses_catalog_hashes_and_real_pins(tmp_path: Path) -> N
     real = next(iter(REAL_DATASETS.values()))
     assert baseline_cache.dataset_identity(real.name, "s", 0, None) == {
         "real_pinned_hashes": dict(real.hashes),
+        "real_split": SPLIT,
         "real_subset_cap": REAL_SUBSET_CAP,
         "real_subset_method": REAL_SUBSET_METHOD,
     }
@@ -272,6 +273,7 @@ def test_dataset_identity_cache_key_includes_real_subset_cap(tmp_path: Path, mon
     after = baseline_cache.dataset_identity(real.name, "s", 0, None)
     assert before["real_subset_cap"] != after["real_subset_cap"]
     assert before["real_pinned_hashes"] == after["real_pinned_hashes"]
+    assert before["real_split"] == after["real_split"]
 
 
 def test_cache_misses_on_dataset_and_tier(tmp_path: Path) -> None:

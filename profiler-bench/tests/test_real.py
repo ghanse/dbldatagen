@@ -127,7 +127,9 @@ def test_subset_is_deterministic_capped_and_closed() -> None:
     first = subset(FIXTURE, _tables(), 200)
     assert all(_rows(first[n]) == _rows(t) for n, t in subset(FIXTURE, _tables(order_seed=3), 200).items())
     assert {n: t.num_rows for n, t in first.items()} != {n: t.num_rows for n, t in _tables().items()}
-    assert all(t.num_rows <= 200 for t in first.values())
+    # Only root entity tables are hash-capped; descendants follow via foreign-key closure.
+    assert first["parent"].num_rows <= 200
+    assert first["parent"].num_rows < _tables()["parent"].num_rows
     parents = set(first["parent"].column("id").to_pylist())
     pids = first["child"].column("pid").to_pylist()
     assert None in pids

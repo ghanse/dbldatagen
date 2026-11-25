@@ -48,15 +48,17 @@ def run_fidelity_samples(
     kill_grace_s: float = DEFAULT_WORKER_KILL_GRACE_S,
     parallelism: int = 1,
     cached_baseline: Mapping[str, Sequence[dict[str, Any]]] | None = None,
+    real_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Scores one representative profile per build/dataset in an isolated worker.
 
     Each (role, dataset) cell runs in a fresh subprocess with one SparkSession reused
-    across all K paired seeds for that cell. Cross-cell isolation, timeouts, and
-    per-seed failure records are unchanged. A crash in one cell cannot affect any
-    other cell. Up to `parallelism` cells run at once; each cell writes only its own
-    sample files and records keep the serial order, so output does not depend on
-    `parallelism`. Datasets in `cached_baseline` reuse those baseline records.
+    across all K paired seeds for that cell (full runtime conf restored between seeds).
+    Cross-cell isolation, timeouts, and per-seed failure records are unchanged. A crash
+    in one cell cannot affect any other cell. Up to `parallelism` cells run at once; each
+    cell writes only its own sample files and records keep the serial order, so output
+    does not depend on `parallelism`. Datasets in `cached_baseline` reuse those baseline
+    records. Real datasets read their exports from the catalog cache `real_root`.
     """
     tier = str(policy.get("fidelity_tier", "s"))
     k = int(policy.get("fidelity_seeds", 5))
@@ -111,6 +113,7 @@ def run_fidelity_samples(
                         cache_dir=cache_dir,
                         harness_hash=harness_hash,
                         metrics_config_hash=metrics_config_hash,
+                        real_root=real_root,
                         python_exe=exe,
                         cell_timeout_s=cell_timeout_s,
                         worker_prefix=worker_prefix,
@@ -142,6 +145,9 @@ def score_one_seed(
         )
         if scores.ceiling is None or scores.relative_reconstruction is None:
             raise RuntimeError("scorer did not produce ceiling-relative reconstruction")
+        applicability = {} if scores.structure is not None else {"structure_status": "not_applicable"}
+        if scores.privacy_status is not None:
+            applicability["privacy_status"] = scores.privacy_status
         return {
             "kind": "fidelity",
             "role": role,
@@ -151,6 +157,7 @@ def score_one_seed(
             "ok": True,
             "reconstruction": scores.reconstruction,
             "structure": scores.structure,
+            **applicability,
             "privacy_passed": scores.privacy_passed,
             "privacy_unmeasured": scores.privacy_unmeasured,
             "ceiling": scores.ceiling,
@@ -211,6 +218,7 @@ def _run_cell(
     cache_dir: Path | None,
     harness_hash: str,
     metrics_config_hash: str,
+    real_root: Path | None,
     python_exe: str,
     cell_timeout_s: float,
     worker_prefix: Sequence[str] | None,
@@ -225,7 +233,9 @@ def _run_cell(
         seeds_path = tmp_path / "seeds.json"
         out_path = tmp_path / "cell.json"
         profile_path.write_text(json.dumps(profile, sort_keys=True, default=str))
-        scorer_path.write_text(json.dumps(_scorer_spec(scorer, cache_dir, harness_hash, metrics_config_hash)))
+        scorer_path.write_text(
+            json.dumps(_scorer_spec(scorer, cache_dir, harness_hash, metrics_config_hash, real_root))
+        )
         spark_path.write_text(json.dumps(fidelity_spark, sort_keys=True))
         seeds_path.write_text(json.dumps(list(seeds)))
         prefix = (
@@ -362,6 +372,7 @@ def _scorer_spec(
     cache_dir: Path | None,
     harness_hash: str,
     metrics_config_hash: str,
+    real_root: Path | None = None,
 ) -> dict[str, Any]:
     if isinstance(scorer, FakeScorer):
         return scorer.to_spec()
@@ -371,6 +382,7 @@ def _scorer_spec(
         cache_dir=cache_dir,
         harness_hash=harness_hash,
         metrics_config_hash=metrics_config_hash,
+        real_root=real_root,
     )
 
 
