@@ -171,10 +171,27 @@ def _profile_table(
     if pearson_expressions:
         values.update(_collect_aggregate(df, pearson_expressions))
     row_count = int(values["__row_count"])
-    columns = [
-        _column_from_aggregate(field, values, index, row_count, privacy, nested=False, df=df)
+    nested = {
+        index: group
         for index, field in enumerate(df.schema.fields)
-    ]
+        if (group := _nested_group(df.select(df[field.name].alias(_VALUE)), field)) is not None
+    }
+    nested_profiles = _profile_nested_groups(list(nested.values()), privacy)
+    nested_children = dict(zip(nested, nested_profiles, strict=True))
+    columns = []
+    for index, field in enumerate(df.schema.fields):
+        column = _column_from_aggregate(
+            field,
+            values,
+            index,
+            row_count,
+            privacy,
+            nested=False,
+            df=df,
+            recurse=False,
+            children=nested_children.get(index),
+        )
+        columns.append(column)
     protected = [
         _protect_column(column, table=name, path=column.name, semantics=semantics, pii_policy=pii_policy)
         for column in columns
@@ -425,6 +442,8 @@ def _column_from_aggregate(
     *,
     nested: bool,
     df: DataFrame,
+    recurse: bool = True,
+    children: list[ColumnProfile] | None = None,
 ) -> ColumnProfile:
     prefix = f"c{index}"
     non_null = int(values[f"{prefix}_non_null"])
@@ -451,13 +470,22 @@ def _column_from_aggregate(
         attributes["boolean"] = BooleanStats(true_fraction=values[f"{prefix}_true_fraction"])
     elif isinstance(field.dataType, (T.ArrayType, T.MapType)):
         attributes["collection_length"] = _length_stats(values, prefix, include_stddev=True)
-    if isinstance(field.dataType, (T.StructType, T.ArrayType, T.MapType)):
+    if children is not None:
+        attributes["children"] = children
+    elif recurse and isinstance(field.dataType, (T.StructType, T.ArrayType, T.MapType)):
         nested_df = df if nested else df.select(df[field.name].alias(_VALUE))
         attributes["children"] = _profile_children(nested_df, field, privacy)
     return ColumnProfile(**attributes)
 
 
 def _profile_children(df: DataFrame, field: T.StructField, privacy: PrivacyPolicy) -> list[ColumnProfile]:
+    group = _nested_group(df, field)
+    if group is None:
+        raise TypeError(f"unsupported nested Spark data type: {field.dataType}")
+    return _profile_nested_groups([group], privacy)[0]
+
+
+def _nested_group(df: DataFrame, field: T.StructField) -> tuple[DataFrame, list[tuple[T.StructField, Column]]] | None:
     data_type = field.dataType
     value = df[_VALUE]
     if isinstance(data_type, T.StructType):
@@ -465,24 +493,19 @@ def _profile_children(df: DataFrame, field: T.StructField, privacy: PrivacyPolic
             (T.StructField(child.name, child.dataType, child.nullable), value.getField(child.name))
             for child in data_type.fields
         ]
-        return _profile_nested_fields(df, fields, privacy)
+        return df, fields
     if isinstance(data_type, T.ArrayType):
         child_df = df.select(F.explode(value).alias(_VALUE))
-        return _profile_nested_fields(
-            child_df,
-            [(T.StructField("element", data_type.elementType, data_type.containsNull), child_df[_VALUE])],
-            privacy,
-        )
+        return child_df, [(T.StructField("element", data_type.elementType, data_type.containsNull), child_df[_VALUE])]
     if not isinstance(data_type, T.MapType):
-        raise TypeError(f"unsupported nested Spark data type: {data_type}")
+        return None
     exploded = df.select(F.explode(value).alias("key", "value"))
-    return _profile_nested_fields(
+    return (
         exploded,
         [
             (T.StructField("key", data_type.keyType, False), F.col("key")),
             (T.StructField("value", data_type.valueType, data_type.valueContainsNull), F.col("value")),
         ],
-        privacy,
     )
 
 
@@ -511,6 +534,106 @@ def _profile_nested_fields(
         )
         for index, (field, column) in enumerate(children)
     ]
+
+
+def _profile_nested_groups(
+    groups: list[tuple[DataFrame, list[tuple[T.StructField, Column]]]], privacy: PrivacyPolicy
+) -> list[list[ColumnProfile]]:
+    """Profiles every nested container at a depth with one Spark action."""
+    if not groups:
+        return []
+    aggregates = []
+    for group_index, (df, children) in enumerate(groups):
+        expressions = [F.count(F.lit(1)).alias("__row_count")]
+        for index, (field, column) in enumerate(children):
+            expressions.extend(_aggregate_expressions(column, field.dataType, index))
+        aggregate = df.agg(*expressions)
+        aggregates.append(
+            aggregate.select(*(F.col(name).alias(f"g{group_index}_{name}") for name in aggregate.columns)).withColumn(
+                "__group", F.lit(group_index)
+            )
+        )
+    rows = aggregates[0]
+    for aggregate in aggregates[1:]:
+        rows = rows.unionByName(aggregate, allowMissingColumns=True)
+    collected = {int(row["__group"]): row.asDict() for row in rows.collect()}
+    values_by_group = []
+    for group_index in range(len(groups)):
+        prefix = f"g{group_index}_"
+        values = {
+            key.removeprefix(prefix): value for key, value in collected[group_index].items() if key.startswith(prefix)
+        }
+        values_by_group.append(values)
+    _with_nested_value_counts(groups, values_by_group)
+
+    descendant_groups = []
+    descendant_slots = []
+    for group_index, (df, children) in enumerate(groups):
+        for child_index, (field, column) in enumerate(children):
+            group = _nested_group(df.select(column.alias(_VALUE)), field)
+            if group is not None:
+                descendant_slots.append((group_index, child_index))
+                descendant_groups.append(group)
+    descendants = _profile_nested_groups(descendant_groups, privacy)
+    descendant_map = dict(zip(descendant_slots, descendants, strict=True))
+
+    result = []
+    for group_index, (df, children) in enumerate(groups):
+        values = values_by_group[group_index]
+        row_count = int(values["__row_count"])
+        profiles = []
+        for child_index, (field, column) in enumerate(children):
+            profile = _column_from_aggregate(
+                field,
+                values,
+                child_index,
+                row_count,
+                privacy,
+                nested=True,
+                df=df.select(column.alias(_VALUE)),
+                recurse=False,
+                children=descendant_map.get((group_index, child_index)),
+            )
+            profiles.append(profile)
+        result.append(profiles)
+    return result
+
+
+def _with_nested_value_counts(
+    groups: list[tuple[DataFrame, list[tuple[T.StructField, Column]]]], values_by_group: list[dict[str, Any]]
+) -> None:
+    """Adds all nested integer frequency counts at a depth with one Spark action."""
+    counts = []
+    for group_index, ((df, children), values) in enumerate(zip(groups, values_by_group, strict=True)):
+        eligible = [
+            (index, column)
+            for index, (field, column) in enumerate(children)
+            if isinstance(field.dataType, tuple(_INTEGER_BITS))
+            and 2 <= values[f"c{index}_distinct"] <= _HISTOGRAM_MAX_DISTINCT
+        ]
+        if not eligible:
+            continue
+        entries = F.explode(
+            F.array(
+                *(
+                    F.struct(F.lit(group_index).alias("g"), F.lit(index).alias("c"), column.cast("long").alias("v"))
+                    for index, column in eligible
+                )
+            )
+        )
+        counts.append(
+            df.select(entries.alias("e")).select("e.*").where(F.col("v").isNotNull()).groupBy("g", "c", "v").count()
+        )
+    if not counts:
+        return
+    rows = counts[0]
+    for frame in counts[1:]:
+        rows = rows.unionByName(frame)
+    grouped: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for row in sorted(rows.collect(), key=lambda row: (row["g"], row["c"], row["v"])):
+        grouped.setdefault((row["g"], row["c"]), []).append((row["v"], row["count"]))
+    for (group_index, child_index), pairs in grouped.items():
+        values_by_group[group_index][f"c{child_index}_value_counts"] = pairs
 
 
 def _collect_aggregate(df: DataFrame, expressions: list[Column]) -> dict[str, Any]:

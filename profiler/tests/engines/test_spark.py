@@ -12,7 +12,7 @@ from pyspark.sql import types as T
 from dbldatagen_profiler.engines.spark import engine as spark_engine
 from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
 from dbldatagen_profiler.engines.spark.engine import _histogram, _logical_type, _numeric_stats, _pearson_pairs
-from dbldatagen_profiler.model import LogicalType, PrivacyPolicy, ValueTreatment, profile_json_schema
+from dbldatagen_profiler.model import ColumnProfile, LogicalType, PrivacyPolicy, ValueTreatment, profile_json_schema
 
 
 pytestmark = [pytest.mark.spark, pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")]
@@ -562,6 +562,59 @@ def test_nested_columns_have_value_counts(spark: SparkSession) -> None:
     assert columns[1].children[0].children[0].value_count == 2
     assert columns[2].children[0].value_count == 1
     assert columns[2].children[1].value_count == 1
+
+
+def _batched_nested_fixture(spark: SparkSession) -> DataFrame:
+    schema = (
+        "record struct<x:int, inner:struct<label:string>>, "
+        "items array<struct<code:int, note:string>>, lookup map<string,int>"
+    )
+    return spark.createDataFrame(
+        [
+            (
+                Row(x=index % 3, inner=Row(label=f"label-{index % 2}")),
+                [Row(code=index % 4, note=f"note-{index % 3}")],
+                {"k": index % 5},
+            )
+            for index in range(60)
+        ],
+        schema,
+    )
+
+
+def _sequential_nested_groups(monkeypatch: pytest.MonkeyPatch) -> None:
+    batched = spark_engine._profile_nested_groups
+
+    def sequential(
+        groups: list[tuple[DataFrame, list[tuple[T.StructField, Column]]]], privacy: PrivacyPolicy
+    ) -> list[list[ColumnProfile]]:
+        return [batched([group], privacy)[0] for group in groups]
+
+    monkeypatch.setattr(spark_engine, "_profile_nested_groups", sequential)
+
+
+def test_batched_nested_aggregates_are_byte_identical(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    frame = _batched_nested_fixture(spark)
+    actual = profile_dataframe("nested", frame, detect_pii=False).model_dump(mode="json", exclude={"created_at"})
+    _sequential_nested_groups(monkeypatch)
+    expected = profile_dataframe("nested", frame, detect_pii=False).model_dump(mode="json", exclude={"created_at"})
+
+    assert actual == expected
+
+
+def test_batched_nested_aggregates_reduce_spark_jobs(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    frame = _batched_nested_fixture(spark)
+    tracker = spark.sparkContext.statusTracker()
+    spark.sparkContext.setJobGroup("nested-batched", "nested-batched")
+    profile_dataframe("nested", frame, detect_pii=False)
+    batched_jobs = len(tracker.getJobIdsForGroup("nested-batched"))
+
+    _sequential_nested_groups(monkeypatch)
+    spark.sparkContext.setJobGroup("nested-sequential", "nested-sequential")
+    profile_dataframe("nested", frame, detect_pii=False)
+    sequential_jobs = len(tracker.getJobIdsForGroup("nested-sequential"))
+
+    assert batched_jobs < sequential_jobs
 
 
 def test_profiles_multiple_tables(spark: SparkSession) -> None:
