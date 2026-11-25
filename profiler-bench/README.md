@@ -330,7 +330,7 @@ The reference sampler is designed for benchmark tiers up to `s` (about 100,000 r
 harness. Each build is a git worktree plus commit; the **speed** worker imports that worktree's `profiler/src` via
 `PYTHONPATH` in a **fresh subprocess**. Speed samples time `profile_tables` (driver wall, process CPU, peak RSS)
 after an untimed warmup, rotate baseline/candidate order across cases, and record profile hashes under the policy's
-timed Spark config (unchanged by fidelity settings). The default policy (version 2.0.0) times speed on `local[8]` with
+timed Spark config (unchanged by fidelity settings). The default policy (version 2.1.0) times speed on `local[8]` with
 an 8 GiB driver (other confs unchanged; 1.x used `local[2]` and 2 GiB). Speed results under 1.x are not comparable
 with 2.0.0; old experiments re-evaluate against the policy recorded in their own `run.json`. The speed baselines in
 `profiler/rsi/BASELINE.md` were measured under 1.x and must be re-measured (P1.8e). The nested tier-m OOM at 2 GiB is
@@ -361,11 +361,13 @@ fcntl lock with atomic writes. Baseline-build samples are also cached across exp
 `profiler/rsi/experiments/.cache/baseline/` (git-ignored). Fidelity entries (the baseline profile and its K per-seed
 scores) are reused for any proposal type. Speed entries (all N baseline samples of one dataset and tier) are reused
 only for accuracy proposals; speed and data-volume proposals always time both builds fresh in the same run, with
-rotated order. Keys cover the baseline `profiler/src` hash, harness hash, policy hash, metrics config hash, dataset,
+rotated order. Keys cover the baseline `profiler/src` hash, harness hash, sampling-policy hash, metrics config hash, dataset,
 tier, dataset seed, Spark config hash, the catalog generator fingerprint and instance content hash (or the pinned
 hashes of a real dataset), and the Python, PySpark, NumPy, pandas, scikit-learn, and pyarrow versions. Speed keys add
 the Java version, sample count, and machine; fidelity keys add the sampler seeds and scorer. Any mismatch, corrupt
-file, or failed sample recomputes. Writes use an fcntl lock with atomic replace. `run.json` records `baseline_cached`,
+file, or failed sample recomputes. Gate thresholds are excluded from the sampling-policy hash, so cached samples can be
+reevaluated under new gates; sample counts, seeds, tiers, dataset seed, and Spark configuration remain key inputs. Writes
+use an fcntl lock with atomic replace. `run.json` records `baseline_cached`,
 `baseline_cache_parts` (whether speed caching was allowed and whether speed or fidelity came from the cache),
 `baseline_cache_sources`, and `baseline_cache_hits`. Pass `--no-baseline-cache` to measure the baseline fresh. The
 candidate role never reads the cache, including in control runs. `--control` runs the baseline against itself. Unmeasured privacy checks keep the
@@ -376,6 +378,11 @@ rejects them. Tests can explicitly inject a `FakeScorer`; command-line runs neve
 weighted mean across datasets of each dataset's mean paired-seed difference; its CI uses a **stratified bootstrap**
 that resamples seeds within each dataset (datasets are fixed strata). A hierarchical bootstrap that also resamples
 datasets is a documented alternative and is not used. Per-dataset regression gates keep a within-dataset bootstrap.
+An accuracy proposal may instead declare `targets.datasets`. It is accepted when either the mean gate passes or every
+declared target improves relative reconstruction by at least `accuracy.min_target_improvement` with a paired per-dataset
+CI lower bound above zero. The existing per-dataset regression, structure, privacy, completeness, and control gates apply
+to both paths; without structured targets, only the mean path is available. The verdict records the accepting
+`accuracy_path` and the targeted gate records each target CI.
 Each gate reports a two-sided 95% percentile interval with **no family-wise guarantee** across gates. Privacy is a
 hard guard (not policy-disableable). Completeness is checked against the expected matrix from `run.json`. Control runs
 and identical `profiler_src_hash` builds can never be `accepted`. Results land in `profiler/rsi/experiments/<id>/` as
