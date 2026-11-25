@@ -320,9 +320,19 @@ def test_sensitive_value_in_non_regex_profile_field_fails_raw_scan(
     sku["string"] = {**(sku.get("string") or {}), "top_values": [{"value": email, "frequency": 0.1}]}
     leaky = Profile.model_validate(data)
     score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
+    _assert_counted_once_at_top_values(score)
+
+
+def _assert_counted_once_at_top_values(score: PrivacyScore) -> None:
+    """The full scan locates the planted email once, so the sampled text scan does not count it again."""
     detail = {c.name: c for c in score.checks}
-    assert detail["profile.sensitive_value_leaks"].detail["sensitive_value_in_profile_text"] >= 1.0
-    assert detail["profile.k_threshold"].detail["sensitive_value_in_profile_text"] >= 1.0
+    for name in ("profile.sensitive_value_leaks", "profile.k_threshold"):
+        hits = detail[name].detail
+        located = [k for k in hits if k.startswith("sensitive_value_in_profile:customers.email:")]
+        assert located and all("top_values" in k for k in located), located
+        assert hits["sensitive_value_in_profile"] == len(located)
+        assert "sensitive_value_in_profile_text" not in hits
+        assert detail[name].value >= 1.0
     assert not score.passed
 
 
@@ -354,10 +364,7 @@ def test_percent_encoded_sensitive_value_fails_raw_scan(
     sku["string"] = {**(sku.get("string") or {}), "top_values": [{"value": encoded, "frequency": 0.1}]}
     leaky = Profile.model_validate(data)
     score = score_privacy(real, _independent(spark), leaky, materialize("retail", "xs", 0).manifest)
-    detail = {c.name: c for c in score.checks}
-    assert detail["profile.sensitive_value_leaks"].detail["sensitive_value_in_profile_text"] >= 1.0
-    assert detail["profile.k_threshold"].detail["sensitive_value_in_profile_text"] >= 1.0
-    assert not score.passed
+    _assert_counted_once_at_top_values(score)
 
 
 def test_source_type_not_matching_schema_fails_closed_strings(
