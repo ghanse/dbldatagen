@@ -195,7 +195,11 @@ def _profile_table(
 
 
 def _collect_column_aggregates(df: DataFrame, columns_per_chunk: int = _AGGREGATE_COLUMNS_PER_CHUNK) -> dict[str, Any]:
-    """Collects per-column aggregates in bounded plans and schema order."""
+    """Collects bounded aggregate plans in schema order, rescanning ``df`` for each chunk.
+
+    The input is deliberately not cached: materializing every table adds memory and
+    lifecycle overhead, while measured scans of the catalog's columnar inputs were faster.
+    """
     if columns_per_chunk < 1:
         raise ValueError("columns_per_chunk must be positive")
 
