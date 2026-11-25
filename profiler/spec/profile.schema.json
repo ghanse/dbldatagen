@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "dbldatagen profile spec 0.2.0. Generated from dbldatagen_profiler.model; do not edit.",
+  "$comment": "dbldatagen profile spec 0.3.0. Generated from dbldatagen_profiler.model; do not edit.",
   "$defs": {
     "BooleanStats": {
       "description": "Statistics for a boolean column.\n\nAttributes:\n    true_fraction: Fraction of non-null values that are true.",

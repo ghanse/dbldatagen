@@ -15,8 +15,26 @@ def with_extras(profile: dict[str, Any], version: str) -> dict[str, Any]:
     return profile
 
 
-def test_spec_version_is_0_2_0() -> None:
-    assert SPEC_VERSION == "0.2.0"
+def test_spec_version_is_0_3_0() -> None:
+    assert SPEC_VERSION == "0.3.0"
+
+
+def test_0_2_profile_with_semantic_evidence_still_loads(minimal_profile: dict[str, Any]) -> None:
+    minimal_profile["spec_version"] = "0.2.0"
+    minimal_profile["tables"][0]["columns"][0]["semantic"] = {
+        "pii_class": "account_id",
+        "sensitivity": "direct_identifier",
+        "confidence": 0.85,
+        "evidence": [
+            {"method": "column_name", "match_rate": 1.0},
+            {"method": "sample_uniqueness", "match_rate": 1.0},
+        ],
+    }
+    profile = load_profile(minimal_profile, strict=True)
+    assert profile.spec_version == "0.2.0"
+    assert profile.model_dump(mode="json")["tables"][0]["columns"][0]["semantic"] == (
+        minimal_profile["tables"][0]["columns"][0]["semantic"]
+    )
 
 
 def test_0_1_profile_still_loads(minimal_profile: dict[str, object]) -> None:

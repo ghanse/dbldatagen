@@ -26,7 +26,7 @@ from typing import Annotated, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 
 
-SPEC_VERSION = "0.2.0"
+SPEC_VERSION = "0.3.0"
 SUPPORTED_MAJOR_VERSION = int(SPEC_VERSION.split(".", maxsplit=1)[0])
 STRICT_CONTEXT_KEY = "strict"
 DEFAULT_MIN_VALUE_COUNT = 10

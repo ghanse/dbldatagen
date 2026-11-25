@@ -320,6 +320,15 @@ release):
 - **major**: any other change, including new enum values or constraint kinds. A reader rejects a profile whose major
   version differs from its own.
 
+Before 1.0 the major version stays at 0, so a minor bump may also narrow the spec, for example by turning a string
+field into an enum. Profiles the profiler wrote under an earlier minor version still load.
+
+Spec changes:
+
+- **0.3.0**: `semantic.evidence[].method` is the `EvidenceMethod` enum instead of a free string. Every method earlier
+  profilers wrote is in the enum, so their profiles still load; an unknown method is rejected.
+- **0.2.0**: adds `semantic` and table quasi-identifier sets.
+
 Producers should validate their output strictly, which rejects any field the spec does not define:
 
 ```bash
