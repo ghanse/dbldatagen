@@ -149,8 +149,10 @@ A profile contains:
   dates to UTC epoch days; timestamps, timestamp-without-time-zone, and times to UTC epoch seconds. The profile
   contains only the aggregate coefficient and column names, never source values or row samples. Dependencies are
   batch-only.
-- `semantic`: optional PII class, sensitivity, confidence, and value-free detection evidence. Tables may also record
-  sampled pairs and triples that behave as quasi-identifiers.
+- `semantic`: optional PII class, sensitivity, confidence, and value-free detection evidence. Each evidence entry is a
+  `method` from a fixed set (`EvidenceMethod`, e.g. `column_name`, `email`, `luhn`, `sample_uniqueness`) and its sampled
+  `match_rate`; unknown methods are rejected. Tables may also record sampled pairs and triples that behave as
+  quasi-identifiers.
 
 Only the basic schema, row count, and null information are required; engines can add the other blocks over time.
 

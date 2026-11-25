@@ -446,10 +446,29 @@ class Sensitivity(str, Enum):
     FREE_TEXT = "free_text"
 
 
+class EvidenceMethod(str, Enum):
+    """Detection method behind a semantic classification."""
+
+    COLUMN_NAME = "column_name"
+    EMAIL = "email"
+    PHONE = "phone"
+    LUHN = "luhn"
+    IBAN_MOD97 = "iban_mod97"
+    US_SSN = "us_ssn"
+    IP_ADDRESS = "ip_address"
+    UUID = "uuid"
+    OPAQUE_TOKEN_ENTROPY = "opaque_token_entropy"
+    PLAUSIBLE_AGE = "plausible_age"
+    SAMPLE_UNIQUENESS = "sample_uniqueness"
+    PII_SPAN = "pii_span"
+    POLICY_COLUMN = "policy_column"
+    POLICY_COLUMN_GENERIC = "policy_column_generic"
+
+
 class SemanticEvidence(_SpecModel):
     """Detection method and its sampled match rate, without source values."""
 
-    method: str = Field(min_length=1)
+    method: EvidenceMethod
     match_rate: Fraction
 
     @model_validator(mode="before")
