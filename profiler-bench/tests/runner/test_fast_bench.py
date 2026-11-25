@@ -27,9 +27,9 @@ from profiler_bench.runner.spark_conf import fidelity_spark_config
 DATASETS = ["numeric", "retail"]
 
 
-def test_default_policy_is_2_1_0_with_fast_defaults() -> None:
+def test_default_policy_is_2_2_0_with_screen_defaults() -> None:
     policy = load_policy(DEFAULT_POLICY)
-    assert policy["version"] == "2.1.0"
+    assert policy["version"] == "2.2.0"
     assert policy["accuracy"]["min_target_improvement"] == 0.01
     assert policy["spark"]["master"] == "local[8]"
     assert policy["spark"]["configs"] == {
@@ -38,18 +38,21 @@ def test_default_policy_is_2_1_0_with_fast_defaults() -> None:
         "spark.ui.enabled": "false",
         "spark.driver.memory": "8g",
     }
-    assert policy["speed_samples"] == {"xs": 2, "s": 15, "m": 15}
-    assert policy["speed_samples_accuracy"] == {"xs": 2, "s": 2, "m": 0}
+    assert policy["speed_samples"] == {"xs": 2, "r": 2, "s": 15, "m": 15}
+    assert policy["speed_samples_accuracy"] == {"xs": 2, "r": 2, "s": 2, "m": 0}
     assert policy["fidelity_parallelism"] == 3
+    assert policy["screen"]["tier"] == "r"
+    assert policy["screen"]["fidelity_seeds"] == 3
+    assert policy["screen"]["margin"] == 0.5
 
 
 def test_effective_speed_samples_by_proposal_type() -> None:
     policy = load_policy(DEFAULT_POLICY)
-    assert effective_speed_samples(policy, "accuracy") == {"xs": 2, "s": 2, "m": 0}
-    assert effective_speed_samples(policy, "speed") == {"xs": 2, "s": 15, "m": 15}
-    assert effective_speed_samples(policy, "data_volume") == {"xs": 2, "s": 15, "m": 15}
+    assert effective_speed_samples(policy, "accuracy") == {"xs": 2, "r": 2, "s": 2, "m": 0}
+    assert effective_speed_samples(policy, "speed") == {"xs": 2, "r": 2, "s": 15, "m": 15}
+    assert effective_speed_samples(policy, "data_volume") == {"xs": 2, "r": 2, "s": 15, "m": 15}
     del policy["speed_samples_accuracy"]
-    assert effective_speed_samples(policy, "accuracy") == {"xs": 2, "s": 15, "m": 15}
+    assert effective_speed_samples(policy, "accuracy") == {"xs": 2, "r": 2, "s": 15, "m": 15}
 
 
 def _speed(role: str, dataset: str, tier: str, index: int) -> dict[str, Any]:

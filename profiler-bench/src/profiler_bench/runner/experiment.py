@@ -22,7 +22,7 @@ from profiler_bench.runner.identity import (
     machine_info,
 )
 from profiler_bench.runner.measure import check_profile_determinism, run_speed_samples
-from profiler_bench.runner.policy import effective_speed_samples, load_policy
+from profiler_bench.runner.policy import apply_screen_overrides, effective_speed_samples, load_policy
 from profiler_bench.runner.scorer import FakeScorer, Scorer, try_real_scorer
 from profiler_bench.runner.spark_conf import (
     DEFAULT_FIDELITY_DRIVER_MEMORY,
@@ -51,6 +51,7 @@ class ExperimentConfig:
         fidelity_cell_timeout_s: Wall-clock timeout for one (build, dataset) fidelity worker.
         baseline_cache: Reuse and store baseline-build samples across experiments.
         baseline_cache_dir: Baseline cache location; defaults to `profiler/rsi/experiments/.cache/baseline`.
+        stage: `official` (default) or `screen` (tier-r screening; accuracy proposals only).
     """
 
     experiment_id: str
@@ -69,6 +70,7 @@ class ExperimentConfig:
     fidelity_cell_timeout_s: float = DEFAULT_FIDELITY_CELL_TIMEOUT_S
     baseline_cache: bool = True
     baseline_cache_dir: Path | None = None
+    stage: str = "official"
 
 
 def experiment_dir(experiment_id: str, repo_root: Path | None = None) -> Path:
@@ -103,9 +105,20 @@ def _recorded_command(command: Sequence[str], repo_root: Path) -> list[str]:
     return [_recorded_path(arg, repo_root) if Path(arg).is_absolute() else arg for arg in command]
 
 
+def _resolve_stage_policy(config: ExperimentConfig) -> tuple[str, dict[str, Any]]:
+    """Returns `(stage, policy)` with screen overrides applied when requested."""
+    stage = str(config.stage or "official")
+    if stage not in {"official", "screen"}:
+        raise ValueError(f"unknown stage {stage!r}; expected 'official' or 'screen'")
+    policy = load_policy(config.policy_path)
+    if stage == "screen":
+        policy = apply_screen_overrides(policy)
+    return stage, policy
+
+
 def run_experiment(config: ExperimentConfig) -> Path:
     """Runs the experiment and returns the experiment directory path."""
-    policy = load_policy(config.policy_path)
+    stage, policy = _resolve_stage_policy(config)
     repo_root = (config.repo_root or Path(__file__).resolve().parents[4]).resolve()
     out = experiment_dir(config.experiment_id, repo_root)
     if out.exists():
@@ -130,8 +143,10 @@ def run_experiment(config: ExperimentConfig) -> Path:
     proposal = config.proposal or {"type": "accuracy", "targets": datasets}
     (out / "proposal.json").write_text(json.dumps(proposal, indent=2, sort_keys=True) + "\n")
     proposal_type = str(proposal.get("type", "accuracy"))
+    if stage == "screen" and proposal_type != "accuracy":
+        raise ValueError("screening stage supports accuracy proposals only")
     all_speed_n = effective_speed_samples(policy, proposal_type)
-    speed_n = {tier: all_speed_n[tier] for tier in speed_tiers}
+    speed_n = {tier: all_speed_n.get(tier, 0) for tier in speed_tiers}
     if speed_n[fidelity_tier] < 1:
         raise ValueError(f"fidelity tier {fidelity_tier!r} needs at least one speed sample for its profile")
     dataset_seed = int(policy.get("dataset_seed", 0))
@@ -178,6 +193,7 @@ def run_experiment(config: ExperimentConfig) -> Path:
     run_meta = {
         "experiment_id": config.experiment_id,
         "control": config.control,
+        "stage": stage,
         "datasets": datasets,
         "speed_tiers": speed_tiers,
         "speed_samples_effective": speed_n,

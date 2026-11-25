@@ -15,7 +15,7 @@ from typing import Any, Literal
 from profiler_bench.evaluate.bootstrap import BootstrapCI, paired_bootstrap_ci, stratified_dataset_mean_ci
 
 
-Verdict = Literal["accepted", "rejected", "inconclusive"]
+Verdict = Literal["accepted", "rejected", "inconclusive", "screen_pass", "screen_fail"]
 
 
 @dataclass
@@ -95,6 +95,9 @@ def evaluate_gates(
         verdict, accuracy_path = _combine_accuracy(gates, targeted=bool(targets))
     else:
         verdict = _combine(gates)
+    stage = str(run.get("stage") or "official")
+    if stage == "screen":
+        verdict = _screen_verdict(verdict, gates)
     result = {
         "verdict": verdict,
         "proposal_type": proposal_type,
@@ -107,7 +110,24 @@ def evaluate_gates(
     }
     if accuracy_path is not None:
         result["accuracy_path"] = accuracy_path
+    if stage == "screen":
+        result["stage"] = "screen"
     return result
+
+
+def _screen_verdict(verdict: Verdict, gates: Sequence[GateResult]) -> Verdict:
+    """Maps official gate outcomes onto screen_pass / screen_fail.
+
+    Screening never returns `accepted`. A privacy failure is always `screen_fail`. Any other
+    official `rejected` is `screen_fail`. Official `accepted` or `inconclusive` (borderline under
+    the loosened screen margins) is `screen_pass`.
+    """
+    privacy = next((gate for gate in gates if gate.name == "privacy"), None)
+    if privacy is not None and privacy.status == "fail":
+        return "screen_fail"
+    if verdict == "rejected":
+        return "screen_fail"
+    return "screen_pass"
 
 
 def expected_sample_keys(run: dict[str, Any]) -> dict[str, set[str]]:

@@ -17,8 +17,8 @@ from profiler_bench.catalog.gen import STRUCTURE, Rng, rng_factory
 from profiler_bench.catalog.manifest import Column, ForeignKey, Manifest, Table
 
 
-TIERS: dict[str, int] = {"xs": 5_000, "s": 100_000, "m": 2_000_000}
-TIER_FILES: dict[str, int] = {"xs": 1, "s": 4, "m": 16}
+TIERS: dict[str, int] = {"xs": 5_000, "r": 25_000, "s": 100_000, "m": 2_000_000}
+TIER_FILES: dict[str, int] = {"xs": 1, "r": 2, "s": 4, "m": 16}
 DEFAULT_TIER = "s"
 FINGERPRINT_PACKAGES = ("numpy", "pandas", "pyarrow", "pyspark")
 

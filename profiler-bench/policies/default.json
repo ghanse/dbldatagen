@@ -1,5 +1,5 @@
 {
-  "version": "2.1.0",
+  "version": "2.2.0",
   "bootstrap": {
     "samples": 2000,
     "seed": 0,
@@ -7,11 +7,13 @@
   },
   "speed_samples": {
     "xs": 2,
+    "r": 2,
     "s": 15,
     "m": 15
   },
   "speed_samples_accuracy": {
     "xs": 2,
+    "r": 2,
     "s": 2,
     "m": 0
   },
@@ -20,6 +22,15 @@
   "fidelity_parallelism": 3,
   "speed_tiers": ["s", "m"],
   "dataset_seed": 0,
+  "screen": {
+    "tier": "r",
+    "fidelity_seeds": 3,
+    "margin": 0.5,
+    "speed_samples": {
+      "r": 2
+    },
+    "note": "Screening never accepts. Gate thresholds use the same accuracy logic with looser margins: improvement floors are multiplied by (1-margin) and regression ceilings by (1+margin), so borderline proposals become screen_pass. Verdicts are only screen_pass or screen_fail; screen_fail is a rejection, screen_pass proceeds to the official tier-s run. Privacy failure is always screen_fail. Synthetic suite and accuracy proposals only."
+  },
   "accuracy": {
     "min_mean_improvement": 0.005,
     "min_target_improvement": 0.01,

@@ -15,25 +15,17 @@ from profiler_bench.runner.policy import DEFAULT_POLICY
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Dispatches `run`, `evaluate`, and `calibrate-targets` subcommands."""
+    """Dispatches `run`, `screen`, `evaluate`, and `calibrate-targets` subcommands."""
     parser = argparse.ArgumentParser(prog="python -m profiler_bench.rsi")
     sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="Compare a baseline profiler build with a candidate.")
-    run.add_argument("--baseline", type=Path, required=True, help="Worktree with baseline profiler/src.")
-    run.add_argument("--candidate", type=Path, required=True, help="Worktree with candidate profiler/src.")
-    run.add_argument("--policy", type=Path, default=DEFAULT_POLICY, help="Frozen policy JSON.")
-    run.add_argument("--experiment-id", required=True, help="Directory name under profiler/rsi/experiments/.")
-    run.add_argument("--datasets", nargs="+", default=None, help="Catalog datasets to measure.")
-    run.add_argument("--control", action="store_true", help="Compare the baseline with itself.")
-    run.add_argument("--repo-root", type=Path, default=None, help="Repository root for experiment output.")
-    run.add_argument("--cache-dir", type=Path, default=None, help="Catalog cache directory.")
-    run.add_argument("--proposal", type=Path, default=None, help="Optional proposal.json to copy.")
-    run.add_argument("--speed-tiers", nargs="+", default=None, help="Override speed tiers.")
+    _add_compare_args(run)
     run.add_argument(
-        "--no-baseline-cache",
-        action="store_true",
-        help="Measure the baseline build fresh instead of reusing cached baseline samples.",
+        "--stage",
+        choices=("official", "screen"),
+        default="official",
+        help="official (default) or screen (tier-r screening; accuracy only).",
     )
     run.add_argument(
         "--mode",
@@ -45,6 +37,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument("--subset-seeds", type=int, default=None, help="Data-volume subset seed count S.")
     run.add_argument("--fidelity-seeds", type=int, default=None, help="Sampler seed count K.")
     run.set_defaults(handler=_run)
+
+    screen = sub.add_parser(
+        "screen",
+        help="Run the screening stage (tier r, 3 seeds, synthetic, accuracy only).",
+    )
+    _add_compare_args(screen)
+    screen.set_defaults(handler=_screen)
 
     evaluate = sub.add_parser("evaluate", help="Re-evaluate saved samples without re-running.")
     evaluate.add_argument("experiment_dir", type=Path, help="Path to profiler/rsi/experiments/<id>.")
@@ -79,11 +78,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     return int(args.handler(args))
 
 
+def _add_compare_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--baseline", type=Path, required=True, help="Worktree with baseline profiler/src.")
+    parser.add_argument("--candidate", type=Path, required=True, help="Worktree with candidate profiler/src.")
+    parser.add_argument("--policy", type=Path, default=DEFAULT_POLICY, help="Frozen policy JSON.")
+    parser.add_argument("--experiment-id", required=True, help="Directory name under profiler/rsi/experiments/.")
+    parser.add_argument("--datasets", nargs="+", default=None, help="Catalog datasets to measure.")
+    parser.add_argument("--control", action="store_true", help="Compare the baseline with itself.")
+    parser.add_argument("--repo-root", type=Path, default=None, help="Repository root for experiment output.")
+    parser.add_argument("--cache-dir", type=Path, default=None, help="Catalog cache directory.")
+    parser.add_argument("--proposal", type=Path, default=None, help="Optional proposal.json to copy.")
+    parser.add_argument("--speed-tiers", nargs="+", default=None, help="Override speed tiers.")
+    parser.add_argument(
+        "--no-baseline-cache",
+        action="store_true",
+        help="Measure the baseline build fresh instead of reusing cached baseline samples.",
+    )
+
+
 def _run(args: argparse.Namespace) -> int:
-    proposal = None
-    if args.proposal is not None:
-        proposal = json.loads(Path(args.proposal).read_text())
-    if args.mode == "data-volume":
+    proposal = _load_proposal(args.proposal)
+    if getattr(args, "mode", "default") == "data-volume":
+        if getattr(args, "stage", "official") == "screen":
+            raise SystemExit("screening stage does not support --mode data-volume")
         path = run_data_volume_experiment(
             DataVolumeConfig(
                 experiment_id=args.experiment_id,
@@ -116,11 +133,21 @@ def _run(args: argparse.Namespace) -> int:
                 speed_tiers=args.speed_tiers,
                 command_line=sys.argv,
                 baseline_cache=not args.no_baseline_cache,
+                stage=getattr(args, "stage", "official"),
             )
         )
     verdict = json.loads((path / "verdict.json").read_text())
     print(json.dumps({"experiment_dir": str(path), "verdict": verdict["verdict"]}, sort_keys=True))
     return 0
+
+
+def _screen(args: argparse.Namespace) -> int:
+    args.stage = "screen"
+    args.mode = "default"
+    args.fractions = None
+    args.subset_seeds = None
+    args.fidelity_seeds = None
+    return _run(args)
 
 
 def _evaluate(args: argparse.Namespace) -> int:
@@ -143,6 +170,15 @@ def _calibrate(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def _load_proposal(path: Path | None) -> dict[str, object] | None:
+    if path is None:
+        return None
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"proposal must be a JSON object: {path}")
+    return data
 
 
 if __name__ == "__main__":

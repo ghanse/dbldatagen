@@ -5,9 +5,10 @@ keys, foreign keys, and privacy classes, and the logical hash of every exported 
 export. Real data has no planted ground truth, so its manifest is marked `ground_truth: none` and claims only
 that structure.
 
-Tiers: `full` is the export. `s` is a deterministic subset of it: a table with more than `TIERS["s"]` rows
-keeps the rows whose primary key (all non-nested columns when it has none) hashes below `TIERS["s"] / rows`;
-then, parents first, a row is dropped when a parent it references through a declared foreign key was dropped.
+Tiers: `full` is the export. `s` is a deterministic subset of it: a table with more than `REAL_SUBSET_CAP`
+rows (~50,000) keeps the rows whose primary key (all non-nested columns when it has none) hashes below
+`REAL_SUBSET_CAP / rows`; then, parents first, a row is dropped when a parent it references through a declared
+foreign key was dropped. Full-export pinned hashes are unchanged.
 
 Exports use the Statement Execution API with `EXTERNAL_LINKS` and `ARROW_STREAM`. Each chunk's link is
 requested just before the chunk is downloaded; an expired link is requested again, up to `LINK_ATTEMPTS` times with
@@ -43,11 +44,12 @@ from pyarrow import ipc
 
 from profiler_bench.catalog.hashing import table_hash
 from profiler_bench.catalog.manifest import Column, ForeignKey, Manifest, Privacy, Table
-from profiler_bench.catalog.registry import TIER_FILES, TIERS, spark_type
+from profiler_bench.catalog.registry import TIER_FILES, spark_type
 from profiler_bench.catalog.store import META_FILE, Materialized, cache_dir, is_intact, read_instance, write_instance
 
 
 REAL_TIERS = ("s", "full")
+REAL_SUBSET_CAP = 50_000
 FULL_FILE_ROWS = 1_000_000
 POLL_SECONDS = 2.0
 RETRY_SECONDS = 2.0
@@ -218,7 +220,7 @@ def materialize(
         tables = export(dataset, connect())
     else:
         full = materialize(dataset, "full", root, check_hash)
-        tables = subset(dataset, {t.name: full.read_table(t.name) for t in full.manifest.tables}, TIERS["s"])
+        tables = subset(dataset, {t.name: full.read_table(t.name) for t in full.manifest.tables}, REAL_SUBSET_CAP)
     truth = dataset.manifest(tier, tables)
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(dir=target.parent, prefix=".tmp-"))
