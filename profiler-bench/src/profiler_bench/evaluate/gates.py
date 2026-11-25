@@ -171,8 +171,9 @@ def _real_holdout(
 ) -> GateResult:
     """Holdout check on the real datasets; it never counts towards acceptance.
 
-    Reports, per real dataset, each build's relative reconstruction and the paired regression with CIs, and
-    whether privacy passed. Fails (rejects the candidate) when a candidate sample fails privacy. Otherwise it
+    Reports, per real dataset, each build's relative reconstruction and the paired regression with CIs, whether
+    privacy passed, the privacy checks left unmeasured (too few independent baseline rows: recorded, neither a pass
+    nor a fail), and the holdout and ceiling overlap with the profiled part per table. Fails (rejects the candidate) when a candidate sample fails privacy. Otherwise it
     is inconclusive when a dataset's regression CI reaches `accuracy.max_dataset_regression`
     (`real_holdout_regression`) or when samples are failed or missing (`real_holdout_incomplete`).
     """
@@ -205,6 +206,17 @@ def _real_holdout(
             if values
         }
         detail["candidate_privacy_passed"] = not any(f"/candidate/{dataset}/" in key for key in privacy_failed)
+        candidate = [
+            r for r in fidelity_records if r.get("ok") and r.get("dataset") == dataset and r.get("role") == "candidate"
+        ]
+        detail["candidate_privacy_unmeasured"] = sorted(
+            {n for r in candidate for n in r.get("privacy_unmeasured") or []}
+        )
+        overlap = next(
+            (r["detail"]["holdout_overlap"] for r in candidate if "holdout_overlap" in (r.get("detail") or {})), None
+        )
+        if overlap is not None:
+            detail["holdout_overlap"] = overlap
         if paired.get(dataset):
             ci = paired_bootstrap_ci(
                 [-diff for diff in paired[dataset]], n_bootstrap=n_bootstrap, seed=seed + 1, confidence=confidence

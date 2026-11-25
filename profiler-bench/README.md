@@ -147,7 +147,7 @@ rows per part. On the current exports, every table keeps at least 31.5% of its r
 shared dimensions: TPC-DS `item` and Wanderbricks `properties`, `amenities`, and `destinations` are in every part in
 full, `customer_address` at 98%. They also reach sensitive tables: 28% of the holdout's TPC-DS `customer` rows, 42% of
 Wanderbricks `hosts`, and all of `properties` are also in `profiled`. The privacy checks that compare synth against
-the holdout are therefore weaker on those tables; restricting the privacy baseline to unseen rows is open work.
+the holdout use only holdout rows absent from `profiled` (see the privacy guard below).
 Tier `s` of a part is the tier-s subset of that part. Parts are cached under `<dataset>/split-v2/<part>/<tier>`.
 
 | Dataset | Source | Licence and terms |
@@ -253,6 +253,31 @@ standard errors. Reports carry counts and rates, never values.
 | `<table>.quasi_identifiers[...].match_rate_excess` | share of rows matching a real-unique quasi-identifier combination exceeds the holdout's by at most 0.01 |
 | `profile.sensitive_value_leaks` | no sensitive real value equals a string of the profile JSON or appears in a scanned profile-text blob; every sensitive value (all rows) is checked against a bounded profile candidate set (decoded strings, concat, required literals, and fully enumerated small branch languages) and fails with `sensitive_value_in_profile` on a hit; every profile string is closed (below); every profile regex is in the allowlisted dialect; sensitive-column patterns pass the structural rule below; and no sensitive value in a seeded sample of 2,000 per column is fully matched by a small-language alternation branch of any other profile regex or contains a rare required literal of one |
 | `profile.k_threshold` | the profile validates; every `top_values` entry and enumeration value occurs in at least `privacy.min_value_count` (k) real rows; closed-string, dialect, and structural pattern rules pass; and on non-sensitive columns no alternation branch is a small-language match or rare required literal against that column's values |
+
+The profile scans (`profile.sensitive_value_leaks` and `profile.k_threshold`) skip only canonical structural
+strings, each verified on its own terms (`privacy._structural_paths`):
+- a table or column name equal to the real schema, including references to one (key, dependency,
+  quasi-identifier, relationship, and constraint columns);
+- a `source_type` equal to the real column's `simpleString()`;
+- a value the model defines for that enum or `Literal` field;
+- the running engine's name and version.
+
+Everything else is scanned, including patterns, top values, enumerations, extrema, and free strings, so a real value
+planted in a pattern, a top value, or a column name the real schema lacks still fails. A sensitive value counts once
+for each profile string that holds it. The concatenation of all strings counts only for values no single string
+holds, the sampled text scan counts only values the full scan missed, and a check's value counts hits, not the
+`<reason>:<path>` detail keys that locate them.
+
+**Real datasets** (`--suite real`) adjust the data checks:
+- The holdout baseline is the holdout part's rows that equal no profiled row (`privacy.independent_rows`).
+- Copy and partial-copy checks use the ceiling part's independent rows as the chance control: excess is the synth
+  rate minus the ceiling rate, both measured against the profiled rows, with the same threshold and noise allowance.
+- A table whose baseline has fewer than max(k, 100) independent rows reports those checks as unmeasured
+  (`GuardCheck.measured` false): recorded in `privacy_unmeasured`, neither a pass nor a fail.
+- Each record's `holdout_overlap` gives, per table, the holdout and ceiling rows and the share also in `profiled`.
+
+The synthetic suite is unchanged. The scorer tests check that a synth with 5% verbatim real rows fails, and so does
+an exact copy.
 
 Profile regex and text privacy is layered (synth-data leakage is the last):
 

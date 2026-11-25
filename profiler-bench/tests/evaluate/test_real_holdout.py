@@ -152,3 +152,18 @@ def test_all_real_datasets_skipped_passes_with_reason() -> None:
     assert (gate["status"], gate["reason"]) == ("pass", "real_holdout_skipped")
     assert gate["detail"]["skipped"] == {"nyctaxi_trips": "Unavailable: offline"}
     assert verdict["verdict"] == "accepted"
+
+
+def test_holdout_reports_unmeasured_checks_and_overlap_without_failing() -> None:
+    speed, fidelity = _records(real_candidate=0.805)
+    for record in fidelity:
+        if record["dataset"] in REAL and record["role"] == "candidate":
+            record["privacy_unmeasured"] = ["trips.dcr_ratio"]
+            record["detail"] = {"holdout_overlap": {"trips": {"holdout_overlap_share": 0.25}}}
+    verdict = evaluate_gates(
+        speed_records=speed, fidelity_records=fidelity, policy=_policy(), proposal={"type": "accuracy"}, run=_run()
+    )
+    detail = _gate(verdict, "real_holdout")["detail"]["datasets"]["nyctaxi_trips"]
+    assert detail["candidate_privacy_unmeasured"] == ["trips.dcr_ratio"]
+    assert detail["holdout_overlap"] == {"trips": {"holdout_overlap_share": 0.25}}
+    assert verdict["verdict"] == "accepted"

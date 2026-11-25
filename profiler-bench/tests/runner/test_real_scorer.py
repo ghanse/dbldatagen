@@ -227,13 +227,21 @@ def test_cli_and_factory_default_to_real_scorer(monkeypatch: Any, tmp_path: Path
 def test_real_dataset_scores_parts_and_skips_structure(monkeypatch: Any, tmp_path: Path) -> None:
     from profiler_bench.runner.scorer import _real_ceiling  # noqa: PLC0415
 
-    parts = {part: {"trips": object()} for part in ("profiled", "holdout", "ceiling")}
+    parts = {
+        part: {"trips": SimpleNamespace(part=part, count=lambda: 300)} for part in ("profiled", "holdout", "ceiling")
+    }
     synth = {"trips": object()}
     manifest = object()
-    loaded_profile = object()
+    loaded_profile = SimpleNamespace(privacy=SimpleNamespace(min_value_count=5))
     roots: list[Any] = []
 
-    def load_part(dataset: Any, tier: str, part: str, spark: Any, root: Any) -> dict[str, object]:
+    def independent_rows(rows: Any, seen: Any) -> Any:
+        assert seen is parts["profiled"]["trips"]
+        kept = SimpleNamespace(of=rows.part, count=lambda: 200)
+        kept.cache = lambda: kept
+        return kept
+
+    def load_part(dataset: Any, tier: str, part: str, spark: Any, root: Any) -> dict[str, SimpleNamespace]:
         assert (dataset.name, tier) == ("nyctaxi_trips", "s")
         roots.append(root)
         return parts[part]
@@ -255,6 +263,7 @@ def test_real_dataset_scores_parts_and_skips_structure(monkeypatch: Any, tmp_pat
         return _Score(0.8, {"score": 0.8})
 
     monkeypatch.setattr("profiler_bench.catalog.real.load_part", load_part)
+    monkeypatch.setattr("profiler_bench.fidelity.privacy.independent_rows", independent_rows)
     monkeypatch.setattr(
         "profiler_bench.catalog.real.materialize_part", lambda *args, **kwargs: SimpleNamespace(manifest=manifest)
     )
@@ -281,7 +290,10 @@ def test_real_dataset_scores_parts_and_skips_structure(monkeypatch: Any, tmp_pat
     assert reconstruction_calls == [(parts["profiled"], synth)]
     args, kwargs = privacy_calls[0]
     assert args == (parts["profiled"], synth, loaded_profile, manifest)
-    assert kwargs["holdout"] is parts["holdout"]
+    assert kwargs["holdout"]["trips"].of == "holdout"
+    assert kwargs["chance"]["trips"].of == "ceiling"
+    assert kwargs["min_independent_rows"] == 100
+    assert scores.detail["holdout_overlap"]["trips"]["holdout_overlap_share"] == 1 / 3
     assert scores.relative_reconstruction == 0.75
 
     reconstruction_calls.clear()
