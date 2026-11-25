@@ -119,6 +119,7 @@ def _score_seeds(
             app_name=f"rsi-fidelity-{role}-{dataset}-{tier}",
         )
         spark.conf.set("spark.sql.session.timeZone", "UTC")
+        conf_snapshot = _snapshot_spark_conf(spark)
         records = []
         session_id = str(id(spark))
         for index, seed in enumerate(seeds):
@@ -134,7 +135,7 @@ def _score_seeds(
                 )
             )
             if index + 1 < len(seeds):
-                _reset_spark_between_seeds(spark)
+                _reset_spark_between_seeds(spark, conf_snapshot)
         return records, [session_id] * len(seeds), spark
 
     records = []
@@ -169,16 +170,32 @@ def _score_seeds(
     return records, session_ids, None
 
 
-def _reset_spark_between_seeds(spark: SparkSession) -> None:
-    """Clears cached frames, temp views, and session conf drift between reused-session seeds."""
+def _snapshot_spark_conf(spark: SparkSession) -> dict[str, str]:
+    """Returns a copy of the session's mutable runtime SQL conf after session setup."""
+    return {str(key): str(value) for key, value in dict(spark.conf.getAll).items()}
+
+
+def _restore_spark_conf(spark: SparkSession, snapshot: dict[str, str]) -> None:
+    """Restores runtime conf to `snapshot`: reset changed keys and unset keys added later."""
+    current = _snapshot_spark_conf(spark)
+    for key in set(current) - set(snapshot):
+        with contextlib.suppress(Exception):
+            spark.conf.unset(key)
+    for key, value in snapshot.items():
+        if current.get(key) != value:
+            with contextlib.suppress(Exception):
+                spark.conf.set(key, value)
+
+
+def _reset_spark_between_seeds(spark: SparkSession, conf_snapshot: dict[str, str]) -> None:
+    """Clears cached frames, temp views, and full runtime conf drift between reused-session seeds."""
     with contextlib.suppress(Exception):
         spark.catalog.clearCache()
     with contextlib.suppress(Exception):
         for table in spark.catalog.listTables():
             if getattr(table, "isTemporary", False):
                 spark.catalog.dropTempView(table.name)
-    # Scorer and fidelity paths set UTC; restore it in case a seed left another zone.
-    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    _restore_spark_conf(spark, conf_snapshot)
 
 
 def _harness_profiler_module_file() -> str | None:

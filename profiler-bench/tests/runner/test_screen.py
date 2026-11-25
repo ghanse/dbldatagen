@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -26,7 +27,7 @@ from profiler_bench.runner.policy import (
     load_policy,
     screened_accuracy_thresholds,
 )
-from profiler_bench.runner.scorer import FakeScorer, try_real_scorer
+from profiler_bench.runner.scorer import FakeScorer, FidelityScores, try_real_scorer
 from profiler_bench.runner.spark_conf import fidelity_spark_config
 
 
@@ -419,6 +420,73 @@ def test_seed_raise_still_records_per_seed_failures(tmp_path: Path) -> None:
     assert baseline[1]["ok"] is False
     assert baseline[1]["error_class"] == "RuntimeError"
     assert "seed-boom" in baseline[1]["error"]
+
+
+def test_reused_session_restores_non_timezone_conf(spark: SparkSession) -> None:
+    """A seed that mutates runtime SQL conf must not leak those settings into the next seed."""
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    spark.conf.set("spark.sql.shuffle.partitions", "2")
+    original_shuffle = spark.conf.get("spark.sql.shuffle.partitions")
+    marker_key = "spark.sql.profiler_bench.test.marker"
+    with contextlib.suppress(Exception):
+        spark.conf.unset(marker_key)
+    assert spark.conf.get(marker_key, None) is None
+
+    seen: dict[str, str | None] = {}
+
+    class ConfMutatingScorer:
+        def score(
+            self,
+            profile: dict[str, Any],
+            *,
+            dataset: str,
+            tier: str,
+            seed: int,
+            structure_seed: int,
+            sample_seed: int,
+        ) -> FidelityScores:
+            del profile, dataset, tier, structure_seed, sample_seed
+            active = SparkSession.getActiveSession()
+            assert active is not None
+            if seed == 0:
+                active.conf.set("spark.sql.shuffle.partitions", "99")
+                active.conf.set(marker_key, "leaked")
+            else:
+                seen["shuffle"] = active.conf.get("spark.sql.shuffle.partitions")
+                seen["marker"] = active.conf.get(marker_key, None)
+            return FidelityScores(
+                reconstruction=0.8,
+                structure=0.7,
+                privacy_passed=True,
+                ceiling=0.9,
+                relative_reconstruction=0.8 / 0.9,
+                privacy_unmeasured=[],
+                detail={},
+                metrics_config_hash="conf-mutate",
+            )
+
+        def ceiling(self, dataset: str, tier: str, *, structure_seed: int = 0) -> float:
+            del dataset, tier, structure_seed
+            return 0.9
+
+    records, session_ids, _held = fidelity_worker._score_seeds(
+        role="baseline",
+        dataset="numeric",
+        tier="xs",
+        seeds=[0, 1],
+        profile={"tables": {}},
+        scorer=ConfMutatingScorer(),
+        dataset_seed=0,
+        fidelity_spark=fidelity_spark_config(driver_memory="8g"),
+        use_spark=True,
+        session_mode=fidelity_worker.SESSION_REUSE,
+    )
+    assert len(records) == 2 and all(record["ok"] for record in records)
+    assert len(set(session_ids)) == 1
+    assert seen["shuffle"] == original_shuffle
+    assert seen["marker"] is None
+    assert spark.conf.get("spark.sql.shuffle.partitions") == original_shuffle
+    assert spark.conf.get(marker_key, None) is None
 
 
 def _numeric_xs_profile(spark: SparkSession) -> dict[str, Any]:
