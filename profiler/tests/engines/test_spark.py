@@ -18,6 +18,27 @@ from dbldatagen_profiler.model import LogicalType, PrivacyPolicy, ValueTreatment
 pytestmark = [pytest.mark.spark, pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")]
 
 
+def test_wide_profile_is_byte_identical_across_aggregate_chunk_sizes(spark: SparkSession) -> None:
+    frame = spark.range(100).selectExpr(*[f"CAST({index} AS BIGINT) AS c{index}_id" for index in range(29)])
+
+    profiles = [
+        spark_engine._profile_table("wide", frame, PrivacyPolicy(), None, None, aggregate_columns_per_chunk=chunk_size)
+        for chunk_size in (1, 7, len(frame.columns))
+    ]
+
+    assert profiles[0].model_dump_json() == profiles[1].model_dump_json() == profiles[2].model_dump_json()
+
+
+def test_chunked_aggregate_merge_order_follows_schema(spark: SparkSession) -> None:
+    frame = spark.range(20).selectExpr("id AS z", "id + 1 AS a", "id + 2 AS m")
+
+    values = spark_engine._collect_column_aggregates(frame, columns_per_chunk=1)
+
+    prefixes = [key.split("_", 1)[0] for key in values]
+    assert prefixes[0] == ""
+    assert list(dict.fromkeys(prefixes[1:])) == ["c0", "c1", "c2"]
+
+
 @pytest.mark.parametrize(
     ("spark_type", "logical_type"),
     [
