@@ -2,6 +2,8 @@
 
 import re
 
+import numpy as np
+import pandas as pd
 import pytest
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -10,7 +12,7 @@ from dbldatagen_profiler.engines.spark import profile_tables
 from dbldatagen_profiler.model import Profile
 from profiler_bench.catalog import load, materialize
 from profiler_bench.catalog.manifest import Manifest
-from profiler_bench.fidelity import PrivacyScore, score_privacy
+from profiler_bench.fidelity import PrivacyScore, privacy, score_privacy
 from profiler_bench.fidelity.config import load_config
 from profiler_bench.fidelity.privacy import (
     _membership_checks,
@@ -155,7 +157,19 @@ def test_too_few_independent_rows_are_unmeasured_not_failed(
     assert all(
         not c.passed and c.detail["insufficient_independent_rows"] == 1.0 for c in score.checks if not c.measured
     )
-    assert score.passed, [c for c in score.checks if c.measured and not c.passed]
+    assert not [c for c in score.checks if c.measured and not c.passed]
+    assert not [c for c in score.checks if c.measured and c.name.endswith(privacy.COPY_CHECKS)]
+    assert (score.status, score.passed) == ("unmeasured", False)
+
+
+def test_the_synthetic_suite_status_is_pass_or_fail(
+    spark: SparkSession, real: dict[str, DataFrame], profile: Profile, manifest: Manifest
+) -> None:
+    independent = score_privacy(real, load("retail", "xs", 0, spark, sample_seed=3), profile, manifest)
+    copied = score_privacy(real, real, profile, manifest)
+    assert (independent.status, independent.passed) == ("pass", True)
+    assert (copied.status, copied.passed) == ("fail", False)
+    assert all(c.measured for c in [*independent.checks, *copied.checks])
 
 
 def _shuffled(real: dict[str, DataFrame], seed: int = 0) -> dict[str, DataFrame]:
@@ -247,4 +261,49 @@ def test_copy_checks_that_cannot_catch_a_five_percent_copy_are_underpowered(
     assert [c.name for c in checks] == ["customers.copy_rate_excess", "customers.partial_copy_rate_excess"]
     for check in checks:
         assert (check.measured, check.passed, check.detail["underpowered"]) == (False, False, 1.0), check
-        assert check.detail["detectable_copy_excess"] <= check.detail["required_excess"]
+        assert check.detail["alternative_excess"] <= check.detail["alternative_required"]
+
+
+def _frames(spark: SparkSession, rows: int, values: int, seed: int) -> DataFrame:
+    rng = np.random.default_rng(seed)
+    data = pd.DataFrame({"a": rng.integers(0, values, rows), "b": rng.integers(0, values, rows)}).astype("int64")
+    return spark.createDataFrame(data)
+
+
+TABLES = {
+    "large": {"seen": 4_000, "unseen": 4_000, "values": 10**9, "powered": True},
+    "small": {"seen": 60, "unseen": 60, "values": 10**9, "powered": False},
+    "high_repeat": {"seen": 4_000, "unseen": 4_000, "values": 3, "powered": False},
+    "high_overlap": {"seen": 4_000, "unseen": 120, "values": 10**9, "powered": False},
+}
+
+
+@pytest.mark.parametrize("shape", list(TABLES))
+def test_powered_checks_fail_a_real_five_percent_copy_and_unpowered_ones_never_pass(
+    spark: SparkSession, shape: str
+) -> None:
+    spec = TABLES[shape]
+    config, columns = load_config(), ["a", "b"]
+    seen = _frames(spark, spec["seen"], spec["values"], 1).cache()
+    unseen = _frames(spark, spec["unseen"], spec["values"], 2).cache()
+    synth = _frames(spark, spec["seen"], spec["values"], 3).cache()
+    rows = synth.count()
+    copied = synth.limit(rows - rows // 20).unionByName(seen.orderBy("a", "b").limit(rows // 20))
+    clean = _membership_checks(shape, seen, synth, unseen, columns, 0, config, None)
+    mixed = _membership_checks(shape, seen, copied, unseen, columns, 0, config, None)
+    assert [c.name for c in clean] == [f"{shape}.copy_rate_excess", f"{shape}.partial_copy_rate_excess"]
+    for before, after in zip(clean, mixed, strict=True):
+        assert not (before.measured and not before.passed), before
+        if spec["powered"]:
+            assert before.measured and before.passed, before
+            assert after.measured and not after.passed, after
+        else:
+            assert (before.measured, before.passed, before.detail.get("underpowered")) == (False, False, 1.0), before
+            assert not after.passed, after
+            assert after.detail.get("underpowered") == 1.0 or after.measured, after
+
+
+def test_a_value_in_identical_strings_keeps_every_path(spark: SparkSession) -> None:
+    values = spark.createDataFrame([("john", "john", 4)], "raw string, v string, n int")
+    texts = [("xxjohnxx", "$.a"), ("xxjohnxx", "$.b"), ("other", "$.c")]
+    assert privacy._candidate_substring_hits(values, spark, [], texts, [], 4) == {"john": {"$.a", "$.b"}}

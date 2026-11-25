@@ -301,7 +301,9 @@ class PrivacyScore(_Score):
         config_version: Metrics configuration version.
         config_hash: Metrics configuration hash.
         checks: Every guard check, named `<table>.<check>` or `profile.<check>`.
-        passed: Whether every measured check passed.
+        passed: Whether `status` is `pass`.
+        status: `fail` when a measured check failed; `unmeasured` on a real dataset where no copy, partial-copy, or
+            distance-to-closest-record check was measured; `pass` otherwise.
     """
 
     dataset: str
@@ -309,6 +311,7 @@ class PrivacyScore(_Score):
     config_hash: str
     checks: list[GuardCheck]
     passed: bool
+    status: Literal["pass", "fail", "unmeasured"] = "pass"
 
 
 class OverallScore(_Score):

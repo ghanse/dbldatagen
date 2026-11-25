@@ -13,10 +13,11 @@ copied the profiled rows matches them more. Tables with no non-key columns compa
 instead (`shuffled_control` in the detail). A baseline with fewer rows than `min_independent_rows` makes its checks
 unmeasured (`GuardCheck.measured` false): recorded, neither a pass nor a fail.
 
-Real-dataset copy checks also pass a power check. Match rates are means over synth rows, so a synth that is
-`POWER_COPY_SHARE` verbatim profiled rows and otherwise at chance has `POWER_COPY_SHARE` times the excess of an exact
-copy. When that excess cannot exceed the threshold plus the noise allowance, a pass of the check could not rule out
-such a copy; it is reported unmeasured with `underpowered` in its detail, never as a pass. Failed checks stay failed.
+Real-dataset copy checks also pass a power check. Match rates are means over synth rows, so replacing a
+`POWER_COPY_SHARE` of the synth's rows with verbatim profiled rows gives rates `(1 - share) * rate + share * copied`.
+The check is rerun on the expected rates of that mix, which recomputes the pooled rate and noise allowance
+under the alternative; when it would still pass, a pass could not rule out such a copy and the check is reported
+unmeasured with `underpowered` in its detail, never as a pass. Failed checks stay failed.
 
 The profile scans skip only canonical structural strings verified against the real schema and the model (see
 `_structural_paths`); a sensitive value found in the profile counts once per profile string that holds it.
@@ -33,6 +34,7 @@ import typing
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 from urllib.parse import unquote
 
 import numpy as np
@@ -194,13 +196,27 @@ def score_privacy(
             violations = {**violations, reason: violations.get(reason, 0.0) + hits}
     checks.append(_at_most("profile.sensitive_value_leaks", _hits(leaks), limits.max_profile_leaks, leaks))
     checks.append(_at_most("profile.k_threshold", _hits(violations), limits.max_k_violations, violations))
+    status = _status(checks, real_dataset=min_independent_rows is not None)
     return PrivacyScore(
         dataset=manifest.dataset,
         config_version=config.version,
         config_hash=config.hash(),
         checks=checks,
-        passed=all(c.passed for c in checks if c.measured),
+        passed=status == "pass",
+        status=status,
     )
+
+
+COPY_CHECKS = ("copy_rate_excess", "partial_copy_rate_excess", "dcr_ratio")
+
+
+def _status(checks: Sequence[GuardCheck], *, real_dataset: bool) -> Literal["pass", "fail", "unmeasured"]:
+    """Returns `fail` when a measured check failed. On real datasets, `pass` also needs at least one measured
+    copy-type check (`COPY_CHECKS`); with none the guard measured nothing about the rows and is `unmeasured`."""
+    if any(c.measured and not c.passed for c in checks):
+        return "fail"
+    copy_measured = any(c.measured and c.name.endswith(COPY_CHECKS) for c in checks)
+    return "unmeasured" if real_dataset and not copy_measured else "pass"
 
 
 def _hits(detail: Mapping[str, float]) -> float:
@@ -369,14 +385,32 @@ def _short(baseline: DataFrame, min_rows: int | None) -> int | None:
 POWER_COPY_SHARE = 0.05
 
 
-def _powered(check: GuardCheck, copy_excess: float) -> GuardCheck:
-    """Returns `check`, or an unmeasured `underpowered` check when it passed but a `POWER_COPY_SHARE` copy could not
-    have failed it; a failed check stays failed."""
-    detectable = POWER_COPY_SHARE * copy_excess
-    required = check.threshold + check.detail.get("noise_allowance", 0.0)
-    if detectable > required or not check.passed:
-        return check.model_copy(update={"detail": {**check.detail, "detectable_copy_excess": detectable}})
-    detail = {"unmeasured": 1.0, "underpowered": 1.0, "detectable_copy_excess": detectable, "required_excess": required}
+Rate = tuple[float, int]
+
+
+def _powered(
+    check: GuardCheck, measured: tuple[Rate, Rate], copied: tuple[float, float | None], z: float
+) -> GuardCheck:
+    """Returns `check`, or an unmeasured `underpowered` check when it passed but would also pass with a
+    `POWER_COPY_SHARE` verbatim copy mixed into the synth; a failed check stays failed.
+
+    `measured` is the check's two `(rate, rows)`; `copied` the same two rates for verbatim profiled rows, with None
+    for a side the synth does not enter (the shuffled control). Rates are means over synth rows, so the mix has rate
+    `(1 - share) * rate + share * copied`; the check is rerun on those expected rates, which recomputes the pooled
+    rate and the noise allowance under the alternative.
+    """
+    share = POWER_COPY_SHARE
+    (a, a_rows), (b, b_rows) = measured
+    mixed_a = (1 - share) * a + share * copied[0]
+    mixed_b = b if copied[1] is None else (1 - share) * b + share * copied[1]
+    alternative = _excess(check.name, (mixed_a, a_rows), (mixed_b, b_rows), check.threshold, z)
+    power = {
+        "alternative_excess": alternative.value,
+        "alternative_required": check.threshold + alternative.detail["noise_allowance"],
+    }
+    if not alternative.passed or not check.passed:
+        return check.model_copy(update={"detail": {**check.detail, **power}})
+    detail = {"unmeasured": 1.0, "underpowered": 1.0, **power}
     return GuardCheck(
         name=check.name, value=0.0, threshold=check.threshold, passed=False, measured=False, detail=detail
     )
@@ -403,22 +437,14 @@ def _copy_checks(
     if short is not None:
         names = ["copy_rate_excess", *(["partial_copy_rate_excess"] if len(values) > 1 else [])]
         return [_too_few_rows(f"{table}.{name}", limit, short) for name in names]
-    copy = _excess(
-        f"{table}.copy_rate_excess",
-        _match_rate(synth, real, shared),
-        _match_rate(control, real, shared),
-        limit,
-        config.privacy.noise_z,
-    )
+    rates = (_match_rate(synth, real, shared), _match_rate(control, real, shared))
+    copy = _excess(f"{table}.copy_rate_excess", *rates, limit, config.privacy.noise_z)
     if not shuffled:
         return [copy, *_partial_copy(table, (synth, real), (control, real), values, seed, config)]
-    exact = 1.0 - _match_rate(control, real, shared)[0]
-    partial = _partial_copy(
-        table, (synth, real), (control, real), values, seed, config, ((real, real), (control, real))
-    )
+    partial = _partial_copy(table, (synth, real), (control, real), values, seed, config, ((real, real), None))
     return [
         c.model_copy(update={"detail": {**c.detail, "shuffled_control": 1.0}})
-        for c in [_powered(copy, exact), *partial]
+        for c in [_powered(copy, rates, (1.0, None), config.privacy.noise_z), *partial]
     ]
 
 
@@ -443,17 +469,13 @@ def _membership_checks(
         return [_too_few_rows(f"{table}.{name}", limit, short) for name in names]
     size = min(real.count(), unseen.count())
     seen_rows, unseen_rows = _seeded_rows(real, size, seed, "seen"), _seeded_rows(unseen, size, seed, "unseen")
-    copy = _excess(
-        f"{table}.copy_rate_excess",
-        _match_rate(synth, seen_rows, values),
-        _match_rate(synth, unseen_rows, values),
-        limit,
-        config.privacy.noise_z,
+    rates = (_match_rate(synth, seen_rows, values), _match_rate(synth, unseen_rows, values))
+    copy = _excess(f"{table}.copy_rate_excess", *rates, limit, config.privacy.noise_z)
+    copied = (_match_rate(real, seen_rows, values)[0], _match_rate(real, unseen_rows, values)[0])
+    partial = _partial_copy(
+        table, (synth, seen_rows), (synth, unseen_rows), values, seed, config, ((real, seen_rows), (real, unseen_rows))
     )
-    exact = _match_rate(real, seen_rows, values)[0] - _match_rate(real, unseen_rows, values)[0]
-    copied = ((real, seen_rows), (real, unseen_rows))
-    partial = _partial_copy(table, (synth, seen_rows), (synth, unseen_rows), values, seed, config, copied)
-    checks = [_powered(copy, exact), *partial]
+    checks = [_powered(copy, rates, copied, config.privacy.noise_z), *partial]
     return [
         c.model_copy(update={"detail": {**c.detail, "membership": 1.0, "reference_rows": float(size)}}) for c in checks
     ]
@@ -474,14 +496,14 @@ def _partial_copy(
     shared: Sequence[str],
     seed: int,
     config: MetricsConfig,
-    copied: tuple[tuple[DataFrame, DataFrame], tuple[DataFrame, DataFrame]] | None = None,
+    copied: tuple[tuple[DataFrame, DataFrame], tuple[DataFrame, DataFrame] | None] | None = None,
 ) -> list[GuardCheck]:
     """Returns a check that no column pair reproduces reference-unique value pairs more often than the baseline does.
 
     `measured` and `baseline` are `(rows, reference)`: usually `(synth, real)` and `(holdout, real)`, and
-    `(synth, real)` and `(synth, unseen)` for the membership test. With `copied`, the same two rates for an exact
-    copy, each pair passes the power check (`_powered`); the check covers only powered pairs and is unmeasured
-    `underpowered` when none is.
+    `(synth, real)` and `(synth, unseen)` for the membership test. With `copied`, the `(rows, reference)` giving the
+    same two rates for verbatim profiled rows (None for a side the synth does not enter), each pair passes the power
+    check (`_powered`); the check covers only powered pairs and is unmeasured `underpowered` when none is.
 
     A synth row that copies some columns of a real row, row-aligned, reproduces the real row's combination of values
     in every pair of copied columns; combinations unique in the real table do not recur by chance. Primary key and
@@ -502,14 +524,17 @@ def _partial_copy(
     ]
     name = f"{table}.partial_copy_rate_excess"
     if copied is not None:
-        exact = [
-            a[0] - b[0]
-            for a, b in zip(_pair_match_rates(*copied[0], pairs), _pair_match_rates(*copied[1], pairs), strict=True)
+        copied_a = [rate for rate, _ in _pair_match_rates(*copied[0], pairs)]
+        copied_b: list[float | None] = [None] * len(pairs)
+        if copied[1] is not None:
+            copied_b = [r for r, _ in _pair_match_rates(*copied[1], pairs)]
+        powered = [
+            _powered(c, (a, b), (ca, cb), config.privacy.noise_z)
+            for c, a, b, ca, cb in zip(checks, synth_rates, holdout_rates, copied_a, copied_b, strict=True)
         ]
-        powered = [_powered(c, e) for c, e in zip(checks, exact, strict=True)]
         checks = [c for c in powered if c.measured]
         if not checks:
-            best = max(powered, key=lambda c: c.detail["detectable_copy_excess"])
+            best = max(powered, key=lambda c: c.detail["alternative_excess"] - c.detail["alternative_required"])
             return [best.model_copy(update={"name": name, "detail": {**best.detail, "pairs": float(len(pairs))}})]
     worst = max(range(len(checks)), key=lambda i: checks[i].value)
     return [
@@ -1400,7 +1425,6 @@ def _candidate_substring_hits(
             hits.setdefault(row["v"], set()).add(row["path"])
     if texts:
         blob = "\x1e".join(text for text, _ in texts)
-        text_paths = dict(texts)
         matched = [
             r["v"]
             for r in values.where(F.col("n") >= min_len)
@@ -1411,7 +1435,7 @@ def _candidate_substring_hits(
             .collect()
         ]
         for value in matched:
-            for text, json_path in text_paths.items():
+            for text, json_path in texts:
                 if value in text:
                     hits.setdefault(value, set()).add(json_path)
     if factors:

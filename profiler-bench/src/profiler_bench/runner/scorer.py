@@ -31,6 +31,7 @@ class FidelityScores:
         privacy_unmeasured: Privacy checks that could not be measured.
         detail: Full per-metric detail from the underlying scorers.
         metrics_config_hash: Hash of the metrics configuration that produced the scores.
+        privacy_status: `pass`, `fail`, or `unmeasured` on real datasets (see `PrivacyScore.status`); None otherwise.
     """
 
     reconstruction: float
@@ -41,6 +42,7 @@ class FidelityScores:
     privacy_unmeasured: list[str]
     detail: dict[str, Any]
     metrics_config_hash: str
+    privacy_status: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable mapping."""
@@ -495,6 +497,7 @@ def _score_real_dataset(
         reconstruction=float(reconstruction.score),
         structure=None,
         privacy_passed=bool(privacy.passed),
+        privacy_status=str(privacy.status),
         ceiling=float(ceiling.score),
         relative_reconstruction=relative,
         privacy_unmeasured=[c.name for c in privacy.checks if c.detail.get("unmeasured", 0.0) > 0.0],

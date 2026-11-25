@@ -145,6 +145,8 @@ def score_one_seed(
         if scores.ceiling is None or scores.relative_reconstruction is None:
             raise RuntimeError("scorer did not produce ceiling-relative reconstruction")
         applicability = {} if scores.structure is not None else {"structure_status": "not_applicable"}
+        if scores.privacy_status is not None:
+            applicability["privacy_status"] = scores.privacy_status
         return {
             "kind": "fidelity",
             "role": role,

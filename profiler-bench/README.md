@@ -276,20 +276,26 @@ holds, the sampled text scan counts only values the full scan missed, and a chec
   columns included, matches seen and unseen rows alike; one that memorised profiled rows matches them more.
 - Tables with no non-key columns (key-only bridge tables) compare the synth with the profiled part with each column
   shuffled independently (`privacy.shuffled_columns`, seeded by the sampler seed), labelled `shuffled_control`.
-- **Power check.** Match rates are means over synth rows, so a synth that is 5% verbatim profiled rows and otherwise
-  at chance has 5% of an exact copy's excess. When that cannot exceed the threshold plus the noise allowance, the check
-  could not catch such a copy: a pass is reported unmeasured with `underpowered` (never as a pass), and a failure stays
-  a failure. This happens on tiny tables, on tables whose non-key columns repeat across rows, and when few
-  independent holdout rows remain.
+- **Power check.** Match rates are means over synth rows, so replacing 5% of the synth's rows with verbatim profiled
+  rows gives each rate `0.95 * rate + 0.05 * copied rate` (the shuffled control's rate does not move). The check is
+  rerun on those expected rates, with the pooled rate and noise allowance recomputed under that alternative. If it
+  would still pass, a pass could not rule out such a copy: the check is reported unmeasured with `underpowered`
+  (never as a pass), and a failure stays a failure. This happens on tiny tables, on tables whose non-key columns
+  repeat across rows, and when few independent holdout rows remain.
 - A table whose baseline has fewer than max(k, 100) independent rows reports those checks as unmeasured
   (`GuardCheck.measured` false): recorded in `privacy_unmeasured`, neither a pass nor a fail.
+- **Privacy status** (`PrivacyScore.status`, the record's `privacy_status`): `fail` when a measured check failed;
+  `pass` only when, in addition, at least one copy, partial-copy, or distance-to-closest-record check was measured;
+  otherwise `unmeasured`. A guard that measured nothing about the rows never passes.
 - Each record's `holdout_overlap` gives, per table, the holdout rows and the share also in `profiled`. The
-  `real_holdout` gate lists each dataset's unmeasured, underpowered, and shuffled-control checks.
+  `real_holdout` gate lists each dataset's privacy status and its unmeasured, underpowered, and shuffled-control
+  checks.
 
 Known gap: on a key-only table, a 5% copy can stay below the shuffled chance level when the rest of the synth matches
-real key pairs less often than the shuffle does (Wanderbricks `property_amenities`); exact copies are caught. The
-profile carries only aggregates, so reproducing key edges requires memorising rows, which the exact-copy control
-catches. The synthetic suite is unchanged.
+real key pairs less often than the shuffle does (Wanderbricks `property_amenities`). The power check then reports
+the check underpowered rather than passed; exact copies are caught. The profile carries only aggregates, so
+reproducing key edges requires memorising rows, which the exact-copy control catches. The synthetic suite is
+unchanged: its status is `pass` or `fail` as before.
 
 Profile regex and text privacy is layered (synth-data leakage is the last):
 
@@ -453,9 +459,10 @@ skipped with the reason in `run.json` `real_skipped`; the run continues. Scored 
 The evaluator treats the real suite as a **holdout**, not part of acceptance: real samples are excluded from
 completeness, privacy, accuracy mean, per-dataset, structure, and speed gates, and checked only by the `real_holdout`
 gate. It reports each real dataset's baseline and candidate relative reconstruction with bootstrap CIs, the paired
-regression CI, and whether the candidate passed privacy. A candidate sample that fails privacy on a real dataset
-**rejects** (`real_holdout_privacy_failed`). A regression CI that reaches `accuracy.max_dataset_regression` makes the
-verdict **inconclusive** (`real_holdout_regression`) instead of accepted; failed or missing real samples do the same
+regression CI, and the candidate's privacy status. A candidate sample that fails privacy on a real dataset
+**rejects** (`real_holdout_privacy_failed`). A candidate sample whose privacy is `unmeasured` makes the verdict
+**inconclusive** (`real_holdout_privacy_unmeasured`), never accepted. So does a regression CI whose upper bound
+exceeds `accuracy.max_dataset_regression` (`real_holdout_regression`), and failed or missing real samples
 (`real_holdout_incomplete`). With every real dataset skipped the gate passes as `real_holdout_skipped`. A
 `real`-only run has no synthetic pairs, so it can measure but never accept.
 

@@ -171,13 +171,16 @@ def _real_holdout(
 ) -> GateResult:
     """Holdout check on the real datasets; it never counts towards acceptance.
 
-    Reports, per real dataset, each build's relative reconstruction and the paired regression with CIs, whether
-    privacy passed, the privacy checks left unmeasured (too few independent baseline rows: recorded, neither a pass
-    nor a fail), the copy checks that were underpowered (a 5% verbatim copy could not fail them; also unmeasured),
-    the copy checks of key-only tables that used the shuffled control, and the holdout's overlap with the profiled
-    part per table. Fails (rejects the candidate) when a candidate sample fails privacy. Otherwise it
-    is inconclusive when a dataset's regression CI reaches `accuracy.max_dataset_regression`
-    (`real_holdout_regression`) or when samples are failed or missing (`real_holdout_incomplete`).
+    Reports, per real dataset, each build's relative reconstruction and the paired regression with CIs, the
+    candidate's privacy status (`pass`, `fail`, or `unmeasured` when no copy-type check was measured), the privacy
+    checks left unmeasured (too few independent baseline rows: recorded, neither a pass nor a fail), the copy checks
+    that were underpowered (a 5% verbatim copy could not fail them; also unmeasured), the copy checks of key-only
+    tables that used the shuffled control, and the holdout's overlap with the profiled part per table.
+
+    Fails (rejects the candidate) when a candidate sample fails privacy. Otherwise it is inconclusive when a
+    candidate sample's privacy is unmeasured (`real_holdout_privacy_unmeasured`), when a dataset's regression CI
+    upper bound exceeds `accuracy.max_dataset_regression` (`real_holdout_regression`), or when samples are failed or
+    missing (`real_holdout_incomplete`).
     """
     boot = policy.get("bootstrap", {})
     n_bootstrap, seed = int(boot.get("samples", 2000)), int(boot.get("seed", 0))
@@ -185,9 +188,11 @@ def _real_holdout(
     max_reg = float(policy.get("accuracy", {}).get("max_dataset_regression", 0.01))
     ok = {_sample_key(record): record for record in [*speed_records, *fidelity_records] if record.get("ok")}
     incomplete = sorted(real_sample_keys(run) - set(ok))
-    privacy_failed = sorted(
-        key for key, record in ok.items() if "/candidate/" in key and record.get("privacy_passed") is False
-    )
+    candidate_privacy = {
+        key: _privacy_status(record) for key, record in ok.items() if key.startswith("fidelity/candidate/")
+    }
+    privacy_failed = sorted(key for key, status in candidate_privacy.items() if status == "fail")
+    privacy_unmeasured = sorted(key for key, status in candidate_privacy.items() if status == "unmeasured")
     paired = _paired_relative(fidelity_records)
     datasets: dict[str, Any] = {}
     regressed = []
@@ -207,7 +212,10 @@ def _real_holdout(
             for role, values in relative.items()
             if values
         }
-        detail["candidate_privacy_passed"] = not any(f"/candidate/{dataset}/" in key for key in privacy_failed)
+        statuses = {s for key, s in candidate_privacy.items() if f"/candidate/{dataset}/" in key}
+        status_of = "fail" if "fail" in statuses else "unmeasured" if "unmeasured" in statuses else "pass"
+        detail["candidate_privacy_status"] = status_of
+        detail["candidate_privacy_passed"] = status_of == "pass"
         candidate = [
             r for r in fidelity_records if r.get("ok") and r.get("dataset") == dataset and r.get("role") == "candidate"
         ]
@@ -229,13 +237,15 @@ def _real_holdout(
                 [-diff for diff in paired[dataset]], n_bootstrap=n_bootstrap, seed=seed + 1, confidence=confidence
             )
             detail["regression"] = ci.to_dict()
-            if ci.high >= max_reg:
+            if ci.high > max_reg:
                 regressed.append(dataset)
         datasets[dataset] = detail
     status: Literal["pass", "fail", "inconclusive"] = "pass"
     reason = "real_holdout_passed" if run.get("real_datasets") else "real_holdout_skipped"
     if privacy_failed:
         status, reason = "fail", "real_holdout_privacy_failed"
+    elif privacy_unmeasured:
+        status, reason = "inconclusive", "real_holdout_privacy_unmeasured"
     elif regressed:
         status, reason = "inconclusive", "real_holdout_regression"
     elif incomplete:
@@ -250,6 +260,7 @@ def _real_holdout(
             "max_regression": max_reg,
             "regressed": regressed,
             "privacy_failed": privacy_failed,
+            "privacy_unmeasured": privacy_unmeasured,
             "incomplete": incomplete,
             "skipped": run.get("real_skipped") or {},
             "split": run.get("real_split"),
@@ -257,6 +268,14 @@ def _real_holdout(
             "note": "holdout check: excluded from the mean and per-dataset accuracy gates",
         },
     )
+
+
+def _privacy_status(record: dict[str, Any]) -> str:
+    """Returns a fidelity record's privacy status; records without `privacy_status` have only pass or fail."""
+    status = record.get("privacy_status")
+    if status in ("pass", "fail", "unmeasured"):
+        return str(status)
+    return "pass" if record.get("privacy_passed") is True else "fail"
 
 
 def _sample_completeness(

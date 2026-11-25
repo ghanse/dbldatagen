@@ -154,16 +154,66 @@ def test_all_real_datasets_skipped_passes_with_reason() -> None:
     assert verdict["verdict"] == "accepted"
 
 
-def test_holdout_reports_unmeasured_checks_and_overlap_without_failing() -> None:
+def _verdict_with(fidelity: list[dict[str, Any]], speed: list[dict[str, Any]], **policy: float) -> dict[str, Any]:
+    full = _policy()
+    full["accuracy"] = {**full["accuracy"], **policy}
+    return evaluate_gates(
+        speed_records=speed, fidelity_records=fidelity, policy=full, proposal={"type": "accuracy"}, run=_run()
+    )
+
+
+def _set_candidate_privacy(fidelity: list[dict[str, Any]], statuses: list[str]) -> None:
+    for record in fidelity:
+        if record["dataset"] in REAL and record["role"] == "candidate":
+            status = statuses[record["seed"]]
+            record["privacy_status"], record["privacy_passed"] = status, status == "pass"
+
+
+def test_unmeasured_real_privacy_is_inconclusive_never_accepted() -> None:
     speed, fidelity = _records(real_candidate=0.805)
+    _set_candidate_privacy(fidelity, ["unmeasured"] * len(SEEDS))
+    verdict = _verdict_with(fidelity, speed)
+    gate = _gate(verdict, "real_holdout")
+    assert (gate["status"], gate["reason"]) == ("inconclusive", "real_holdout_privacy_unmeasured")
+    detail = gate["detail"]["datasets"]["nyctaxi_trips"]
+    assert (detail["candidate_privacy_status"], detail["candidate_privacy_passed"]) == ("unmeasured", False)
+    assert gate["detail"]["privacy_failed"] == []
+    assert verdict["verdict"] == "inconclusive"
+
+
+def test_failed_real_privacy_rejects_even_when_other_seeds_are_unmeasured() -> None:
+    speed, fidelity = _records(real_candidate=0.805)
+    _set_candidate_privacy(fidelity, ["unmeasured", "fail", "pass"])
+    verdict = _verdict_with(fidelity, speed)
+    gate = _gate(verdict, "real_holdout")
+    assert (gate["status"], gate["reason"]) == ("fail", "real_holdout_privacy_failed")
+    assert gate["detail"]["datasets"]["nyctaxi_trips"]["candidate_privacy_status"] == "fail"
+    assert verdict["verdict"] == "rejected"
+
+
+def test_measured_privacy_reports_unmeasured_checks_and_overlap() -> None:
+    speed, fidelity = _records(real_candidate=0.805)
+    _set_candidate_privacy(fidelity, ["pass"] * len(SEEDS))
     for record in fidelity:
         if record["dataset"] in REAL and record["role"] == "candidate":
             record["privacy_unmeasured"] = ["trips.dcr_ratio"]
             record["detail"] = {"holdout_overlap": {"trips": {"holdout_overlap_share": 0.25}}}
-    verdict = evaluate_gates(
-        speed_records=speed, fidelity_records=fidelity, policy=_policy(), proposal={"type": "accuracy"}, run=_run()
-    )
+    verdict = _verdict_with(fidelity, speed)
     detail = _gate(verdict, "real_holdout")["detail"]["datasets"]["nyctaxi_trips"]
+    assert detail["candidate_privacy_status"] == "pass"
     assert detail["candidate_privacy_unmeasured"] == ["trips.dcr_ratio"]
     assert detail["holdout_overlap"] == {"trips": {"holdout_overlap_share": 0.25}}
     assert verdict["verdict"] == "accepted"
+
+
+def test_regression_at_exactly_the_limit_is_not_a_regression() -> None:
+    limit = 0.0078125
+    speed, fidelity = _records()
+    for record in fidelity:
+        if record["dataset"] in REAL:
+            record["relative_reconstruction"] = 0.5 if record["role"] == "baseline" else 0.5 - limit
+    at_limit = _gate(_verdict_with(fidelity, speed, max_dataset_regression=limit), "real_holdout")
+    assert at_limit["detail"]["datasets"]["nyctaxi_trips"]["regression"]["high"] == limit
+    assert at_limit["reason"] == "real_holdout_passed"
+    above = _gate(_verdict_with(fidelity, speed, max_dataset_regression=limit / 2), "real_holdout")
+    assert above["reason"] == "real_holdout_regression"

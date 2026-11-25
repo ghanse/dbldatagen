@@ -253,7 +253,7 @@ def test_real_dataset_scores_parts_and_skips_structure(monkeypatch: Any, tmp_pat
 
     def score_privacy(*args: Any, **kwargs: Any) -> Any:
         privacy_calls.append((args, kwargs))
-        return SimpleNamespace(passed=True, checks=[], model_dump=lambda mode: {"passed": True})
+        return SimpleNamespace(passed=True, status="pass", checks=[], model_dump=lambda mode: {"passed": True})
 
     reconstruction_calls: list[tuple[object, object]] = []
 
@@ -302,7 +302,7 @@ def test_real_dataset_scores_parts_and_skips_structure(monkeypatch: Any, tmp_pat
     assert shuffles == [(parts["profiled"]["trips"], 3, "trips")]
     assert kwargs["min_independent_rows"] == 100
     assert scores.detail["holdout_overlap"]["trips"]["holdout_overlap_share"] == 1 / 3
-    assert scores.relative_reconstruction == 0.75
+    assert (scores.relative_reconstruction, scores.privacy_status) == (0.75, "pass")
 
     reconstruction_calls.clear()
     _real_ceiling(scorer, "nyctaxi_trips", "s", cast(Any, None))
