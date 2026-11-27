@@ -1,0 +1,168 @@
+{
+  "baseline": {
+    "commit": "44a85d1659fddcb9184ac0b554782d7eddc2253c",
+    "dirty": true,
+    "profiler_src_hash": "c973a04542de8201fe48d6a4326fa7e8922cfaa63bfbbc9933f2f6f5b279ca3b",
+    "role": "baseline",
+    "worktree": "<repo>"
+  },
+  "baseline_cache_enabled": false,
+  "baseline_cache_hits": [],
+  "baseline_cache_parts": {
+    "fidelity_cached": false,
+    "speed_cache_allowed": false,
+    "speed_cached": false
+  },
+  "baseline_cache_sources": [],
+  "baseline_cached": false,
+  "candidate": {
+    "commit": "112fb10146158defc7fad620cff703fb94526056",
+    "dirty": false,
+    "profiler_src_hash": "dcca5317faa39fd6cabbd8c520f98a47e93ff858328c015c1a66eccd156234b3",
+    "role": "candidate",
+    "worktree": "<external>/rsi-0008"
+  },
+  "command_line": [
+    "<repo>/profiler-bench/src/profiler_bench/rsi/__main__.py",
+    "run",
+    "--baseline",
+    "<repo>",
+    "--candidate",
+    "<external>/rsi-0008",
+    "--policy",
+    "profiler-bench/policies/default.json",
+    "--experiment-id",
+    "rsi-0008-s-0001",
+    "--datasets",
+    "retail",
+    "numeric",
+    "strings",
+    "temporal",
+    "nested",
+    "edge",
+    "--speed-tiers",
+    "s",
+    "--suite",
+    "synthetic",
+    "--proposal",
+    "profiler/rsi/experiments/.rsi-0008-s-0001-proposal.json",
+    "--no-baseline-cache"
+  ],
+  "control": false,
+  "datasets": [
+    "retail",
+    "numeric",
+    "strings",
+    "temporal",
+    "nested",
+    "edge"
+  ],
+  "experiment_id": "rsi-0008-s-0001",
+  "fidelity_cell_timeout_s": 2700.0,
+  "fidelity_model_source": "harness",
+  "fidelity_parallelism": 3,
+  "fidelity_spark": {
+    "configs": {
+      "spark.driver.memory": "8g",
+      "spark.sql.session.timeZone": "UTC",
+      "spark.sql.shuffle.partitions": "4",
+      "spark.ui.enabled": "false"
+    },
+    "master": "local[4]"
+  },
+  "fidelity_tier": "s",
+  "harness": {
+    "commit": "44a85d1659fddcb9184ac0b554782d7eddc2253c",
+    "dirty": true,
+    "harness_hash": "4f1b2c2388431d7e9b1926d77a16532c674a735e2aeecbea10207eca914ccdf4",
+    "harness_root": "<repo>",
+    "hashed_roots": [
+      "<repo>/profiler-bench/src/profiler_bench",
+      "<repo>/profiler-bench/policies"
+    ],
+    "metrics_config_hash": "846521dcf72bb2f576d3ac9af89b95c4fcbee5e6b49bc9c5e838e5a54bf2be69",
+    "policy_hash": "9534478b8f3cdd415dbff2fd5fc3aa6e345cd2ff5523a0a271752a94c481fef3"
+  },
+  "machine": {
+    "machine": "arm64",
+    "node": "X5R2FN2YQC",
+    "platform": "macOS-26.7.2-arm64-arm-64bit",
+    "processor": "arm",
+    "python": "3.10.20 (main, Mar  3 2026, 00:49:35) [Clang 17.0.0 (clang-1700.6.3.2)]"
+  },
+  "not_measured": [
+    "Spark executor / JVM heap and RSS (driver process RSS only)",
+    "GPU / accelerator time",
+    "network and disk IO bytes",
+    "cluster-scale Spark (local[*] only)",
+    "end-to-end dbldatagen generation from the profile"
+  ],
+  "policy": {
+    "accuracy": {
+      "ci_lower_must_exceed": 0.0,
+      "max_dataset_regression": 0.01,
+      "max_structure_regression": 0.02,
+      "min_mean_improvement": 0.005,
+      "min_target_improvement": 0.01
+    },
+    "bootstrap": {
+      "confidence": 0.95,
+      "samples": 2000,
+      "seed": 0
+    },
+    "dataset_seed": 0,
+    "fidelity_parallelism": 3,
+    "fidelity_seeds": 5,
+    "fidelity_tier": "s",
+    "not_measured": [
+      "Spark executor / JVM heap and RSS (driver process RSS only)",
+      "GPU / accelerator time",
+      "network and disk IO bytes",
+      "cluster-scale Spark (local[*] only)",
+      "end-to-end dbldatagen generation from the profile"
+    ],
+    "privacy": {
+      "hard_guard": true,
+      "note": "Privacy cannot be disabled; every candidate dataset x seed must set privacy_passed=true."
+    },
+    "spark": {
+      "configs": {
+        "spark.driver.memory": "8g",
+        "spark.sql.session.timeZone": "UTC",
+        "spark.sql.shuffle.partitions": "2",
+        "spark.ui.enabled": "false"
+      },
+      "master": "local[8]"
+    },
+    "speed": {
+      "max_cpu_regression": 0.1,
+      "max_rss_regression_abs_mib": 64.0,
+      "max_rss_regression_frac": 0.05,
+      "max_wall_regression": 0.1,
+      "min_target_improvement": 0.05
+    },
+    "speed_samples": {
+      "m": 15,
+      "s": 15,
+      "xs": 2
+    },
+    "speed_samples_accuracy": {
+      "m": 0,
+      "s": 2,
+      "xs": 2
+    },
+    "speed_tiers": [
+      "s",
+      "m"
+    ],
+    "version": "2.1.0"
+  },
+  "policy_path": "<repo>/profiler-bench/policies/default.json",
+  "speed_samples_effective": {
+    "s": 15
+  },
+  "speed_tiers": [
+    "s"
+  ],
+  "suite": "synthetic"
+}

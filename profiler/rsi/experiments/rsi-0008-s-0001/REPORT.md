@@ -1,0 +1,256 @@
+# Experiment rsi-0008-s-0001
+
+Verdict: **accepted**
+
+## Builds
+
+- Baseline: `44a85d1659fddcb9184ac0b554782d7eddc2253c` (`<repo>`)
+- Candidate: `112fb10146158defc7fad620cff703fb94526056` (`<external>/rsi-0008`)
+- Harness: `44a85d1659fddcb9184ac0b554782d7eddc2253c` hash `4f1b2c238843`
+- Control run: `False`
+
+## Measured
+
+- Driver wall time, process CPU time, and peak RSS for `profile_tables`
+- Profile JSON hash (created_at stripped) and cross-sample determinism
+- Paired reconstruction / structure / privacy scores at the fidelity tier
+
+## Not measured
+
+- Spark executor / JVM heap and RSS (driver process RSS only)
+- GPU / accelerator time
+- network and disk IO bytes
+- cluster-scale Spark (local[*] only)
+- end-to-end dbldatagen generation from the profile
+
+## Gates
+
+- `sample_completeness`: pass (all_samples_ok)
+- `privacy`: pass (privacy_passed)
+- `control`: pass (distinct_builds)
+- `accuracy_per_dataset`: pass (no_reconstruction_regression)
+- `structure`: pass (no_structure_regression)
+- `speed_target`: pass (target_improved)
+- `speed_guards`: pass (no_speed_regression)
+
+## Summary
+
+```json
+{
+  "control": false,
+  "experiment_id": "rsi-0008-s-0001",
+  "failed_fidelity": 0,
+  "failed_speed": 0,
+  "fidelity": {
+    "baseline/edge": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.8822255450805594,
+      "relative_mean": 0.8830992791203196,
+      "structure_mean": 0.3666666666666667
+    },
+    "baseline/nested": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.722738386720007,
+      "relative_mean": 0.7268033165518081,
+      "structure_mean": 0.7222222222222223
+    },
+    "baseline/numeric": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.8618475188879904,
+      "relative_mean": 0.867683569790373,
+      "structure_mean": 0.4230769230769232
+    },
+    "baseline/retail": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.6266969944221608,
+      "relative_mean": 0.6597185670082261,
+      "structure_mean": 0.28644688644688654
+    },
+    "baseline/strings": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.6003000617915715,
+      "relative_mean": 0.6015700821111973,
+      "structure_mean": 0.23529411764705882
+    },
+    "baseline/temporal": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.7651408335304646,
+      "relative_mean": 0.7672849360402435,
+      "structure_mean": 0.33333333333333337
+    },
+    "candidate/edge": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.8822255450805594,
+      "relative_mean": 0.8830992791203196,
+      "structure_mean": 0.3666666666666667
+    },
+    "candidate/nested": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.722738386720007,
+      "relative_mean": 0.7268033165518081,
+      "structure_mean": 0.7222222222222223
+    },
+    "candidate/numeric": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.8618475188879904,
+      "relative_mean": 0.867683569790373,
+      "structure_mean": 0.4230769230769232
+    },
+    "candidate/retail": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.6266969944221608,
+      "relative_mean": 0.6597185670082261,
+      "structure_mean": 0.28644688644688654
+    },
+    "candidate/strings": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.6003000617915715,
+      "relative_mean": 0.6015700821111973,
+      "structure_mean": 0.23529411764705882
+    },
+    "candidate/temporal": {
+      "n": 5,
+      "privacy_all_passed": true,
+      "reconstruction_mean": 0.7651408335304646,
+      "relative_mean": 0.7672849360402435,
+      "structure_mean": 0.33333333333333337
+    }
+  },
+  "not_measured": [
+    "Spark executor / JVM heap and RSS (driver process RSS only)",
+    "GPU / accelerator time",
+    "network and disk IO bytes",
+    "cluster-scale Spark (local[*] only)",
+    "end-to-end dbldatagen generation from the profile"
+  ],
+  "profile_determinism": {
+    "deterministic": true,
+    "divergent": {}
+  },
+  "speed": {
+    "baseline/edge@s": {
+      "cpu_s_median": 2.6697170000000003,
+      "n": 15,
+      "peak_rss_bytes_median": 281296896.0,
+      "profile_hashes": [
+        "4ea5b2d6b885a25849d93975d94d0f10c5716daa464e0a319a165dd43cd015f1"
+      ],
+      "wall_s_median": 13.24583829101175
+    },
+    "baseline/nested@s": {
+      "cpu_s_median": 51.996072999999996,
+      "n": 15,
+      "peak_rss_bytes_median": 412368896.0,
+      "profile_hashes": [
+        "3b42c263cd2d832d15f5c539479f47686637e8241a9d19ef9aef1a8a48aac141"
+      ],
+      "wall_s_median": 408.0089762919815
+    },
+    "baseline/numeric@s": {
+      "cpu_s_median": 3.456214000000001,
+      "n": 15,
+      "peak_rss_bytes_median": 276643840.0,
+      "profile_hashes": [
+        "7ef348e776b5e35a5a7c4befe9677f303747f89a3f242677e0f40bc7d4130d4a"
+      ],
+      "wall_s_median": 26.084531917003915
+    },
+    "baseline/retail@s": {
+      "cpu_s_median": 2.006714,
+      "n": 15,
+      "peak_rss_bytes_median": 252723200.0,
+      "profile_hashes": [
+        "e6b1034f2d97c9fa50e4221fdafdd55eb0cac4f7e94fa161b6061b4de712a10e"
+      ],
+      "wall_s_median": 5.820768625009805
+    },
+    "baseline/strings@s": {
+      "cpu_s_median": 3.1440199999999994,
+      "n": 15,
+      "peak_rss_bytes_median": 344932352.0,
+      "profile_hashes": [
+        "3cf1ad8963fb00a03f57060d81d19edef1a45ea7e75c0ef5092df4488e49bbdf"
+      ],
+      "wall_s_median": 9.117218374973163
+    },
+    "baseline/temporal@s": {
+      "cpu_s_median": 1.4286200000000004,
+      "n": 15,
+      "peak_rss_bytes_median": 249397248.0,
+      "profile_hashes": [
+        "9e20d67edefcf57215dcec8dc7bf26ed5078e1e918edb9b2d4b4efc858ceeaa5"
+      ],
+      "wall_s_median": 4.3829925410682335
+    },
+    "candidate/edge@s": {
+      "cpu_s_median": 2.6571550000000004,
+      "n": 15,
+      "peak_rss_bytes_median": 287752192.0,
+      "profile_hashes": [
+        "4ea5b2d6b885a25849d93975d94d0f10c5716daa464e0a319a165dd43cd015f1"
+      ],
+      "wall_s_median": 13.592489708098583
+    },
+    "candidate/nested@s": {
+      "cpu_s_median": 52.947320999999995,
+      "n": 15,
+      "peak_rss_bytes_median": 413351936.0,
+      "profile_hashes": [
+        "062c9b0f4ccec4e4d374b61cc9b0258f6661f41da656268058a3de05f9daf5a1"
+      ],
+      "wall_s_median": 166.7348954579793
+    },
+    "candidate/numeric@s": {
+      "cpu_s_median": 3.4561919999999997,
+      "n": 15,
+      "peak_rss_bytes_median": 276332544.0,
+      "profile_hashes": [
+        "7ef348e776b5e35a5a7c4befe9677f303747f89a3f242677e0f40bc7d4130d4a"
+      ],
+      "wall_s_median": 26.736880499986
+    },
+    "candidate/retail@s": {
+      "cpu_s_median": 2.022817,
+      "n": 15,
+      "peak_rss_bytes_median": 253591552.0,
+      "profile_hashes": [
+        "e6b1034f2d97c9fa50e4221fdafdd55eb0cac4f7e94fa161b6061b4de712a10e"
+      ],
+      "wall_s_median": 5.870968458009884
+    },
+    "candidate/strings@s": {
+      "cpu_s_median": 3.1619340000000005,
+      "n": 15,
+      "peak_rss_bytes_median": 345260032.0,
+      "profile_hashes": [
+        "3cf1ad8963fb00a03f57060d81d19edef1a45ea7e75c0ef5092df4488e49bbdf"
+      ],
+      "wall_s_median": 9.121603125007823
+    },
+    "candidate/temporal@s": {
+      "cpu_s_median": 1.4294220000000002,
+      "n": 15,
+      "peak_rss_bytes_median": 248987648.0,
+      "profile_hashes": [
+        "9e20d67edefcf57215dcec8dc7bf26ed5078e1e918edb9b2d4b4efc858ceeaa5"
+      ],
+      "wall_s_median": 4.39314070797991
+    }
+  }
+}
+```
+
+## Profile determinism
+
+Deterministic: `True`
