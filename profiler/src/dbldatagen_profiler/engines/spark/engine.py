@@ -414,6 +414,7 @@ def _aggregate_expressions(column: Column, data_type: T.DataType, index: int) ->
                 F.min(length).alias(f"{prefix}_length_min"),
                 F.max(length).alias(f"{prefix}_length_max"),
                 F.avg(length).alias(f"{prefix}_length_mean"),
+                F.stddev_samp(length).alias(f"{prefix}_length_stddev"),
             ]
         )
     elif isinstance(data_type, _temporal_types()):
@@ -469,7 +470,7 @@ def _column_from_aggregate(
     if isinstance(field.dataType, _NUMERIC_TYPES):
         attributes["numeric"] = _numeric_stats(field.dataType, values, prefix, privacy)
     elif isinstance(field.dataType, _string_types()):
-        attributes["string"] = StringStats(length=_length_stats(values, prefix, include_stddev=False))
+        attributes["string"] = StringStats(length=_length_stats(values, prefix, include_stddev=True))
     elif isinstance(field.dataType, _temporal_types()):
         attributes["temporal"] = _temporal_stats(field.dataType, values, prefix, privacy)
     elif isinstance(field.dataType, T.BooleanType) and values.get(f"{prefix}_true_fraction") is not None:
