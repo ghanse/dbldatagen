@@ -5,10 +5,10 @@ with `merge_states`; the merge is associative and commutative. `profile_states` 
 
 Exact statistics (equal to the batch engine): row count, null fraction, value counts of nested columns, numeric and
 temporal min/max (lossless for decimal and int64), string and collection length min/max/mean, and boolean true
-fraction. Approximate statistics: numeric mean/stddev and collection length stddev are merged in floating point
-(Chan et al.), so they match the batch engine to rounding error only. Distinct counts come from Spark's built-in
-HyperLogLog sketch (Apache DataSketches HLL, lgConfigK=`HLL_LG_CONFIG_K`) and are flagged `exact=false`, with a
-relative standard error of `DISTINCT_RELATIVE_ERROR`.
+fraction. Approximate statistics: numeric mean/stddev and string/collection length stddev are merged in floating
+point (Chan et al.), so they match the batch engine to rounding error only. Distinct counts come from Spark's
+built-in HyperLogLog sketch (Apache DataSketches HLL, lgConfigK=`HLL_LG_CONFIG_K`) and are flagged `exact=false`,
+with a relative standard error of `DISTINCT_RELATIVE_ERROR`.
 """
 
 from __future__ import annotations
@@ -360,7 +360,7 @@ def _column_profile(f: T.StructField, state: ColumnState, policy: PrivacyPolicy,
             stddev=moments.stddev(),
         )
     elif isinstance(data_type, _string_types()):
-        attributes["string"] = StringStats(length=(state.lengths or Lengths()).stats(include_stddev=False))
+        attributes["string"] = StringStats(length=(state.lengths or Lengths()).stats(include_stddev=True))
     elif isinstance(data_type, _temporal_types()):
         attributes["temporal"] = (
             TemporalStats(

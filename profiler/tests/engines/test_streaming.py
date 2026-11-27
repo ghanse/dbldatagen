@@ -151,7 +151,7 @@ def _assert_equivalent(batch: object, stream: object, path: str = "") -> None:
             elif path.endswith("numeric") and key in {"mean", "stddev"} and batch[key] is not None:
                 scale = max(1.0, abs(batch["mean"]), batch["stddev"] or 0.0)
                 assert math.isclose(batch[key], stream[key], rel_tol=1e-9, abs_tol=1e-9 * scale), f"{path}.{key}"
-            elif path.endswith("collection_length") and key == "stddev" and batch[key] is not None:
+            elif path.endswith(("collection_length", "string.length")) and key == "stddev" and batch[key] is not None:
                 assert math.isclose(batch[key], stream[key], rel_tol=1e-9), f"{path}.{key}"
             else:
                 _assert_equivalent(batch[key], stream[key], f"{path}.{key}")

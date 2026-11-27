@@ -257,7 +257,10 @@ def test_profiles_flat_statistics(spark: SparkSession) -> None:
     assert number.numeric.mean == pytest.approx(1.5)
     assert number.numeric.stddev == pytest.approx(2**-0.5)
     assert number.numeric.quantiles is None
-    assert text.string.length.model_dump(exclude_none=True) == {"min": 1, "max": 4, "mean": 2.5}
+    assert text.string.length.min == 1
+    assert text.string.length.max == 4
+    assert text.string.length.mean == pytest.approx(2.5)
+    assert text.string.length.stddev == pytest.approx((4.5) ** 0.5)
     assert moment.temporal.min == "2026-01-01T00:00:00Z"
     assert moment.temporal.quantiles is None
     assert flag.boolean.true_fraction == 0.5
@@ -677,6 +680,58 @@ def test_nested_columns_have_value_counts(spark: SparkSession) -> None:
     assert columns[1].children[0].children[0].value_count == 2
     assert columns[2].children[0].value_count == 1
     assert columns[2].children[1].value_count == 1
+
+
+def test_string_length_includes_stddev_top_level_and_nested(spark: SparkSession) -> None:
+    """Sampler-consumed length moments (min/max/mean/stddev) for top-level and nested strings."""
+    rows = [
+        ("aa", Row(city="X", street="ab"), ["short", "longer"]),
+        ("bbbb", Row(city="YYYY", street="cdef"), ["mid"]),
+        ("cccccc", Row(city="ZZ", street="ghijkl"), ["abcdefgh"]),
+    ]
+    frame = spark.createDataFrame(
+        rows,
+        "comment string, address struct<city:string,street:string>, tags array<string>",
+    )
+    columns = {column.name: column for column in profile_dataframe("contacts", frame).tables[0].columns}
+    comment = columns["comment"].string
+    assert comment is not None and comment.length is not None
+    assert comment.length.min == 2 and comment.length.max == 6
+    assert comment.length.mean == pytest.approx(4.0)
+    assert comment.length.stddev == pytest.approx(2.0)
+
+    address = columns["address"]
+    assert address.children is not None
+    city = {child.name: child for child in address.children}["city"].string
+    assert city is not None and city.length is not None
+    assert city.length.min == 1 and city.length.max == 4
+    assert city.length.mean == pytest.approx(7 / 3)
+    assert city.length.stddev is not None and city.length.stddev > 0
+
+    tags = columns["tags"]
+    assert tags.children is not None
+    element = tags.children[0].string
+    assert element is not None and element.length is not None
+    assert element.length.min == 3 and element.length.max == 8
+    assert element.length.mean is not None and element.length.stddev is not None
+
+
+def test_direct_identifier_keeps_length_moments_without_literals(spark: SparkSession) -> None:
+    """Length stats are value-free aggregates; direct identifiers still suppress top_values."""
+    rows = [(f"user{index}@example.com",) for index in range(20)] + [(f"admin{index}@corp.org",) for index in range(20)]
+    profile = profile_dataframe("customers", spark.createDataFrame(rows, "email string"))
+    email = profile.tables[0].columns[0]
+    assert email.semantic is not None
+    assert email.semantic.sensitivity.value == "direct_identifier"
+    assert email.string is not None
+    assert email.string.top_values is None
+    assert email.literals() == []
+    assert email.string.length is not None
+    assert email.string.length.min is not None
+    assert email.string.length.max is not None
+    assert email.string.length.mean is not None
+    assert email.string.length.stddev is not None
+    assert email.string.length.stddev > 0
 
 
 def test_profiles_multiple_tables(spark: SparkSession) -> None:

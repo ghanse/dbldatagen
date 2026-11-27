@@ -81,8 +81,8 @@ percentile sketches or cross-column moments.
 
 A snapshot equals the batch profile of the same rows on these statistics: row count, null fraction, nested
 `value_count`, numeric and temporal min/max (lossless for decimal and int64), string and collection length
-min/max/mean, and boolean true fraction. Numeric mean/stddev and collection length stddev are merged in floating
-point (Chan et al.) and match to rounding error. Distinct counts come from Spark's built-in HyperLogLog sketch
+min/max/mean, and boolean true fraction. Numeric mean/stddev and string/collection length stddev are merged in
+floating point (Chan et al.) and match to rounding error. Distinct counts come from Spark's built-in HyperLogLog sketch
 (Apache DataSketches HLL, lgConfigK 12) and are marked `exact: false`. Merging sketches is order-independent, so
 the estimate does not depend on how rows are split into batches. DataSketches documents the relative standard error
 of a merged HLL sketch as about 1.04/√K with K = 2^lgConfigK, which is 1.63% at lgConfigK 12 (`DISTINCT_RELATIVE_ERROR`).
