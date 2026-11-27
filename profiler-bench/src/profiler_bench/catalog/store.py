@@ -76,7 +76,7 @@ def get(name: str) -> Dataset:
 def instance_dir(name: str, tier: str, seed: int, root: Path | None = None, sample_seed: int | None = None) -> Path:
     """Returns the cache directory of one dataset instance, keyed by both seeds and the generator fingerprint."""
     sample = seed if sample_seed is None else sample_seed
-    return (root or cache_dir()) / name / tier / f"seed-{seed}" / f"sample-{sample}" / get(name).fingerprint()
+    return (root or cache_dir()) / name / tier / f"seed-{seed}" / f"sample-{sample}" / get(name).fingerprint(tier)
 
 
 def materialize(
@@ -139,7 +139,13 @@ def file_hashes(instance: Materialized) -> dict[str, str]:
     return {t.name: table_hash(instance.read_table(t.name)) for t in instance.manifest.tables}
 
 
-def write_instance(path: Path, tables: dict[str, pa.Table], truth: Manifest, sample_seed: int) -> None:
+def write_instance(
+    path: Path,
+    tables: dict[str, pa.Table],
+    truth: Manifest,
+    sample_seed: int,
+    extra_meta: dict[str, object] | None = None,
+) -> None:
     """Writes `tables` as `Table.files` parquet parts each, with the manifest and the hash metadata, under `path`."""
     for spec in truth.tables:
         table, directory = tables[spec.name], path / f"{spec.name}.parquet"
@@ -151,6 +157,8 @@ def write_instance(path: Path, tables: dict[str, pa.Table], truth: Manifest, sam
     hashes = {name: table_hash(tables[name]) for name in sorted(tables)}
     seeds = {"structure_seed": truth.structure_seed, "sample_seed": sample_seed}
     meta = {"content_hash": content_hash(hashes, path / MANIFEST_FILE, *seeds.values()), **seeds, "tables": hashes}
+    if extra_meta:
+        meta.update(extra_meta)
     (path / META_FILE).write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     written = file_hashes(read_instance(path))
     if written != hashes:

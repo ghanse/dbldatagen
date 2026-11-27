@@ -11,7 +11,15 @@ import pyarrow as pa
 import pytest
 
 from profiler_bench.catalog import DATASETS, REAL_DATASETS
-from profiler_bench.catalog.real import SPLIT, WAREHOUSE_ENV, RealDataset, RealTable, instance_dir
+from profiler_bench.catalog.real import (
+    REAL_SUBSET_CAP,
+    REAL_SUBSET_METHOD,
+    SPLIT,
+    WAREHOUSE_ENV,
+    RealDataset,
+    RealTable,
+    instance_dir,
+)
 from profiler_bench.catalog.store import write_instance
 from profiler_bench.runner import baseline_cache, measure
 from profiler_bench.runner.experiment import ExperimentConfig, prepare_real, run_experiment, suite_datasets
@@ -53,7 +61,12 @@ def test_uncached_real_datasets_offline_are_skipped_with_a_reason(
 
 def test_real_cache_key_includes_pins_and_split() -> None:
     identity = baseline_cache.dataset_identity(REAL, "s", 0, None)
-    assert identity == {"real_pinned_hashes": dict(REAL_DATASETS[REAL].hashes), "real_split": SPLIT}
+    assert identity == {
+        "real_pinned_hashes": dict(REAL_DATASETS[REAL].hashes),
+        "real_split": SPLIT,
+        "real_subset_cap": REAL_SUBSET_CAP,
+        "real_subset_method": REAL_SUBSET_METHOD,
+    }
 
 
 @pytest.fixture

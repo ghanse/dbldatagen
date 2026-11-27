@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from profiler_bench.catalog import REAL_DATASETS
-from profiler_bench.catalog.real import SPLIT
+from profiler_bench.catalog.real import REAL_SUBSET_CAP, REAL_SUBSET_METHOD, SPLIT
 from profiler_bench.evaluate.evaluate import evaluate_experiment
 from profiler_bench.evaluate.gates import evaluate_gates, expected_sample_keys
 from profiler_bench.rsi import __main__ as rsi_cli
@@ -28,9 +28,9 @@ from profiler_bench.runner.spark_conf import fidelity_spark_config
 DATASETS = ["numeric", "retail"]
 
 
-def test_default_policy_is_2_1_0_with_fast_defaults() -> None:
+def test_default_policy_is_2_2_0_with_screen_defaults() -> None:
     policy = load_policy(DEFAULT_POLICY)
-    assert policy["version"] == "2.1.0"
+    assert policy["version"] == "2.2.0"
     assert policy["accuracy"]["min_target_improvement"] == 0.01
     assert policy["spark"]["master"] == "local[8]"
     assert policy["spark"]["configs"] == {
@@ -39,18 +39,21 @@ def test_default_policy_is_2_1_0_with_fast_defaults() -> None:
         "spark.ui.enabled": "false",
         "spark.driver.memory": "8g",
     }
-    assert policy["speed_samples"] == {"xs": 2, "s": 15, "m": 15}
-    assert policy["speed_samples_accuracy"] == {"xs": 2, "s": 2, "m": 0}
+    assert policy["speed_samples"] == {"xs": 2, "r": 2, "s": 15, "m": 15}
+    assert policy["speed_samples_accuracy"] == {"xs": 2, "r": 2, "s": 2, "m": 0}
     assert policy["fidelity_parallelism"] == 3
+    assert policy["screen"]["tier"] == "r"
+    assert policy["screen"]["fidelity_seeds"] == 3
+    assert policy["screen"]["margin"] == 0.5
 
 
 def test_effective_speed_samples_by_proposal_type() -> None:
     policy = load_policy(DEFAULT_POLICY)
-    assert effective_speed_samples(policy, "accuracy") == {"xs": 2, "s": 2, "m": 0}
-    assert effective_speed_samples(policy, "speed") == {"xs": 2, "s": 15, "m": 15}
-    assert effective_speed_samples(policy, "data_volume") == {"xs": 2, "s": 15, "m": 15}
+    assert effective_speed_samples(policy, "accuracy") == {"xs": 2, "r": 2, "s": 2, "m": 0}
+    assert effective_speed_samples(policy, "speed") == {"xs": 2, "r": 2, "s": 15, "m": 15}
+    assert effective_speed_samples(policy, "data_volume") == {"xs": 2, "r": 2, "s": 15, "m": 15}
     del policy["speed_samples_accuracy"]
-    assert effective_speed_samples(policy, "accuracy") == {"xs": 2, "s": 15, "m": 15}
+    assert effective_speed_samples(policy, "accuracy") == {"xs": 2, "r": 2, "s": 15, "m": 15}
 
 
 def _speed(role: str, dataset: str, tier: str, index: int) -> dict[str, Any]:
@@ -258,7 +261,19 @@ def test_dataset_identity_uses_catalog_hashes_and_real_pins(tmp_path: Path) -> N
     assert baseline_cache.dataset_identity(real.name, "s", 0, None) == {
         "real_pinned_hashes": dict(real.hashes),
         "real_split": SPLIT,
+        "real_subset_cap": REAL_SUBSET_CAP,
+        "real_subset_method": REAL_SUBSET_METHOD,
     }
+
+
+def test_dataset_identity_cache_key_includes_real_subset_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    real = next(iter(REAL_DATASETS.values()))
+    before = baseline_cache.dataset_identity(real.name, "s", 0, None)
+    monkeypatch.setattr("profiler_bench.catalog.real.REAL_SUBSET_CAP", 12_345)
+    after = baseline_cache.dataset_identity(real.name, "s", 0, None)
+    assert before["real_subset_cap"] != after["real_subset_cap"]
+    assert before["real_pinned_hashes"] == after["real_pinned_hashes"]
+    assert before["real_split"] == after["real_split"]
 
 
 def test_cache_misses_on_dataset_and_tier(tmp_path: Path) -> None:

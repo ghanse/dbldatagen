@@ -1,3 +1,4 @@
+import json
 import os
 import socket
 from pathlib import Path
@@ -12,6 +13,8 @@ from profiler_bench.catalog.__main__ import main
 from profiler_bench.catalog.manifest import ForeignKey
 from profiler_bench.catalog.real import (
     PROFILE_ENV,
+    REAL_SUBSET_CAP,
+    REAL_SUBSET_METHOD,
     WAREHOUSE_ENV,
     RealDataset,
     RealTable,
@@ -21,7 +24,7 @@ from profiler_bench.catalog.real import (
     subset,
 )
 from profiler_bench.catalog.real_datasets import WANDERBRICKS
-from profiler_bench.catalog.store import write_instance
+from profiler_bench.catalog.store import META_FILE, write_instance
 
 
 ENV = (WAREHOUSE_ENV, PROFILE_ENV, "DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_CONFIG_PROFILE")
@@ -124,7 +127,9 @@ def test_subset_is_deterministic_capped_and_closed() -> None:
     first = subset(FIXTURE, _tables(), 200)
     assert all(_rows(first[n]) == _rows(t) for n, t in subset(FIXTURE, _tables(order_seed=3), 200).items())
     assert {n: t.num_rows for n, t in first.items()} != {n: t.num_rows for n, t in _tables().items()}
-    assert all(t.num_rows <= 200 for t in first.values())
+    # Only root entity tables are hash-capped; descendants follow via foreign-key closure.
+    assert first["parent"].num_rows <= 200
+    assert first["parent"].num_rows < _tables()["parent"].num_rows
     parents = set(first["parent"].column("id").to_pylist())
     pids = first["child"].column("pid").to_pylist()
     assert None in pids
@@ -149,6 +154,43 @@ def test_tier_s_derives_from_a_cached_export(offline: None, tmp_path: Path, spar
     assert verify(instance.manifest, frames) == []
     assert [t.row_count for t in instance.manifest.tables] == [300, 1_000, 2_000]
     assert materialize(FIXTURE, "s", tmp_path).content_hash == instance.content_hash
+    meta = json.loads((instance.path / META_FILE).read_text(encoding="utf-8"))
+    assert meta["subset_cap"] == REAL_SUBSET_CAP
+    assert meta["subset_method"] == REAL_SUBSET_METHOD
+
+
+def test_tier_s_rematerializes_when_subset_cap_differs(offline: None, tmp_path: Path) -> None:
+    full = instance_dir(FIXTURE, "full", tmp_path)
+    full.mkdir(parents=True)
+    write_instance(full, _tables(), FIXTURE.manifest(), 0)
+    first = materialize(FIXTURE, "s", tmp_path)
+    meta_path = first.path / META_FILE
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["subset_cap"] = 1
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    marker = first.path / "stale.marker"
+    marker.write_text("stale\n", encoding="utf-8")
+    second = materialize(FIXTURE, "s", tmp_path)
+    assert not marker.exists()
+    restored = json.loads((second.path / META_FILE).read_text(encoding="utf-8"))
+    assert restored["subset_cap"] == REAL_SUBSET_CAP
+    assert restored["subset_method"] == REAL_SUBSET_METHOD
+
+
+def test_tier_s_rematerializes_when_subset_meta_missing(offline: None, tmp_path: Path) -> None:
+    full = instance_dir(FIXTURE, "full", tmp_path)
+    full.mkdir(parents=True)
+    write_instance(full, _tables(), FIXTURE.manifest(), 0)
+    first = materialize(FIXTURE, "s", tmp_path)
+    meta_path = first.path / META_FILE
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.pop("subset_cap", None)
+    meta.pop("subset_method", None)
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    second = materialize(FIXTURE, "s", tmp_path)
+    restored = json.loads((second.path / META_FILE).read_text(encoding="utf-8"))
+    assert restored["subset_cap"] == REAL_SUBSET_CAP
+    assert restored["subset_method"] == REAL_SUBSET_METHOD
 
 
 @pytest.mark.network

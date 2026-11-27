@@ -89,6 +89,7 @@ class FakeScorer:
     relative_by_fraction: dict[float, float] = field(default_factory=dict)
     role: str = "baseline"
     raise_message: str | None = None
+    raise_seeds: tuple[int, ...] = ()
     crash_exit_code: int | None = None
     fail_datasets: tuple[str, ...] = ()
 
@@ -107,7 +108,7 @@ class FakeScorer:
         if not self.fail_datasets or dataset in self.fail_datasets:
             if self.crash_exit_code is not None:
                 os._exit(int(self.crash_exit_code))
-            if self.raise_message is not None:
+            if self.raise_message is not None and (not self.raise_seeds or seed in self.raise_seeds):
                 raise RuntimeError(self.raise_message)
         values: dict[str, Any] = {
             "reconstruction": self.reconstruction,
@@ -150,6 +151,7 @@ class FakeScorer:
             relative_by_fraction=dict(self.relative_by_fraction),
             role=role,
             raise_message=self.raise_message,
+            raise_seeds=tuple(self.raise_seeds),
             crash_exit_code=self.crash_exit_code,
             fail_datasets=tuple(self.fail_datasets),
         )
@@ -168,6 +170,7 @@ class FakeScorer:
             "relative_by_fraction": {str(frac): value for frac, value in self.relative_by_fraction.items()},
             "role": self.role,
             "raise_message": self.raise_message,
+            "raise_seeds": list(self.raise_seeds),
             "crash_exit_code": self.crash_exit_code,
             "fail_datasets": list(self.fail_datasets),
         }
@@ -194,6 +197,7 @@ def scorer_from_spec(spec: dict[str, Any]) -> Scorer:
             },
             role=str(spec.get("role", "baseline")),
             raise_message=spec.get("raise_message"),
+            raise_seeds=tuple(int(seed) for seed in list(spec.get("raise_seeds", []))),
             crash_exit_code=spec.get("crash_exit_code"),
             fail_datasets=tuple(str(name) for name in list(spec.get("fail_datasets", []))),
         )

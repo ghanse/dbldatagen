@@ -3,6 +3,7 @@ import math
 import pytest
 
 from profiler_bench.catalog import DATASETS, TIERS, generate
+from profiler_bench.catalog.hashing import table_hash
 from profiler_bench.catalog.registry import TIER_FILES
 
 
@@ -19,13 +20,14 @@ def _sizes(name: str, tier: str) -> dict[str, float]:
 
 
 def test_tiers_are_ordered() -> None:
-    assert list(TIERS) == ["xs", "s", "m"]
-    assert TIERS["xs"] < TIERS["s"] < TIERS["m"]
+    assert list(TIERS) == ["xs", "r", "s", "m"]
+    assert TIERS["xs"] < TIERS["r"] < TIERS["s"] < TIERS["m"]
+    assert TIERS["r"] == 25_000
     assert list(TIER_FILES) == list(TIERS)
 
 
 @pytest.mark.parametrize("name", sorted(DATASETS))
-@pytest.mark.parametrize("tier", ["xs", "s"])
+@pytest.mark.parametrize("tier", ["xs", "r", "s"])
 def test_generated_rows_match_the_size_formulas(name: str, tier: str) -> None:
     rows, expected = _rows(name, tier), _sizes(name, tier)
     assert set(rows) == set(expected)
@@ -35,16 +37,25 @@ def test_generated_rows_match_the_size_formulas(name: str, tier: str) -> None:
 
 @pytest.mark.parametrize("name", sorted(DATASETS))
 def test_m_tier_size_formulas_scale(name: str) -> None:
-    xs, s, m = (_sizes(name, tier) for tier in TIERS)
+    xs, r, s, m = (_sizes(name, tier) for tier in TIERS)
     assert max(m.values()) == pytest.approx(TIERS["m"], rel=0.05)
-    assert all(xs[t] <= s[t] <= m[t] for t in m)
+    assert all(xs[t] <= r[t] <= s[t] <= m[t] for t in m)
     assert sum(m.values()) > 10 * sum(s.values())
 
 
 @pytest.mark.parametrize("name", sorted(DATASETS))
 def test_largest_table_tracks_the_tier_size(name: str) -> None:
-    for tier in ("xs", "s"):
+    for tier in ("xs", "r", "s"):
         assert max(_rows(name, tier).values()) == pytest.approx(TIERS[tier], rel=0.05)
+
+
+@pytest.mark.parametrize("name", sorted(DATASETS))
+def test_tier_r_is_deterministic(name: str) -> None:
+    first, truth = generate(DATASETS[name], "r", 0)
+    second, again = generate(DATASETS[name], "r", 0)
+    assert truth.model_dump() == again.model_dump()
+    assert {n: table_hash(t) for n, t in first.items()} == {n: table_hash(t) for n, t in second.items()}
+    assert max(t.num_rows for t in first.values()) == pytest.approx(TIERS["r"], rel=0.05)
 
 
 @pytest.mark.slow

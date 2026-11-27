@@ -17,8 +17,8 @@ from profiler_bench.catalog.gen import STRUCTURE, Rng, rng_factory
 from profiler_bench.catalog.manifest import Column, ForeignKey, Manifest, Table
 
 
-TIERS: dict[str, int] = {"xs": 5_000, "s": 100_000, "m": 2_000_000}
-TIER_FILES: dict[str, int] = {"xs": 1, "s": 4, "m": 16}
+TIERS: dict[str, int] = {"xs": 5_000, "r": 25_000, "s": 100_000, "m": 2_000_000}
+TIER_FILES: dict[str, int] = {"xs": 1, "r": 2, "s": 4, "m": 16}
 DEFAULT_TIER = "s"
 FINGERPRINT_PACKAGES = ("numpy", "pandas", "pyarrow", "pyspark")
 
@@ -57,16 +57,23 @@ class Dataset:
     build: Callable[[int, Rng, Rng], Build]
     sizes: Callable[[int], dict[str, float]] | None = None
 
-    def fingerprint(self) -> str:
+    def fingerprint(self, tier: str = DEFAULT_TIER) -> str:
         """Returns a hash of the generator source, the shared catalog code, and the library versions.
 
         The fingerprint is part of the cache key, so editing a generator or upgrading numpy, pandas,
-        pyarrow, or pyspark invalidates the cache.
+        pyarrow, or pyspark invalidates the cache. Adding a tier does not change xs/s/m fingerprints:
+        the hashed registry payload keeps the pre-`r` tier tables, and only new tiers append their own
+        `(rows, files)` after that payload.
         """
-        sources = [inspect.getsourcefile(self.build), gen.__file__, manifest.__file__, __file__]
+        if tier not in TIERS:
+            raise KeyError(f"unknown tier {tier!r}; expected one of {sorted(TIERS)}")
+        sources = [inspect.getsourcefile(self.build), gen.__file__, manifest.__file__]
         digest = hashlib.sha256()
         for source in sources:
             digest.update(Path(str(source)).read_bytes())
+        digest.update(_registry_fingerprint_bytes())
+        if tier not in _LEGACY_TIERS:
+            digest.update(f"tier={tier};rows={TIERS[tier]};files={TIER_FILES[tier]}\n".encode())
         for package in FINGERPRINT_PACKAGES:
             digest.update(f"{package}=={version(package)}\n".encode())
         return digest.hexdigest()[:16]
@@ -168,3 +175,47 @@ def spark_type(arrow_type: pa.DataType) -> str:
     if pa.types.is_list(arrow_type):
         return f"array<{spark_type(arrow_type.value_type)}>"
     raise ValueError(f"unsupported Arrow type {arrow_type}")
+
+
+# fingerprint-payload-end
+# Code below is omitted from the registry fingerprint payload so adding tiers / rewiring
+# fingerprint() cannot invalidate existing xs/s/m catalog caches.
+
+_LEGACY_TIERS = frozenset({"xs", "s", "m"})
+_LEGACY_TIERS_ASSIGN = 'TIERS: dict[str, int] = {"xs": 5_000, "s": 100_000, "m": 2_000_000}'
+_LEGACY_TIER_FILES_ASSIGN = 'TIER_FILES: dict[str, int] = {"xs": 1, "s": 4, "m": 16}'
+_FINGERPRINT_PAYLOAD_END = "\n# fingerprint-payload-end\n"
+_LEGACY_FINGERPRINT_METHOD = '''    def fingerprint(self) -> str:
+        """Returns a hash of the generator source, the shared catalog code, and the library versions.
+
+        The fingerprint is part of the cache key, so editing a generator or upgrading numpy, pandas,
+        pyarrow, or pyspark invalidates the cache.
+        """
+        sources = [inspect.getsourcefile(self.build), gen.__file__, manifest.__file__, __file__]
+        digest = hashlib.sha256()
+        for source in sources:
+            digest.update(Path(str(source)).read_bytes())
+        for package in FINGERPRINT_PACKAGES:
+            digest.update(f"{package}=={version(package)}\\n".encode())
+        return digest.hexdigest()[:16]
+'''
+
+
+def _registry_fingerprint_bytes() -> bytes:
+    """Returns this module's bytes as hashed for fingerprints (pre-`r` tier tables, legacy method)."""
+    import re  # noqa: PLC0415
+
+    text = Path(__file__).read_text(encoding="utf-8")
+    if _FINGERPRINT_PAYLOAD_END not in text:
+        raise RuntimeError("registry fingerprint marker missing")
+    text = text.split(_FINGERPRINT_PAYLOAD_END, 1)[0].rstrip() + "\n"
+    text = re.sub(r"^TIERS: dict\[str, int\] = \{.*\}$", _LEGACY_TIERS_ASSIGN, text, count=1, flags=re.M)
+    text = re.sub(r"^TIER_FILES: dict\[str, int\] = \{.*\}$", _LEGACY_TIER_FILES_ASSIGN, text, count=1, flags=re.M)
+    text = re.sub(
+        r"    def fingerprint\(self.*?\n        return digest\.hexdigest\(\)\[:16\]\n\n",
+        lambda _match: _LEGACY_FINGERPRINT_METHOD + "\n",
+        text,
+        count=1,
+        flags=re.S,
+    )
+    return text.encode()

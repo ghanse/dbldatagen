@@ -52,12 +52,13 @@ def run_fidelity_samples(
 ) -> list[dict[str, Any]]:
     """Scores one representative profile per build/dataset in an isolated worker.
 
-    Each (role, dataset) cell runs in a fresh subprocess with its own SparkSession.
-    All K paired seeds for that cell share the process. A crash in one cell cannot
-    affect any other cell. Up to `parallelism` cells run at once; each cell writes only
-    its own sample files and records keep the serial order, so output does not depend
-    on `parallelism`. Datasets in `cached_baseline` reuse those baseline records. Real datasets read their
-    exports from the catalog cache `real_root`.
+    Each (role, dataset) cell runs in a fresh subprocess with one SparkSession reused
+    across all K paired seeds for that cell (full runtime conf restored between seeds).
+    Cross-cell isolation, timeouts, and per-seed failure records are unchanged. A crash
+    in one cell cannot affect any other cell. Up to `parallelism` cells run at once; each
+    cell writes only its own sample files and records keep the serial order, so output
+    does not depend on `parallelism`. Datasets in `cached_baseline` reuse those baseline
+    records. Real datasets read their exports from the catalog cache `real_root`.
     """
     tier = str(policy.get("fidelity_tier", "s"))
     k = int(policy.get("fidelity_seeds", 5))

@@ -5,9 +5,12 @@ keys, foreign keys, and privacy classes, and the logical hash of every exported 
 export. Real data has no planted ground truth, so its manifest is marked `ground_truth: none` and claims only
 that structure.
 
-Tiers: `full` is the export. `s` is a deterministic subset of it: a table with more than `TIERS["s"]` rows
-keeps the rows whose primary key (all non-nested columns when it has none) hashes below `TIERS["s"] / rows`;
-then, parents first, a row is dropped when a parent it references through a declared foreign key was dropped.
+Tiers: `full` is the export. `s` is a deterministic subset of it: each root entity table
+(`RealDataset.split_roots`, by default tables that reference no other table) with more than
+`REAL_SUBSET_CAP` rows (~50,000) keeps the rows whose primary key (all non-nested columns when it has none)
+hashes below `REAL_SUBSET_CAP / rows`; then, parents first, a descendant row is dropped when a parent it
+references through a declared foreign key was dropped. Full-export pinned hashes are unchanged. After the
+benchmark root-entity split, tier `s` of each part applies the same root-set cap so descendants follow.
 
 Exports use the Statement Execution API with `EXTERNAL_LINKS` and `ARROW_STREAM`. Each chunk's link is
 requested just before the chunk is downloaded; an expired link is requested again, up to `LINK_ATTEMPTS` times with
@@ -58,11 +61,13 @@ from pyspark.sql import DataFrame, SparkSession
 
 from profiler_bench.catalog.hashing import table_hash
 from profiler_bench.catalog.manifest import Column, ForeignKey, Manifest, Privacy, Table
-from profiler_bench.catalog.registry import TIER_FILES, TIERS, spark_type
+from profiler_bench.catalog.registry import TIER_FILES, spark_type
 from profiler_bench.catalog.store import META_FILE, Materialized, is_intact, read_instance, write_instance
 
 
 REAL_TIERS = ("s", "full")
+REAL_SUBSET_CAP = 50_000
+REAL_SUBSET_METHOD = "root_entity_hash"
 FULL_FILE_ROWS = 1_000_000
 POLL_SECONDS = 2.0
 RETRY_SECONDS = 2.0
@@ -84,7 +89,10 @@ SPLIT: dict[str, Any] = {
         "foreign key, in declared order, to a table connected to a root"
     ),
     "closure": "children first, parent rows referenced from a part are copied into it; no row is dropped",
-    "tier_s": "the tier-s subset of each part",
+    "tier_s": (
+        f"root-entity subset of each part: cap each root set at {REAL_SUBSET_CAP} "
+        f"({REAL_SUBSET_METHOD}); descendants follow via foreign-key closure"
+    ),
 }
 
 
@@ -250,24 +258,35 @@ def materialize(
         raise KeyError(f"unknown tier {tier!r}; expected one of {list(REAL_TIERS)}")
     target = instance_dir(dataset, tier, root)
     if (target / META_FILE).exists():
-        cached = is_intact(target, check_hash) and (tier != "full" or _pinned(dataset, read_instance(target)))
+        cached = (
+            is_intact(target, check_hash)
+            and _subset_meta_matches(target, tier)
+            and (tier != "full" or _pinned(dataset, read_instance(target)))
+        )
         if cached:
             return read_instance(target)
         shutil.rmtree(target)
     if tier == "full":
         tables = export(dataset, connect())
+        extra_meta = None
     else:
         full = materialize(dataset, "full", root, check_hash)
-        tables = subset(dataset, {t.name: full.read_table(t.name) for t in full.manifest.tables}, TIERS["s"])
-    _write(target, tables, dataset.manifest(tier, tables))
+        tables = subset(dataset, {t.name: full.read_table(t.name) for t in full.manifest.tables}, REAL_SUBSET_CAP)
+        extra_meta = {"subset_cap": REAL_SUBSET_CAP, "subset_method": REAL_SUBSET_METHOD}
+    _write(target, tables, dataset.manifest(tier, tables), extra_meta=extra_meta)
     return read_instance(target)
 
 
-def _write(target: Path, tables: Mapping[str, pa.Table], truth: Manifest) -> None:
+def _write(
+    target: Path,
+    tables: Mapping[str, pa.Table],
+    truth: Manifest,
+    extra_meta: dict[str, object] | None = None,
+) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(dir=target.parent, prefix=".tmp-"))
     try:
-        write_instance(staging, dict(tables), truth, 0)
+        write_instance(staging, dict(tables), truth, 0, extra_meta=extra_meta)
         staging.rename(target)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
@@ -298,7 +317,7 @@ def materialize_part(
         raise KeyError(f"unknown tier {tier!r} or part {part!r}; expected {list(REAL_TIERS)} and {list(PARTS)}")
     target = part_dir(dataset, tier, part, root)
     if (target / META_FILE).exists():
-        if is_intact(target, check_hash):
+        if is_intact(target, check_hash) and _subset_meta_matches(target, tier):
             return read_instance(target)
         shutil.rmtree(target)
     if tier == "full":
@@ -314,9 +333,29 @@ def materialize_part(
         (split_dir(dataset, root) / SPLIT_REPORT).write_text(report, encoding="utf-8")
     else:
         whole = materialize_part(dataset, "full", part, root, check_hash)
-        tables = subset(dataset, {t.name: whole.read_table(t.name) for t in whole.manifest.tables}, TIERS["s"])
-        _write(target, tables, dataset.manifest(tier, tables))
+        tables = subset(dataset, {t.name: whole.read_table(t.name) for t in whole.manifest.tables}, REAL_SUBSET_CAP)
+        _write(
+            target,
+            tables,
+            dataset.manifest(tier, tables),
+            extra_meta={"subset_cap": REAL_SUBSET_CAP, "subset_method": REAL_SUBSET_METHOD},
+        )
     return read_instance(target)
+
+
+def _subset_meta_matches(target: Path, tier: str) -> bool:
+    """Returns whether a cached real instance was built with the current subset cap and method.
+
+    Full exports have no subset metadata. Tier-s materializations without a recorded cap (pre-50k
+    caches) or with a different cap/method must be rematerialized.
+    """
+    if tier == "full":
+        return True
+    try:
+        meta = json.loads((target / META_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    return bool(meta.get("subset_cap") == REAL_SUBSET_CAP and meta.get("subset_method") == REAL_SUBSET_METHOD)
 
 
 def load_part(
@@ -425,19 +464,24 @@ def _pinned(dataset: RealDataset, instance: Materialized) -> bool:
 
 
 def subset(dataset: RealDataset, tables: Mapping[str, pa.Table], cap: int) -> dict[str, pa.Table]:
-    """Returns the deterministic tier-s subset of `tables`, closed under the declared foreign keys.
+    """Returns the deterministic tier-s subset of `tables`, capped on root entities.
+
+    Each root table (`split_roots`, or tables with no parents) with more than `cap` rows is hash-filtered.
+    Descendants are not independently capped: they remain only when they still reference a kept parent
+    through a declared foreign key (parents first).
 
     Args:
         dataset: Real dataset the tables belong to.
         tables: Full tables by name.
-        cap: Most rows a table keeps before foreign-key closure.
+        cap: Most rows a root entity table keeps before foreign-key closure.
     """
     specs = {t.name: t for t in dataset.tables}
     parents = {name: {fk.parent_table for fk in dataset.foreign_keys if fk.child_table == name} for name in specs}
+    roots = set(dataset.split_roots) or {name for name, found in parents.items() if not found}
     kept: dict[str, pa.Table] = {}
     for name in TopologicalSorter(parents).static_order():
         table = tables[name]
-        if table.num_rows > cap:
+        if name in roots and table.num_rows > cap:
             columns = specs[name].primary_key or [f.name for f in table.schema if not pa.types.is_nested(f.type)]
             table = table.filter(_hash_below(table, columns, name, cap / table.num_rows))
         for fk in (fk for fk in dataset.foreign_keys if fk.child_table == name):

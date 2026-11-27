@@ -132,6 +132,16 @@ def java_version() -> str:
 def dataset_identity(dataset: str, tier: str, seed: int, root: Path | None) -> dict[str, Any]:
     """Returns the catalog generator fingerprint and instance content hash, or a real dataset's pins and split."""
     if dataset in REAL_DATASETS:
-        return {"real_pinned_hashes": dict(REAL_DATASETS[dataset].hashes), "real_split": SPLIT}
+        from profiler_bench.catalog.real import REAL_SUBSET_CAP, REAL_SUBSET_METHOD  # noqa: PLC0415
+
+        return {
+            "real_pinned_hashes": dict(REAL_DATASETS[dataset].hashes),
+            "real_split": SPLIT,
+            "real_subset_cap": REAL_SUBSET_CAP,
+            "real_subset_method": REAL_SUBSET_METHOD,
+        }
     instance = materialize(dataset, tier, seed=seed, root=root, check_hash=False)
-    return {"catalog_fingerprint": get(dataset).fingerprint(), "catalog_content_hash": instance.content_hash}
+    return {
+        "catalog_fingerprint": get(dataset).fingerprint(tier),
+        "catalog_content_hash": instance.content_hash,
+    }

@@ -22,7 +22,8 @@ dependency values, quasi-identifier uniqueness, and foreign-key coverage and fan
 | Tier | Base rows | Use |
 |---|---|---|
 | `xs` | 5,000 | unit tests |
-| `s` | 100,000 | default RSI loop tier |
+| `r` | 25,000 | screening stage (cheap pre-filter) |
+| `s` | 100,000 | default RSI loop / official fidelity tier |
 | `m` | 2,000,000 | speed tier |
 
 The base row count is the size of each dataset's largest table; the other tables scale with it, and
@@ -122,8 +123,8 @@ any network or authentication failure, the export raises `Unavailable` with the 
 
 | Tier | Contents |
 |---|---|
-| `full` | the export |
-| `s` | a table over 100,000 rows keeps the rows whose primary key (all non-nested columns without one) hashes below `100,000 / rows`; then, parents first, rows that reference a dropped parent through a declared foreign key are dropped |
+| `full` | the export (pinned logical hashes unchanged) |
+| `s` | a deterministic root-entity subset capped at `REAL_SUBSET_CAP` (~50,000 rows): each root table over that cap keeps the rows whose primary key (all non-nested columns without one) hashes below `cap / rows`; descendants are not independently capped and remain only when they still reference a kept parent through a declared foreign key. After the benchmark root-entity split, the same cap applies to each part's root set |
 
 Real data has no planted truth. Its manifest is marked `ground_truth: none` and claims only the schema, row counts,
 documented primary, unique, and foreign keys that hold in the data, and privacy classes; it makes no distribution
@@ -395,7 +396,7 @@ The reference sampler is designed for benchmark tiers up to `s` (about 100,000 r
 harness. Each build is a git worktree plus commit; the **speed** worker imports that worktree's `profiler/src` via
 `PYTHONPATH` in a **fresh subprocess**. Speed samples time `profile_tables` (driver wall, process CPU, peak RSS)
 after an untimed warmup, rotate baseline/candidate order across cases, and record profile hashes under the policy's
-timed Spark config (unchanged by fidelity settings). The default policy (version 2.1.0) times speed on `local[8]` with
+timed Spark config (unchanged by fidelity settings). The default policy (version 2.2.0) times speed on `local[8]` with
 an 8 GiB driver (other confs unchanged; 1.x used `local[2]` and 2 GiB). Speed results under 1.x are not comparable
 with 2.0.0; old experiments re-evaluate against the policy recorded in their own `run.json`. The speed baselines in
 `profiler/rsi/BASELINE.md` were measured under 1.x and must be re-measured (P1.8e). The nested tier-m OOM at 2 GiB is
@@ -406,10 +407,12 @@ count actually used as `speed_samples_effective`, and the evaluator's expected m
 this field use the policy's `speed_samples`). Fidelity samples take one
 profile per build/dataset at the fidelity tier and score it with the reference sampler and fidelity metrics for K
 **paired** sampler seeds. Each
-`(build, dataset)` cell runs in its own fidelity worker subprocess with a fresh SparkSession (profile in via file,
-score JSON out via file; all K seeds share that process; default per-cell timeout 45 minutes via
-`ExperimentConfig.fidelity_cell_timeout_s`, recorded as `fidelity_cell_timeout_s`). On timeout the parent SIGTERMs
-then SIGKILLs the worker process group so orphan JVMs cannot survive. Builds rotate per dataset the same way speed
+`(build, dataset)` cell runs in its own fidelity worker subprocess with one SparkSession reused across all K seeds
+(profile in via file, score JSON out via file; cross-cell isolation and per-seed failure records unchanged; default
+per-cell timeout 45 minutes via `ExperimentConfig.fidelity_cell_timeout_s`, recorded as `fidelity_cell_timeout_s`).
+Results are byte-identical to creating a fresh session per seed; set `PROFILER_BENCH_FIDELITY_SESSION=fresh` only for
+equivalence or timing measurements. Speed samples keep one fresh process per sample so timing does not change. On
+timeout the parent SIGTERMs then SIGKILLs the worker process group so orphan JVMs cannot survive. Builds rotate per dataset the same way speed
 samples do. Up to `fidelity_parallelism` cells (policy default 3) run at once, each on `local[4]` with an 8 GiB
 driver; each cell writes only its own sample files and records keep the serial order, so results are byte-identical
 to serial execution. Fidelity always starts after every speed sample has finished, and speed samples run one at a
@@ -478,9 +481,23 @@ uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi run \
   --baseline /path/to/baseline --candidate /path/to/candidate \
   --policy profiler-bench/policies/default.json --experiment-id demo [--datasets retail numeric] [--control] \
   [--suite synthetic|real|all]
+uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi screen \
+  --baseline /path/to/baseline --candidate /path/to/candidate \
+  --policy profiler-bench/policies/default.json --experiment-id demo-screen
 uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi evaluate \
   profiler/rsi/experiments/demo
 ```
+
+### Screening stage
+
+Accuracy proposals can run a cheap **screen** before the official tier-`s` run: `python -m profiler_bench.rsi screen`
+(or `run --stage screen`). The policy's `screen` section (tier `r`, 3 fidelity seeds, margin 0.5, 2 smoke speed
+samples on `r`) overrides sampling for that experiment; `run.json` records `stage: screen` and the effective policy
+(including loosened accuracy thresholds). Screening uses the synthetic catalog only and never returns `accepted`:
+verdicts are `screen_pass` (would plausibly pass under the loosened margins, including borderline / inconclusive
+cases) or `screen_fail` (a rejection, including any privacy failure). A `screen_pass` proceeds to the full official
+run (tier `s`, 5 seeds, and the real holdout suite when that suite is enabled). Old experiments still re-evaluate
+under the policy recorded in their own `run.json`.
 
 ### Data-volume objective
 

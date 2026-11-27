@@ -23,7 +23,7 @@ from profiler_bench.runner.identity import (
     machine_info,
 )
 from profiler_bench.runner.measure import check_profile_determinism, run_speed_samples
-from profiler_bench.runner.policy import effective_speed_samples, load_policy
+from profiler_bench.runner.policy import apply_screen_overrides, effective_speed_samples, load_policy
 from profiler_bench.runner.scorer import FakeScorer, Scorer, try_real_scorer
 from profiler_bench.runner.spark_conf import (
     DEFAULT_FIDELITY_DRIVER_MEMORY,
@@ -52,6 +52,7 @@ class ExperimentConfig:
         fidelity_cell_timeout_s: Wall-clock timeout for one (build, dataset) fidelity worker.
         baseline_cache: Reuse and store baseline-build samples across experiments.
         baseline_cache_dir: Baseline cache location; defaults to `profiler/rsi/experiments/.cache/baseline`.
+        stage: `official` (default) or `screen` (tier-r screening; accuracy proposals only; synthetic only).
         suite: `synthetic` (the catalog generators), `real` (the real datasets, a holdout check), or `all`.
     """
 
@@ -71,6 +72,7 @@ class ExperimentConfig:
     fidelity_cell_timeout_s: float = DEFAULT_FIDELITY_CELL_TIMEOUT_S
     baseline_cache: bool = True
     baseline_cache_dir: Path | None = None
+    stage: str = "official"
     suite: str = "synthetic"
 
 
@@ -150,9 +152,22 @@ def _recorded_command(command: Sequence[str], repo_root: Path) -> list[str]:
     return [_recorded_path(arg, repo_root) if Path(arg).is_absolute() else arg for arg in command]
 
 
+def _resolve_stage_policy(config: ExperimentConfig) -> tuple[str, dict[str, Any]]:
+    """Returns `(stage, policy)` with screen overrides applied when requested."""
+    stage = str(config.stage or "official")
+    if stage not in {"official", "screen"}:
+        raise ValueError(f"unknown stage {stage!r}; expected 'official' or 'screen'")
+    if stage == "screen" and config.suite != "synthetic":
+        raise ValueError("screening stage is synthetic-only")
+    policy = load_policy(config.policy_path)
+    if stage == "screen":
+        policy = apply_screen_overrides(policy)
+    return stage, policy
+
+
 def run_experiment(config: ExperimentConfig) -> Path:
     """Runs the experiment and returns the experiment directory path."""
-    policy = load_policy(config.policy_path)
+    stage, policy = _resolve_stage_policy(config)
     repo_root = (config.repo_root or Path(__file__).resolve().parents[4]).resolve()
     out = experiment_dir(config.experiment_id, repo_root)
     if out.exists():
@@ -177,8 +192,10 @@ def run_experiment(config: ExperimentConfig) -> Path:
     proposal = config.proposal or {"type": "accuracy", "targets": datasets}
     (out / "proposal.json").write_text(json.dumps(proposal, indent=2, sort_keys=True) + "\n")
     proposal_type = str(proposal.get("type", "accuracy"))
+    if stage == "screen" and proposal_type != "accuracy":
+        raise ValueError("screening stage supports accuracy proposals only")
     all_speed_n = effective_speed_samples(policy, proposal_type)
-    speed_n = {tier: all_speed_n[tier] for tier in speed_tiers}
+    speed_n = {tier: all_speed_n.get(tier, 0) for tier in speed_tiers}
     if speed_n[fidelity_tier] < 1:
         raise ValueError(f"fidelity tier {fidelity_tier!r} needs at least one speed sample for its profile")
     dataset_seed = int(policy.get("dataset_seed", 0))
@@ -202,34 +219,21 @@ def run_experiment(config: ExperimentConfig) -> Path:
     scorer_baseline, scorer_candidate = _role_scorers(scorer)
 
     cache_root = (config.baseline_cache_dir or out.parent / ".cache" / "baseline") if config.baseline_cache else None
-    speed_keys, fidelity_keys = (
-        _merged_keys(
-            [
-                _cache_keys(
-                    baseline=baseline,
-                    harness=harness,
-                    policy=policy,
-                    datasets=names,
-                    speed_n=tiers,
-                    fidelity_tier=fidelity_tier,
-                    fidelity_spark=fidelity_spark,
-                    scorer=scorer_baseline,
-                    cache_speed=proposal_type == "accuracy",
-                    catalog_root=config.cache_dir,
-                )
-                for names, tiers in ((datasets, speed_n), (real_datasets, real_speed_n))
-            ]
-        )
-        if cache_root is not None
-        else ({}, {})
+    speed_keys, fidelity_keys, speed_hits, fidelity_hits, hits = _baseline_cache_state(
+        cache_root=cache_root,
+        baseline=baseline,
+        harness=harness,
+        policy=policy,
+        datasets=datasets,
+        real_datasets=real_datasets,
+        speed_n=speed_n,
+        real_speed_n=real_speed_n,
+        fidelity_tier=fidelity_tier,
+        fidelity_spark=fidelity_spark,
+        scorer=scorer_baseline,
+        cache_speed=proposal_type == "accuracy",
+        catalog_root=config.cache_dir,
     )
-    speed_hits = _cache_hits(cache_root, speed_keys)
-    fidelity_hits = _cache_hits(cache_root, fidelity_keys)
-    hits = [
-        {"case": f"{kind}/{dataset}/{tier}", "source": entry["source_experiment_id"]}
-        for kind, found in (("speed", speed_hits), ("fidelity", fidelity_hits))
-        for (dataset, tier), entry in found.items()
-    ]
 
     real_meta = {
         "real_datasets": real_datasets,
@@ -243,6 +247,7 @@ def run_experiment(config: ExperimentConfig) -> Path:
         **(real_meta if config.suite != "synthetic" else {}),
         "experiment_id": config.experiment_id,
         "control": config.control,
+        "stage": stage,
         "datasets": datasets,
         "speed_tiers": speed_tiers,
         "speed_samples_effective": speed_n,
@@ -312,6 +317,60 @@ def run_experiment(config: ExperimentConfig) -> Path:
 
     evaluate_experiment(out)
     return out
+
+
+def _baseline_cache_state(
+    *,
+    cache_root: Path | None,
+    baseline: BuildIdentity,
+    harness: HarnessIdentity,
+    policy: dict[str, Any],
+    datasets: Sequence[str],
+    real_datasets: Sequence[str],
+    speed_n: dict[str, int],
+    real_speed_n: dict[str, int],
+    fidelity_tier: str,
+    fidelity_spark: dict[str, Any],
+    scorer: Scorer,
+    cache_speed: bool,
+    catalog_root: Path | None,
+) -> tuple[
+    dict[tuple[str, str], dict[str, Any]],
+    dict[tuple[str, str], dict[str, Any]],
+    dict[Any, dict[str, Any]],
+    dict[Any, dict[str, Any]],
+    list[dict[str, str]],
+]:
+    """Returns `(speed_keys, fidelity_keys, speed_hits, fidelity_hits, hits)` for baseline reuse."""
+    speed_keys, fidelity_keys = (
+        _merged_keys(
+            [
+                _cache_keys(
+                    baseline=baseline,
+                    harness=harness,
+                    policy=policy,
+                    datasets=names,
+                    speed_n=tiers,
+                    fidelity_tier=fidelity_tier,
+                    fidelity_spark=fidelity_spark,
+                    scorer=scorer,
+                    cache_speed=cache_speed,
+                    catalog_root=catalog_root,
+                )
+                for names, tiers in ((datasets, speed_n), (real_datasets, real_speed_n))
+            ]
+        )
+        if cache_root is not None
+        else ({}, {})
+    )
+    speed_hits = _cache_hits(cache_root, speed_keys)
+    fidelity_hits = _cache_hits(cache_root, fidelity_keys)
+    hits = [
+        {"case": f"{kind}/{dataset}/{tier}", "source": entry["source_experiment_id"]}
+        for kind, found in (("speed", speed_hits), ("fidelity", fidelity_hits))
+        for (dataset, tier), entry in found.items()
+    ]
+    return speed_keys, fidelity_keys, speed_hits, fidelity_hits, hits
 
 
 def _cache_keys(
