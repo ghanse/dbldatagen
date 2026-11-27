@@ -12,10 +12,125 @@ from pyspark.sql import types as T
 from dbldatagen_profiler.engines.spark import engine as spark_engine
 from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
 from dbldatagen_profiler.engines.spark.engine import _histogram, _logical_type, _numeric_stats, _pearson_pairs
-from dbldatagen_profiler.model import LogicalType, PrivacyPolicy, ValueTreatment, profile_json_schema
+from dbldatagen_profiler.model import LogicalType, PrivacyPolicy, TableProfile, ValueTreatment, profile_json_schema
 
 
 pytestmark = [pytest.mark.spark, pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")]
+
+
+def _wide_varied_frame(spark: SparkSession) -> DataFrame:
+    expressions = []
+    for index in range(9):
+        null = "id % 13 = 0"
+        expressions.extend(
+            [
+                f"IF({null}, NULL, {'4611686018427387904' if index % 2 == 0 else '-4611686018427387904'} "
+                f"+ id * 10000000000000000 + {index})::BIGINT AS long{index}_id",
+                f"IF({null}, NULL, "
+                f"{'12345678901234567890.1234567890' if index % 2 == 0 else '-12345678901234567890.1234567890'} "
+                f"+ id * 10000000000000000 + {index})::DECIMAL(38,10) AS decimal{index}_id",
+                f"IF({null}, NULL, ({index + 1}) * 1e9 + SIN(id + {index}) * 1e9 + id / 7.0)::DOUBLE "
+                f"AS double{index}_id",
+                f"IF({null}, NULL, DATE_ADD(DATE '2000-01-01', CAST((id + {index}) % 365 AS INT))) "
+                f"AS date{index}_id",
+                f"IF({null}, NULL, TIMESTAMP_MICROS(946684800000000 + (id + {index}) * 1000001)) "
+                f"AS timestamp{index}_id",
+                f"IF({null}, NULL, CONCAT('s', (id + {index}) % 17, "
+                f"REPEAT('x', CAST((id + {index}) % 7 AS INT)))) AS string{index}_id",
+                f"IF({null}, NULL, CAST((id + {index}) % 4 AS INT)) AS category{index}_id",
+            ]
+        )
+    return spark.range(100).selectExpr(*expressions)
+
+
+def _exact_aggregate_statistics(table: TableProfile) -> dict[str, object]:
+    result: dict[str, object] = {"row_count": table.row_count, "columns": []}
+    columns = result["columns"]
+    assert isinstance(columns, list)
+    for column in table.columns:
+        exact: dict[str, object] = {
+            "name": column.name,
+            "null_count": round(table.row_count * column.null_fraction),
+            "null_fraction": column.null_fraction,
+            "distinct_count": column.distinct_count,
+        }
+        if column.numeric is not None:
+            exact["numeric"] = {
+                "min": column.numeric.min,
+                "max": column.numeric.max,
+                "quantiles": column.numeric.quantiles,
+                "histogram": column.numeric.histogram,
+            }
+        if column.temporal is not None:
+            exact["temporal"] = column.temporal
+        if column.string is not None and column.string.length is not None:
+            exact["string_length"] = {
+                "min": column.string.length.min,
+                "max": column.string.length.max,
+            }
+        columns.append(exact)
+    return result
+
+
+def _assert_averages_close(actual: TableProfile, expected: TableProfile) -> None:
+    for actual_column, expected_column in zip(actual.columns, expected.columns, strict=True):
+        actual_values: list[float | None] = []
+        expected_values: list[float | None] = []
+        if actual_column.numeric is not None and expected_column.numeric is not None:
+            actual_values.extend((actual_column.numeric.mean, actual_column.numeric.stddev))
+            expected_values.extend((expected_column.numeric.mean, expected_column.numeric.stddev))
+        for name in ("string", "collection_length"):
+            actual_stats = getattr(actual_column, name)
+            expected_stats = getattr(expected_column, name)
+            if name == "string":
+                actual_stats = actual_stats.length if actual_stats is not None else None
+                expected_stats = expected_stats.length if expected_stats is not None else None
+            if actual_stats is not None and expected_stats is not None:
+                actual_values.extend((actual_stats.mean, actual_stats.stddev))
+                expected_values.extend((expected_stats.mean, expected_stats.stddev))
+        if actual_column.boolean is not None and expected_column.boolean is not None:
+            actual_values.append(actual_column.boolean.true_fraction)
+            expected_values.append(expected_column.boolean.true_fraction)
+        for actual_value, expected_value in zip(actual_values, expected_values, strict=True):
+            if actual_value is None or expected_value is None:
+                assert actual_value is expected_value
+            else:
+                assert actual_value == pytest.approx(expected_value, rel=1e-12, abs=0.0)
+
+
+def test_wide_profile_statistics_are_invariant_across_aggregate_chunk_sizes(spark: SparkSession) -> None:
+    frame = _wide_varied_frame(spark)
+
+    profiles = [
+        spark_engine._profile_table("wide", frame, PrivacyPolicy(), None, None, aggregate_columns_per_chunk=chunk_size)
+        for chunk_size in (1, 7, 25, len(frame.columns))
+    ]
+
+    expected = profiles[-1]
+    assert all(_exact_aggregate_statistics(profile) == _exact_aggregate_statistics(expected) for profile in profiles)
+    for profile in profiles[:-1]:
+        _assert_averages_close(profile, expected)
+
+
+def test_default_chunks_produce_byte_identical_profiles_across_runs(spark: SparkSession) -> None:
+    frame = _wide_varied_frame(spark)
+
+    profiles = [profile_dataframe("wide", frame, detect_pii=False) for _ in range(2)]
+    normalized = [
+        profile.model_copy(update={"created_at": datetime(2000, 1, 1, tzinfo=timezone.utc)}) for profile in profiles
+    ]
+
+    assert normalized[0].model_dump_json() == normalized[1].model_dump_json()
+
+
+def test_chunked_aggregate_merge_order_follows_schema(spark: SparkSession) -> None:
+    frame = spark.range(20).selectExpr("id AS z", "id + 1 AS a", "id + 2 AS m")
+
+    values = spark_engine._collect_column_aggregates(frame, columns_per_chunk=1)
+
+    prefixes = [key.split("_", 1)[0] for key in values]
+    assert prefixes[0] == ""
+    assert list(dict.fromkeys(prefixes[1:])) == ["c0", "c1", "c2"]
 
 
 @pytest.mark.parametrize(

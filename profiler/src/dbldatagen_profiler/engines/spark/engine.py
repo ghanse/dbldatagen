@@ -74,6 +74,10 @@ _HISTOGRAM_MAX_DISTINCT = 64
 _MAX_PEARSON_PAIRS = 64
 _MAX_PEARSON_CORRELATION = 0.999
 
+# Keep wide-table aggregate plans small enough for Spark to optimize and codegen
+# efficiently. Each chunk is evaluated independently in schema order.
+_AGGREGATE_COLUMNS_PER_CHUNK = 25
+
 
 def profile_tables(
     tables: Mapping[str, DataFrame],
@@ -143,11 +147,9 @@ def _profile_table(
     privacy: PrivacyPolicy,
     analysis: tuple[dict[str, Any], list[tuple[list[str], float, int]]] | None,
     pii_policy: PiiPolicy | None,
+    aggregate_columns_per_chunk: int = _AGGREGATE_COLUMNS_PER_CHUNK,
 ) -> TableProfile:
     semantics, quasi_sets = analysis or ({}, [])
-    expressions: list[Column] = [F.count(F.lit(1)).alias("__row_count")]
-    for index, field in enumerate(df.schema.fields):
-        expressions.extend(_aggregate_expressions(df[field.name], field.dataType, index))
     pairs = _pearson_pairs(df)
     pearson_expressions: list[Column] = []
     for pair_index, (_, _, left, right) in enumerate(pairs):
@@ -166,7 +168,7 @@ def _profile_table(
     values = _with_value_counts(
         df,
         [(f"c{index}", df[field.name], field.dataType) for index, field in enumerate(df.schema.fields)],
-        _collect_aggregate(df, expressions),
+        _collect_column_aggregates(df, aggregate_columns_per_chunk),
     )
     if pearson_expressions:
         values.update(_collect_aggregate(df, pearson_expressions))
@@ -190,6 +192,29 @@ def _profile_table(
         dependencies=dependencies or None,
         quasi_identifier_sets=quasi or None,
     )
+
+
+def _collect_column_aggregates(df: DataFrame, columns_per_chunk: int = _AGGREGATE_COLUMNS_PER_CHUNK) -> dict[str, Any]:
+    """Collects bounded aggregate plans in schema order, rescanning ``df`` for each chunk.
+
+    The input is deliberately not cached: materializing every table adds memory and
+    lifecycle overhead, while measured scans of the catalog's columnar inputs were faster.
+    """
+    if columns_per_chunk < 1:
+        raise ValueError("columns_per_chunk must be positive")
+
+    values: dict[str, Any] = {}
+    fields = df.schema.fields
+    for start in range(0, len(fields), columns_per_chunk):
+        expressions = ([F.count(F.lit(1)).alias("__row_count")] if start == 0 else []) + [
+            expression
+            for index, field in enumerate(fields[start : start + columns_per_chunk], start=start)
+            for expression in _aggregate_expressions(df[field.name], field.dataType, index)
+        ]
+        values.update(_collect_aggregate(df, expressions))
+    if not fields:
+        values.update(_collect_aggregate(df, [F.count(F.lit(1)).alias("__row_count")]))
+    return values
 
 
 def _pearson_pairs(df: DataFrame) -> list[tuple[str, str, Column, Column]]:

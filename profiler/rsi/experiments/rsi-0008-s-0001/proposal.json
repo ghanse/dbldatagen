@@ -1,0 +1,9 @@
+{
+  "proposal_id": "rsi-0008",
+  "targets": {
+    "datasets": [
+      "nested"
+    ]
+  },
+  "type": "speed"
+}
