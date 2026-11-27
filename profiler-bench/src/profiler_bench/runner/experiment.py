@@ -219,34 +219,21 @@ def run_experiment(config: ExperimentConfig) -> Path:
     scorer_baseline, scorer_candidate = _role_scorers(scorer)
 
     cache_root = (config.baseline_cache_dir or out.parent / ".cache" / "baseline") if config.baseline_cache else None
-    speed_keys, fidelity_keys = (
-        _merged_keys(
-            [
-                _cache_keys(
-                    baseline=baseline,
-                    harness=harness,
-                    policy=policy,
-                    datasets=names,
-                    speed_n=tiers,
-                    fidelity_tier=fidelity_tier,
-                    fidelity_spark=fidelity_spark,
-                    scorer=scorer_baseline,
-                    cache_speed=proposal_type == "accuracy",
-                    catalog_root=config.cache_dir,
-                )
-                for names, tiers in ((datasets, speed_n), (real_datasets, real_speed_n))
-            ]
-        )
-        if cache_root is not None
-        else ({}, {})
+    speed_keys, fidelity_keys, speed_hits, fidelity_hits, hits = _baseline_cache_state(
+        cache_root=cache_root,
+        baseline=baseline,
+        harness=harness,
+        policy=policy,
+        datasets=datasets,
+        real_datasets=real_datasets,
+        speed_n=speed_n,
+        real_speed_n=real_speed_n,
+        fidelity_tier=fidelity_tier,
+        fidelity_spark=fidelity_spark,
+        scorer=scorer_baseline,
+        cache_speed=proposal_type == "accuracy",
+        catalog_root=config.cache_dir,
     )
-    speed_hits = _cache_hits(cache_root, speed_keys)
-    fidelity_hits = _cache_hits(cache_root, fidelity_keys)
-    hits = [
-        {"case": f"{kind}/{dataset}/{tier}", "source": entry["source_experiment_id"]}
-        for kind, found in (("speed", speed_hits), ("fidelity", fidelity_hits))
-        for (dataset, tier), entry in found.items()
-    ]
 
     real_meta = {
         "real_datasets": real_datasets,
@@ -330,6 +317,60 @@ def run_experiment(config: ExperimentConfig) -> Path:
 
     evaluate_experiment(out)
     return out
+
+
+def _baseline_cache_state(
+    *,
+    cache_root: Path | None,
+    baseline: BuildIdentity,
+    harness: HarnessIdentity,
+    policy: dict[str, Any],
+    datasets: Sequence[str],
+    real_datasets: Sequence[str],
+    speed_n: dict[str, int],
+    real_speed_n: dict[str, int],
+    fidelity_tier: str,
+    fidelity_spark: dict[str, Any],
+    scorer: Scorer,
+    cache_speed: bool,
+    catalog_root: Path | None,
+) -> tuple[
+    dict[tuple[str, str], dict[str, Any]],
+    dict[tuple[str, str], dict[str, Any]],
+    dict[Any, dict[str, Any]],
+    dict[Any, dict[str, Any]],
+    list[dict[str, str]],
+]:
+    """Returns `(speed_keys, fidelity_keys, speed_hits, fidelity_hits, hits)` for baseline reuse."""
+    speed_keys, fidelity_keys = (
+        _merged_keys(
+            [
+                _cache_keys(
+                    baseline=baseline,
+                    harness=harness,
+                    policy=policy,
+                    datasets=names,
+                    speed_n=tiers,
+                    fidelity_tier=fidelity_tier,
+                    fidelity_spark=fidelity_spark,
+                    scorer=scorer,
+                    cache_speed=cache_speed,
+                    catalog_root=catalog_root,
+                )
+                for names, tiers in ((datasets, speed_n), (real_datasets, real_speed_n))
+            ]
+        )
+        if cache_root is not None
+        else ({}, {})
+    )
+    speed_hits = _cache_hits(cache_root, speed_keys)
+    fidelity_hits = _cache_hits(cache_root, fidelity_keys)
+    hits = [
+        {"case": f"{kind}/{dataset}/{tier}", "source": entry["source_experiment_id"]}
+        for kind, found in (("speed", speed_hits), ("fidelity", fidelity_hits))
+        for (dataset, tier), entry in found.items()
+    ]
+    return speed_keys, fidelity_keys, speed_hits, fidelity_hits, hits
 
 
 def _cache_keys(
