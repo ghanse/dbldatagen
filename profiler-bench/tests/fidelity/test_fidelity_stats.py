@@ -1,3 +1,5 @@
+import itertools
+import math
 import re
 import time
 
@@ -6,6 +8,7 @@ import pandas as pd
 import pytest
 
 from profiler_bench.fidelity import regex, stats
+from profiler_bench.fidelity.scores import log_loss_gap
 
 
 def test_identical_samples_have_zero_distance() -> None:
@@ -50,21 +53,76 @@ def test_auc_counts_ties_as_half() -> None:
     assert stats.auc(np.array([0.1, 0.9]), np.array([0, 1])) == 1.0
 
 
+def _discriminate(real: np.ndarray, synth: np.ndarray, categorical: np.ndarray | None = None) -> stats.Discrimination:
+    rows = [pd.Series(np.arange(len(real)))]
+    folds = (stats.entity_folds(rows, 0), stats.entity_folds([pd.Series(np.arange(len(synth)))], 0))
+    flags = np.zeros(real.shape[1], dtype=bool) if categorical is None else categorical
+    result = stats.discriminate(real, synth, flags, folds, 0, 100, 50, 10)
+    assert result is not None
+    return result
+
+
 def test_discriminator_cannot_tell_identical_samples_apart() -> None:
-    x = np.random.default_rng(0).normal(size=(400, 3))
-    assert stats.discriminator_auc(x, x.copy(), np.zeros(3, dtype=bool), 0, 50) == 0.5
+    x = np.random.default_rng(0).normal(size=(2000, 3))
+    result = _discriminate(x, x.copy())
+    assert result.auc == 0.5
+    assert result.log_loss == pytest.approx(math.log(2))
 
 
-def test_discriminator_separates_shifted_samples() -> None:
+def test_discriminator_on_two_samples_of_one_distribution_stays_near_ln2() -> None:
     rng = np.random.default_rng(0)
-    real, synth = rng.normal(size=(400, 2)), rng.normal(size=(400, 2)) + 3
-    assert stats.discriminator_auc(real, synth, np.zeros(2, dtype=bool), 0, 50) > 0.95
+    losses = [_discriminate(rng.normal(size=(2000, 3)), rng.normal(size=(2000, 3))).log_loss for _ in range(3)]
+    assert all(abs(loss - math.log(2)) < 0.02 for loss in losses)
+
+
+def test_log_loss_gap_is_monotone_and_smooth_in_the_shift() -> None:
+    rng = np.random.default_rng(0)
+    real = rng.normal(size=(2000, 2))
+    shifts = [0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0]
+    results = [_discriminate(real, rng.normal(size=(2000, 2)) + np.array([shift, 0.0])) for shift in shifts]
+    gaps = [log_loss_gap(r.log_loss, math.log(2)) for r in results]
+    assert gaps[0] < 0.02 and gaps[-1] > 0.99
+    assert all(b >= a - 0.02 for a, b in itertools.pairwise(gaps))
+    assert max(b - a for a, b in itertools.pairwise(gaps)) < 0.5
+    saturated = [r for r in results if r.auc > 0.999]
+    assert len({round(log_loss_gap(r.log_loss, math.log(2)), 3) for r in saturated}) > 1
+
+
+def test_discriminator_separates_shifted_samples_and_stores_only_a_histogram() -> None:
+    rng = np.random.default_rng(0)
+    result = _discriminate(rng.normal(size=(2000, 2)), rng.normal(size=(2000, 2)) + 3)
+    assert result.auc > 0.95
+    assert set(result.histogram) == {"real", "synth"}
+    assert all(len(counts) == 10 and sum(counts) == result.n_test for counts in result.histogram.values())
 
 
 def test_discriminator_uses_categorical_codes() -> None:
     rng = np.random.default_rng(0)
-    real, synth = rng.integers(0, 3, (400, 1)).astype(float), rng.integers(3, 6, (400, 1)).astype(float)
-    assert stats.discriminator_auc(real, synth, np.ones(1, dtype=bool), 0, 50) > 0.95
+    real, synth = rng.integers(0, 3, (2000, 1)).astype(float), rng.integers(3, 6, (2000, 1)).astype(float)
+    assert _discriminate(real, synth, np.ones(1, dtype=bool)).auc > 0.95
+
+
+def test_entity_folds_keep_every_entity_on_one_side() -> None:
+    rng = np.random.default_rng(0)
+    orders, products = pd.Series(rng.integers(0, 300, 5000)), pd.Series(rng.integers(0, 40, 5000))
+    folds = stats.entity_folds([products, orders], 7)
+    train = folds == stats.FIT
+    train |= folds == stats.VALIDATION
+    test = folds == stats.TEST
+    for entity in (orders, products):
+        assert not set(entity[train]) & set(entity[test])
+    assert set(products[folds == stats.VALIDATION]).isdisjoint(products[folds == stats.FIT])
+    assert 0.35 < (folds == stats.DROPPED).mean() < 0.65
+    assert (stats.entity_folds([products.copy(), orders.copy()], 7) == folds).all()
+
+
+def test_log_loss_gap_reference_and_clipping() -> None:
+    assert log_loss_gap(0.5, 0.5) == 0.0
+    assert log_loss_gap(0.9, 0.5) == 0.0
+    assert log_loss_gap(0.0, 0.5) == 1.0
+    assert log_loss_gap(0.314, 0.232) == 0.0
+    assert log_loss_gap(0.25, 0.5) == pytest.approx(0.5)
+    assert log_loss_gap(math.log(2) / 2, 1.2) == pytest.approx(0.5)
 
 
 def test_generated_strings_match_their_regex() -> None:

@@ -206,12 +206,42 @@ by total score. A dataset's score is the mean of its table scores.
 | `constraints` | 0.10 | share of synth rows satisfying each check; for functional dependencies, the largest share of rows that can be kept so the dependency holds |
 | `keys` | 0.05 | distinct non-null keys over rows (primary) or over rows with a key (unique) |
 | `foreign_keys` | 0.10 | mean of 1 - abs(coverage error), 1 - fan-out KS, and 1 - fan-out Wasserstein |
-| `discriminator` | 0.10 | 1 - abs(AUC - 0.5) * 2 on the held-out half for a scikit-learn `HistGradientBoostingClassifier` (100 iterations, fixed `random_state`, one thread) on 2,000 seeded rows per side, split in stratified halves; features include the derived string features |
+| `discriminator` | 0.10 | 1 - abs(AUC - 0.5) * 2 on the test fold of the discriminator below |
 
 A column or table the synth lacks, or a column with a different type, scores 0. The **ceiling** scores two row
 samples of the same dataset structure (same structure seed, sample seeds `s` and `s + 1`), which shows how far apart
 two real draws already are. `relative_to(ceiling)` divides each group by the ceiling's same group, caps each at 1,
 and then applies the table's effective weights, so a group above its ceiling cannot hide one below it.
+
+### Discriminator
+
+A scikit-learn `HistGradientBoostingClassifier` (up to 100 iterations, at least 50 rows per leaf, fixed
+`random_state`, one thread) tells synth rows from real rows on up to 4,000 seeded rows per side. It sees row values,
+not relational identities:
+
+- **Features** leave out primary and unique key columns, the columns of every foreign key from or to the table,
+  columns declared `unique` or `monotonic`, and integer columns whose sampled real values are at least 95% distinct
+  (undeclared ids, which real datasets have; `discriminator.id_min_distinct_share`). Derived string features count.
+  Key, foreign-key, and ordering quality keep their own metrics.
+- **Entity split.** A child table's entities are its foreign keys (a product, an order), a table without one its
+  primary key; otherwise rows split by position. Each entity value hashes into the train or test half; a row is in
+  the test fold when all its entities are, in training when all are, and dropped otherwise, so no product or order has
+  rows on both sides. One training row in five, held out by whole entities, picks the boosting iteration (zero
+  iterations, the constant 0.5, included) with the lowest log-loss, so memorizing entity values (a product's
+  sample-specific price) cannot make the classifier overconfident. A side whose entities leave a fold empty (a
+  constant synthetic key) splits by position and is recorded in `split_fallback`.
+- **Foreign-key joins.** Each foreign key adds a unit: child rows inner-joined to their parent's non-identifier
+  columns (one parent row per key), scored the same way. It catches children attached to the wrong parents, which
+  per-table discriminators cannot see.
+- **Stored per unit:** held-out AUC, log-loss, rows, test rows per side, and a 10-bin histogram of the predicted synth
+  probability per side; never row values, row identities, or per-row probabilities.
+
+The **discriminator gap** of a unit is `(r - logloss) / r` clipped to [0, 1], with
+`r = min(ceiling logloss, ln 2)`: 0 when synth rows are as hard to tell from real rows as two real samples are (or as
+the constant prior), 1 when they are perfectly separable. Unlike the AUC, which saturates at 1, log-loss keeps
+falling as the classifier grows confident, so the gap still moves near AUC 1. A dataset's gap is the
+**equal-weight mean over every table and
+foreign-key join** the ceiling scored; a unit the synth lacks counts as 1. Lower is better.
 
 ### Structure recovery
 
@@ -396,7 +426,7 @@ The reference sampler is designed for benchmark tiers up to `s` (about 100,000 r
 harness. Each build is a git worktree plus commit; the **speed** worker imports that worktree's `profiler/src` via
 `PYTHONPATH` in a **fresh subprocess**. Speed samples time `profile_tables` (driver wall, process CPU, peak RSS)
 after an untimed warmup, rotate baseline/candidate order across cases, and record profile hashes under the policy's
-timed Spark config (unchanged by fidelity settings). The default policy (version 2.2.0) times speed on `local[8]` with
+timed Spark config (unchanged by fidelity settings). The default policy (version 3.0.0) times speed on `local[8]` with
 an 8 GiB driver (other confs unchanged; 1.x used `local[2]` and 2 GiB). Speed results under 1.x are not comparable
 with 2.0.0; old experiments re-evaluate against the policy recorded in their own `run.json`. The speed baselines in
 `profiler/rsi/BASELINE.md` were measured under 1.x and must be re-measured (P1.8e). The nested tier-m OOM at 2 GiB is
@@ -442,15 +472,28 @@ candidate role never reads the cache, including in control runs. `--control` run
 sample successful with `privacy_passed=false` and are listed in `privacy_unmeasured`, so the evaluator's hard guard
 rejects them. Tests can explicitly inject a `FakeScorer`; command-line runs never use it.
 
-`profiler_bench.evaluate` applies `profiler-bench/policies/default.json`. The accuracy mean estimand is the equally
-weighted mean across datasets of each dataset's mean paired-seed difference; its CI uses a **stratified bootstrap**
-that resamples seeds within each dataset (datasets are fixed strata). A hierarchical bootstrap that also resamples
-datasets is a documented alternative and is not used. Per-dataset regression gates keep a within-dataset bootstrap.
-An accuracy proposal may instead declare `targets.datasets`. It is accepted when either the mean gate passes or every
-declared target improves relative reconstruction by at least `accuracy.min_target_improvement` with a paired per-dataset
-CI lower bound above zero. The existing per-dataset regression, structure, privacy, completeness, and control gates apply
-to both paths; without structured targets, only the mean path is available. The verdict records the accepting
-`accuracy_path` and the targeted gate records each target CI.
+`profiler_bench.evaluate` applies `profiler-bench/policies/default.json`. Policy 3.0.0 judges accuracy proposals
+**discriminator first** (`accuracy_metric: discriminator`): improvement is the baseline minus candidate discriminator
+gap, paired by seed. A proposal is accepted on either path:
+
+- **global** (`accuracy_mean`): the equally weighted mean across datasets of each dataset's mean paired improvement
+  is at least `discriminator.min_mean_improvement` (0.01, to be calibrated from baseline-refresh noise) with a CI
+  lower bound above zero. The CI uses a **stratified bootstrap** that resamples seeds within each dataset (datasets
+  are fixed strata); a hierarchical bootstrap that also resamples datasets is not used.
+- **targeted** (`accuracy_targeted`, with `targets.datasets`): at least one target improves by at least
+  `discriminator.min_target_improvement` (0.02) with a CI lower bound above zero, and no target is worse beyond
+  noise (improvement CI upper bound below `-discriminator.noise_floor`). A target whose baseline gap is at most
+  `noise_floor` is saturated: it cannot carry the path, only block it.
+
+Guards reject on failure: privacy on every synthetic and real candidate sample; no dataset's gap worsens by more than
+`discriminator.max_dataset_regression` (0.02, `discriminator_per_dataset`); no `keys`, `foreign_keys`, or `constraints`
+group mean of any dataset drops by more than `discriminator.max_group_regression` (0.02, `reconstruction_groups`);
+the composite relative reconstruction does not regress beyond `accuracy.max_dataset_regression`
+(`accuracy_per_dataset`, kept as a guard); and structure, completeness, and control as before. Speed proposals are
+unchanged. The verdict records `accuracy_metric`, the accepting `accuracy_path`, and per dataset both builds' gap,
+AUC, and log-loss with the paired regression CI (`discriminator`, also in `REPORT.md`); the composite stays in the
+summary as a diagnostic. Policies without `accuracy_metric` (2.x and earlier) judge the composite as before, so old
+experiments re-evaluate under the policy in their own `run.json`.
 Each gate reports a two-sided 95% percentile interval with **no family-wise guarantee** across gates. Privacy is a
 hard guard (not policy-disableable). Completeness is checked against the expected matrix from `run.json`. Control runs
 and identical `profiler_src_hash` builds can never be `accepted`. Results land in `profiler/rsi/experiments/<id>/` as
@@ -473,8 +516,10 @@ regression CI, and the candidate's privacy status. A candidate sample that fails
 **rejects** (`real_holdout_privacy_failed`). A candidate sample whose privacy is `unmeasured` makes the verdict
 **inconclusive** (`real_holdout_privacy_unmeasured`), never accepted. So does a regression CI whose upper bound
 exceeds `accuracy.max_dataset_regression` (`real_holdout_regression`), and failed or missing real samples
-(`real_holdout_incomplete`). With every real dataset skipped the gate passes as `real_holdout_skipped`. A
-`real`-only run has no synthetic pairs, so it can measure but never accept.
+(`real_holdout_incomplete`). Under a discriminator policy each real dataset also reports both builds' discriminator
+gap and AUC and the paired gap regression CI, and a gap regression CI upper bound above
+`discriminator.max_dataset_regression` is a `real_holdout_regression` too. With every real dataset skipped the gate
+passes as `real_holdout_skipped`. A `real`-only run has no synthetic pairs, so it can measure but never accept.
 
 ```bash
 uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi run \
@@ -493,7 +538,7 @@ uv run --package dbldatagen-profiler-bench python -m profiler_bench.rsi evaluate
 Accuracy proposals can run a cheap **screen** before the official tier-`s` run: `python -m profiler_bench.rsi screen`
 (or `run --stage screen`). The policy's `screen` section (tier `r`, 3 fidelity seeds, margin 0.5, 2 smoke speed
 samples on `r`) overrides sampling for that experiment; `run.json` records `stage: screen` and the effective policy
-(including loosened accuracy thresholds). Screening uses the synthetic catalog only and never returns `accepted`:
+(including loosened accuracy and discriminator thresholds). Screening uses the synthetic catalog only and never returns `accepted`:
 verdicts are `screen_pass` (would plausibly pass under the loosened margins, including borderline / inconclusive
 cases) or `screen_fail` (a rejection, including any privacy failure). A `screen_pass` proceeds to the full official
 run (tier `s`, 5 seeds, and the real holdout suite when that suite is enabled). Old experiments still re-evaluate

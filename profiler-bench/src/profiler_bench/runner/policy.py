@@ -48,7 +48,7 @@ def apply_screen_overrides(policy: dict[str, Any]) -> dict[str, Any]:
     """Returns a copy of `policy` configured for the screening stage.
 
     Screening uses the screen tier and seed count, accuracy smoke speed samples on that tier
-    only, and the looser accuracy thresholds from `screened_accuracy_thresholds`. The returned
+    only, and the looser accuracy and discriminator thresholds from `screened_accuracy_thresholds`. The returned
     policy still carries the original `screen` section for documentation and re-evaluation.
     """
     screen = screen_section(policy)
@@ -62,30 +62,32 @@ def apply_screen_overrides(policy: dict[str, Any]) -> dict[str, Any]:
     out["speed_samples"] = {**dict(out.get("speed_samples", {})), **speed}
     out["speed_samples_accuracy"] = {**dict(out.get("speed_samples_accuracy", {})), **speed}
     out["accuracy"] = screened_accuracy_thresholds(out)
+    if "discriminator" in out:
+        out["discriminator"] = screened_accuracy_thresholds(out, section="discriminator")
     return out
 
 
-def screened_accuracy_thresholds(policy: dict[str, Any]) -> dict[str, Any]:
-    """Returns accuracy thresholds loosened by `screen.margin`.
+def screened_accuracy_thresholds(policy: dict[str, Any], section: str = "accuracy") -> dict[str, Any]:
+    """Returns the thresholds of one policy section (`accuracy` or `discriminator`) loosened by `screen.margin`.
 
     Improvement floors (`min_mean_improvement`, `min_target_improvement`) are multiplied by
-    `(1 - margin)`. Regression ceilings (`max_dataset_regression`, `max_structure_regression`)
-    are multiplied by `(1 + margin)`. `ci_lower_must_exceed` is unchanged. Margin 0.5 therefore
-    halves the required gain and raises allowed regressions by 50%, so borderline proposals that
+    `(1 - margin)`. Regression ceilings (`max_dataset_regression`, `max_structure_regression`,
+    `max_group_regression`) are multiplied by `(1 + margin)`. `ci_lower_must_exceed` is unchanged. Margin 0.5
+    therefore halves the required gain and raises allowed regressions by 50%, so borderline proposals that
     would be inconclusive or barely rejected under the official gate become `screen_pass`.
     """
     screen = screen_section(policy)
     margin = float(screen["margin"])
     if not 0.0 <= margin < 1.0:
         raise ValueError(f"screen.margin must be in [0, 1), got {margin}")
-    accuracy = dict(policy.get("accuracy", {}))
+    thresholds = dict(policy.get(section, {}))
     for key in ("min_mean_improvement", "min_target_improvement"):
-        if key in accuracy:
-            accuracy[key] = float(accuracy[key]) * (1.0 - margin)
-    for key in ("max_dataset_regression", "max_structure_regression"):
-        if key in accuracy:
-            accuracy[key] = float(accuracy[key]) * (1.0 + margin)
-    return accuracy
+        if key in thresholds:
+            thresholds[key] = float(thresholds[key]) * (1.0 - margin)
+    for key in ("max_dataset_regression", "max_structure_regression", "max_group_regression"):
+        if key in thresholds:
+            thresholds[key] = float(thresholds[key]) * (1.0 + margin)
+    return thresholds
 
 
 def policy_hash(policy: dict[str, Any]) -> str:

@@ -6,6 +6,7 @@ change in a top-level score can be traced to the column, pair, check, or key tha
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Literal
 
@@ -109,15 +110,67 @@ class ForeignKeyScore(_Score):
 class DiscriminatorScore(_Score):
     """Two-sample classifier score.
 
+    Only aggregates are kept: no row values, row identities, or per-row probabilities.
+
     Attributes:
         auc: Held-out AUC of a gradient-boosted classifier telling synth from real rows.
-        rows: Rows per side, half used to train and half to test.
+        log_loss: Held-out log-loss of the same classifier, see `stats.log_loss`.
+        rows: Rows per side sampled before the split.
+        n_test: Test rows per side after the entity split.
+        histogram: Counts of the predicted synth probability in equal-width bins over [0, 1], keyed `real` and
+            `synth`.
+        features: Feature columns the classifier saw.
+        excluded: Top-level columns left out of the features: keys, foreign keys, monotonic, and near-unique
+            integer identifiers.
+        split_by: Entity columns deciding a row's fold (`+` joins a composite key), see `stats.entity_folds`; empty
+            means the row position.
+        split_fallback: Sides (`real`, `synth`) whose entities left a fold empty and that split by position.
         score: 1 - |auc - 0.5| * 2.
     """
 
     auc: float
+    log_loss: float
     rows: int
+    n_test: int
+    histogram: dict[str, list[int]]
+    features: int
+    excluded: list[str] = []
+    split_by: list[str] = []
+    split_fallback: list[str] = []
     score: Score
+
+
+class JoinDiscriminator(_Score):
+    """Discriminator on child rows joined to the non-key columns of their parent along one foreign key.
+
+    Attributes:
+        label: The foreign key.
+        discriminator: Score of the joined frame, or None when a side lacks the tables or too few rows join.
+    """
+
+    label: str
+    discriminator: DiscriminatorScore | None = None
+
+
+class DiscriminatorGap(_Score):
+    """Discriminator gap of one dataset against its real-vs-real ceiling.
+
+    Every table and foreign-key join the ceiling scored is a unit with equal weight. A unit the synth lacks counts
+    as fully separable (gap 1).
+
+    Attributes:
+        gap: Mean of the unit gaps (`stats.log_loss_gap`), or None when the ceiling has no unit. Lower is better.
+        auc: Mean held-out AUC over the units the synth has.
+        log_loss: Mean held-out log-loss over the same units.
+        ceiling_auc: Mean ceiling AUC over every unit.
+        units: Gap per unit, keyed by table name or foreign-key label.
+    """
+
+    gap: float | None
+    auc: float | None
+    log_loss: float | None
+    ceiling_auc: float | None
+    units: dict[str, float]
 
 
 class TableReconstruction(_Score):
@@ -177,6 +230,7 @@ class ReconstructionScore(_Score):
         config_version: Metrics configuration version.
         config_hash: Metrics configuration hash.
         tables: Per-table scores.
+        joins: Discriminator per foreign key on child rows joined to their parent.
         score: Mean of the table scores.
     """
 
@@ -186,6 +240,7 @@ class ReconstructionScore(_Score):
     config_version: str
     config_hash: str
     tables: list[TableReconstruction]
+    joins: list[JoinDiscriminator] = []
     score: Score
 
     def relative_to(self, ceiling: ReconstructionScore) -> float:
@@ -196,6 +251,31 @@ class ReconstructionScore(_Score):
         ceilings = {t.name: t for t in ceiling.tables}
         values = [t.relative_to(ceilings[t.name]) if t.name in ceilings else t.score for t in self.tables]
         return mean(values) or 0.0
+
+    def discriminators(self) -> dict[str, DiscriminatorScore | None]:
+        """Returns the discriminator of every table and foreign-key join, keyed by table name or join label."""
+        return {t.name: t.discriminator for t in self.tables} | {j.label: j.discriminator for j in self.joins}
+
+    def discriminator_gap(self, ceiling: ReconstructionScore) -> DiscriminatorGap:
+        """Returns the dataset's discriminator gap against the real-vs-real `ceiling`, see `DiscriminatorGap`."""
+        mine = self.discriminators()
+        bounds = {unit: d for unit, d in ceiling.discriminators().items() if d is not None}
+        units = {unit: _unit_gap(mine.get(unit), bound) for unit, bound in bounds.items()}
+        present = [d for unit, d in mine.items() if unit in bounds and d is not None]
+        return DiscriminatorGap(
+            gap=mean(list(units.values())),
+            auc=mean([d.auc for d in present]),
+            log_loss=mean([d.log_loss for d in present]),
+            ceiling_auc=mean([d.auc for d in bounds.values()]),
+            units=units,
+        )
+
+    def group_means(self) -> dict[str, float]:
+        """Returns each reconstruction group's mean over the tables that have it."""
+        names = sorted({name for t in self.tables for name in t.groups})
+        return {
+            name: sum(v) / len(v) for name in names if (v := [t.groups[name] for t in self.tables if name in t.groups])
+        }
 
 
 class StructureItem(_Score):
@@ -351,6 +431,24 @@ def weighted(
         return present, {}, 1.0
     effective = {name: weights[name] / total for name in present}
     return present, effective, clamp(sum(effective[name] * value for name, value in present.items()))
+
+
+def _unit_gap(score: DiscriminatorScore | None, ceiling: DiscriminatorScore) -> float:
+    return 1.0 if score is None else log_loss_gap(score.log_loss, ceiling.log_loss)
+
+
+def log_loss_gap(log_loss_value: float, ceiling: float) -> float:
+    """Returns normalized separability relative to real-vs-real and the trivial classifier, lower being better.
+
+    With reference `r = min(ceiling, ln 2)`, the gap is `(r - log_loss_value) / r` clipped to [0, 1]: zero when the
+    classifier does no better than on two real samples (or than the constant prior), and one at perfect separation.
+    Unlike AUC, log-loss keeps moving after the classes become rank-separable.
+    """
+    trivial = math.log(2)
+    reference = min(ceiling, trivial)
+    if reference <= 0:
+        return 0.0 if log_loss_value >= reference else 1.0
+    return min(1.0, max(0.0, (reference - log_loss_value) / reference))
 
 
 def clamp(value: float) -> float:

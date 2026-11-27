@@ -6,6 +6,11 @@ family-wise or simultaneous coverage guarantee across gates or datasets.
 
 Real datasets (`run["real_datasets"]`) are a holdout suite: their samples are kept out of
 every other gate and checked only by the `real_holdout` gate (see `_real_holdout`).
+
+Accuracy proposals are judged by the policy's `accuracy_metric`. `discriminator` (policy 3.x) judges the
+discriminator gap (`discriminator_gap` on each fidelity record; lower is better) and keeps the composite
+relative reconstruction as a guard; see `_discriminator_gates`. A policy without `accuracy_metric` is a
+`composite` policy (2.x and earlier) and is judged as it was, so old runs re-evaluate under their own policy.
 """
 
 from __future__ import annotations
@@ -83,9 +88,12 @@ def evaluate_gates(
     gates.append(_control_guard(run))
 
     accuracy_path: Literal["mean", "targeted"] | None = None
+    metric = accuracy_metric(policy)
+    discriminator = proposal_type == "accuracy" and metric == "discriminator"
     if proposal_type == "accuracy":
         targets = _accuracy_targets(proposal)
-        gates.extend(_accuracy_gates(fidelity_records, policy, targets))
+        accuracy = _discriminator_gates if discriminator else _accuracy_gates
+        gates.extend(accuracy(fidelity_records, policy, targets))
     elif proposal_type == "speed":
         gates.extend(_accuracy_regression_gates(fidelity_records, policy))
         gates.extend(_speed_gates(speed_records, policy, proposal))
@@ -101,7 +109,7 @@ def evaluate_gates(
         )
 
     if run.get("suite", "synthetic") != "synthetic":
-        gates.append(_real_holdout(real_speed, real_fidelity, policy, run))
+        gates.append(_real_holdout(real_speed, real_fidelity, policy, run, discriminator=discriminator))
 
     if proposal_type == "accuracy":
         verdict, accuracy_path = _combine_accuracy(gates, targeted=bool(targets))
@@ -110,7 +118,7 @@ def evaluate_gates(
     stage = str(run.get("stage") or "official")
     if stage == "screen":
         verdict = _screen_verdict(verdict, gates)
-    result = {
+    result: dict[str, Any] = {
         "verdict": verdict,
         "proposal_type": proposal_type,
         "gates": [gate.to_dict() for gate in gates],
@@ -120,11 +128,18 @@ def evaluate_gates(
             "there is no family-wise coverage guarantee across gates."
         ),
     }
-    if accuracy_path is not None:
-        result["accuracy_path"] = accuracy_path
-    if stage == "screen":
-        result["stage"] = "screen"
-    return result
+    extras = {
+        "accuracy_path": accuracy_path,
+        "accuracy_metric": metric if proposal_type == "accuracy" else None,
+        "discriminator": discriminator_summary(fidelity_records, policy) if discriminator else None,
+        "stage": "screen" if stage == "screen" else None,
+    }
+    return result | {key: value for key, value in extras.items() if value is not None}
+
+
+def accuracy_metric(policy: dict[str, Any]) -> Literal["composite", "discriminator"]:
+    """Returns the policy's accuracy metric; policies before 3.0.0 have none and use `composite`."""
+    return "discriminator" if policy.get("accuracy_metric") == "discriminator" else "composite"
 
 
 def _screen_verdict(verdict: Verdict, gates: Sequence[GateResult]) -> Verdict:
@@ -196,6 +211,8 @@ def _real_holdout(
     fidelity_records: Sequence[dict[str, Any]],
     policy: dict[str, Any],
     run: dict[str, Any],
+    *,
+    discriminator: bool = False,
 ) -> GateResult:
     """Holdout check on the real datasets; it never counts towards acceptance.
 
@@ -209,11 +226,17 @@ def _real_holdout(
     candidate sample's privacy is unmeasured (`real_holdout_privacy_unmeasured`), when a dataset's regression CI
     upper bound exceeds `accuracy.max_dataset_regression` (`real_holdout_regression`), or when samples are failed or
     missing (`real_holdout_incomplete`).
+
+    With `discriminator` (accuracy proposals under a discriminator policy), each dataset also reports both builds'
+    discriminator gap and AUC and the paired gap regression (candidate minus baseline) with its CI, and a CI upper
+    bound above `discriminator.max_dataset_regression` is a `real_holdout_regression` too.
     """
     boot = policy.get("bootstrap", {})
     n_bootstrap, seed = int(boot.get("samples", 2000)), int(boot.get("seed", 0))
     confidence = float(boot.get("confidence", 0.95))
     max_reg = float(policy.get("accuracy", {}).get("max_dataset_regression", 0.01))
+    max_disc = float(policy.get("discriminator", {}).get("max_dataset_regression", 0.02))
+    disc_paired = _paired_field(fidelity_records, "discriminator_gap") if discriminator else {}
     ok = {_sample_key(record): record for record in [*speed_records, *fidelity_records] if record.get("ok")}
     incomplete = sorted(real_sample_keys(run) - set(ok))
     candidate_privacy = {
@@ -267,6 +290,11 @@ def _real_holdout(
             detail["regression"] = ci.to_dict()
             if ci.high > max_reg:
                 regressed.append(dataset)
+        if discriminator:
+            detail["discriminator"] = _discriminator_detail(fidelity_records, dataset, disc_paired, boot)
+            regression = detail["discriminator"].get("regression")
+            if regression is not None and regression["high"] > max_disc and dataset not in regressed:
+                regressed.append(dataset)
         datasets[dataset] = detail
     status: Literal["pass", "fail", "inconclusive"] = "pass"
     reason = "real_holdout_passed" if run.get("real_datasets") else "real_holdout_skipped"
@@ -286,6 +314,7 @@ def _real_holdout(
         detail={
             "datasets": datasets,
             "max_regression": max_reg,
+            **({"max_discriminator_regression": max_disc} if discriminator else {}),
             "regressed": regressed,
             "privacy_failed": privacy_failed,
             "privacy_unmeasured": privacy_unmeasured,
@@ -572,6 +601,200 @@ def _accuracy_regression_gates(fidelity_records: Sequence[dict[str, Any]], polic
     return [gate for gate in _accuracy_gates(fidelity_records, policy) if gate.name != "accuracy_mean"]
 
 
+def _discriminator_gates(
+    fidelity_records: Sequence[dict[str, Any]], policy: dict[str, Any], targets: Sequence[str] = ()
+) -> list[GateResult]:
+    """Discriminator-first accuracy gates (policy `accuracy_metric: discriminator`).
+
+    Improvement is baseline minus candidate `discriminator_gap`, paired by (dataset, seed). Paths (either accepts):
+    `accuracy_mean`, the equally weighted mean over datasets, and `accuracy_targeted`. Guards (each rejects):
+    `discriminator_per_dataset` (no dataset's gap worsens beyond `max_dataset_regression`),
+    `reconstruction_groups` (no `guard_groups` group of any dataset drops beyond `max_group_regression`), and the
+    composite `accuracy_per_dataset` and `structure` gates of the composite policy, unchanged.
+    """
+    cfg = policy.get("discriminator", {})
+    boot = policy.get("bootstrap", {})
+    n_bootstrap, seed = int(boot.get("samples", 2000)), int(boot.get("seed", 0))
+    confidence = float(boot.get("confidence", 0.95))
+    worsened = _paired_field(fidelity_records, "discriminator_gap")
+    paired = {dataset: [-diff for diff in diffs] for dataset, diffs in worsened.items()}
+    if paired:
+        mean_ci = stratified_dataset_mean_ci(paired, n_bootstrap=n_bootstrap, seed=seed, confidence=confidence)
+        floor = float(cfg.get("ci_lower_must_exceed", 0.0))
+        mean = _improvement_gate("accuracy_mean", mean_ci, float(cfg.get("min_mean_improvement", 0.01)), floor)
+        mean.detail |= {
+            "metric": "discriminator_gap",
+            "estimand": (
+                "equally weighted mean across datasets of per-dataset mean paired gap improvements "
+                "(baseline minus candidate); stratified bootstrap resamples seeds within each dataset"
+            ),
+            "per_dataset_mean_improvement": {d: sum(v) / len(v) for d, v in paired.items()},
+        }
+    else:
+        mean = GateResult(name="accuracy_mean", passed=False, status="fail", reason="no_discriminator_pairs")
+    gates = [mean]
+    if targets:
+        gates.append(_discriminator_targeted_gate(fidelity_records, paired, targets, cfg, boot))
+    gates.append(
+        _ceiling_gate(
+            "discriminator_per_dataset",
+            worsened,
+            float(cfg.get("max_dataset_regression", 0.02)),
+            boot,
+            seed_offset=6,
+            reason="discriminator_regression",
+        )
+    )
+    gates.append(
+        _ceiling_gate(
+            "reconstruction_groups",
+            _paired_groups(fidelity_records, list(cfg.get("guard_groups", ["keys", "foreign_keys", "constraints"]))),
+            float(cfg.get("max_group_regression", 0.02)),
+            boot,
+            seed_offset=7,
+            reason="group_regression",
+        )
+    )
+    gates.extend(_accuracy_regression_gates(fidelity_records, policy))
+    return gates
+
+
+def _discriminator_targeted_gate(
+    fidelity_records: Sequence[dict[str, Any]],
+    paired: dict[str, list[float]],
+    targets: Sequence[str],
+    cfg: dict[str, Any],
+    boot: dict[str, Any],
+) -> GateResult:
+    """Passes when at least one declared target improves and none gets worse beyond noise.
+
+    A target improves when its mean gap improvement is at least `min_target_improvement` and its CI lower bound
+    exceeds `ci_lower_must_exceed`; it is worse when the CI upper bound is below `-noise_floor`. A target whose
+    baseline gap is at most `noise_floor` cannot improve: it is marked saturated and only checked for getting worse. Missing
+    or worse targets fail; otherwise an improved target passes, a CI straddling the floor is inconclusive, and
+    `targets_saturated` or `target_improvement_insufficient` fails.
+    """
+    required = float(cfg.get("min_target_improvement", 0.02))
+    floor = float(cfg.get("ci_lower_must_exceed", 0.0))
+    noise = float(cfg.get("noise_floor", 0.005))
+    baseline = _role_means(fidelity_records, "discriminator_gap", "baseline")
+    details: dict[str, Any] = {}
+    outcome: dict[str, list[str]] = defaultdict(list)
+    for target in targets:
+        diffs = paired.get(target)
+        if not diffs:
+            details[target] = {"missing": True}
+            outcome["missing"].append(target)
+            continue
+        ci = paired_bootstrap_ci(
+            diffs,
+            statistic="mean",
+            n_bootstrap=int(boot.get("samples", 2000)),
+            seed=int(boot.get("seed", 0)) + 5,
+            confidence=float(boot.get("confidence", 0.95)),
+        )
+        saturated = baseline.get(target, 1.0) <= noise
+        details[target] = ci.to_dict() | {"baseline_gap": baseline.get(target), "saturated": saturated}
+        if ci.high < -noise:
+            outcome["worse"].append(target)
+        elif ci.point >= required and ci.low > floor:
+            outcome["improved"].append(target)
+        elif saturated:
+            outcome["saturated"].append(target)
+        elif ci.low <= floor < ci.high:
+            outcome["inconclusive"].append(target)
+    status: Literal["pass", "fail", "inconclusive"] = "fail"
+    if outcome["missing"]:
+        reason = "target_missing"
+    elif outcome["worse"]:
+        reason = "target_worsened"
+    elif outcome["improved"]:
+        status, reason = "pass", "targets_improved"
+    elif outcome["inconclusive"]:
+        status, reason = "inconclusive", "target_improvement_inconclusive"
+    elif len(outcome["saturated"]) == len(targets):
+        reason = "targets_saturated"
+    else:
+        reason = "target_improvement_insufficient"
+    return GateResult(
+        name="accuracy_targeted",
+        passed=status == "pass",
+        status=status,
+        reason=reason,
+        detail={
+            "metric": "discriminator_gap",
+            "targets": details,
+            "outcome": dict(outcome),
+            "min_target_improvement": required,
+            "ci_lower_must_exceed": floor,
+            "noise_floor": noise,
+        },
+    )
+
+
+def _ceiling_gate(
+    name: str,
+    regressions: dict[str, list[float]],
+    limit: float,
+    boot: dict[str, Any],
+    *,
+    seed_offset: int,
+    reason: str,
+) -> GateResult:
+    """Fails when a key's mean regression CI lies above `limit`; inconclusive when the CI straddles it."""
+    details = {}
+    status: Literal["pass", "fail", "inconclusive"] = "pass"
+    code = f"no_{reason}"
+    for key, values in sorted(regressions.items()):
+        ci = paired_bootstrap_ci(
+            values,
+            statistic="mean",
+            n_bootstrap=int(boot.get("samples", 2000)),
+            seed=int(boot.get("seed", 0)) + seed_offset,
+            confidence=float(boot.get("confidence", 0.95)),
+        )
+        details[key] = ci.to_dict()
+        if ci.low > limit:
+            status, code = "fail", reason
+        elif ci.high > limit and status != "fail":
+            status, code = "inconclusive", f"{reason}_inconclusive"
+    return GateResult(
+        name=name,
+        passed=status == "pass",
+        status=status,
+        reason=code,
+        detail={"regressions": details, "max_regression": limit},
+    )
+
+
+def discriminator_summary(fidelity_records: Sequence[dict[str, Any]], policy: dict[str, Any]) -> dict[str, Any]:
+    """Returns, per dataset, both builds' mean discriminator gap, AUC, and log-loss and the paired regression CI."""
+    boot = policy.get("bootstrap", {})
+    paired = _paired_field(fidelity_records, "discriminator_gap")
+    datasets = sorted({str(r["dataset"]) for r in fidelity_records if r.get("kind") == "fidelity" and r.get("ok")})
+    return {dataset: _discriminator_detail(fidelity_records, dataset, paired, boot) for dataset in datasets}
+
+
+def _discriminator_detail(
+    fidelity_records: Sequence[dict[str, Any]], dataset: str, paired: dict[str, list[float]], boot: dict[str, Any]
+) -> dict[str, Any]:
+    rows = [r for r in fidelity_records if r.get("ok") and r.get("dataset") == dataset]
+    detail: dict[str, Any] = {}
+    for role in ("baseline", "candidate"):
+        for field_name in ("discriminator_gap", "discriminator_auc", "discriminator_log_loss"):
+            values = [float(r[field_name]) for r in rows if r.get("role") == role and r.get(field_name) is not None]
+            if values:
+                detail[f"{role}_{field_name.removeprefix('discriminator_')}"] = sum(values) / len(values)
+    if paired.get(dataset):
+        detail["regression"] = paired_bootstrap_ci(
+            paired[dataset],
+            n_bootstrap=int(boot.get("samples", 2000)),
+            seed=int(boot.get("seed", 0)) + 6,
+            confidence=float(boot.get("confidence", 0.95)),
+        ).to_dict()
+    return detail
+
+
 def _combine_accuracy(
     gates: Sequence[GateResult], *, targeted: bool
 ) -> tuple[Verdict, Literal["mean", "targeted"] | None]:
@@ -795,6 +1018,46 @@ def _paired_relative(records: Sequence[dict[str, Any]]) -> dict[str, list[float]
         if "baseline" in roles and "candidate" in roles:
             paired[dataset].append(roles["candidate"] - roles["baseline"])
     return dict(paired)
+
+
+def _paired_field(records: Sequence[dict[str, Any]], name: str) -> dict[str, list[float]]:
+    """Returns candidate minus baseline of a numeric record field per dataset, paired by seed; nulls are skipped."""
+    by: dict[tuple[str, int], dict[str, float]] = defaultdict(dict)
+    for record in records:
+        if record.get("kind") != "fidelity" or not record.get("ok") or record.get(name) is None:
+            continue
+        by[(str(record["dataset"]), int(record["seed"]))][str(record["role"])] = float(record[name])
+    paired: dict[str, list[float]] = defaultdict(list)
+    for (dataset, _seed), roles in sorted(by.items()):
+        if "baseline" in roles and "candidate" in roles:
+            paired[dataset].append(roles["candidate"] - roles["baseline"])
+    return dict(paired)
+
+
+def _paired_groups(records: Sequence[dict[str, Any]], groups: Sequence[str]) -> dict[str, list[float]]:
+    """Returns baseline minus candidate of each guard group per `dataset:group`, paired by seed."""
+    by: dict[tuple[str, int], dict[str, dict[str, float]]] = defaultdict(dict)
+    for record in records:
+        if record.get("kind") == "fidelity" and record.get("ok"):
+            values = record.get("reconstruction_groups") or {}
+            by[(str(record["dataset"]), int(record["seed"]))][str(record["role"])] = values
+    paired: dict[str, list[float]] = defaultdict(list)
+    for (dataset, _seed), roles in sorted(by.items()):
+        base, cand = roles.get("baseline"), roles.get("candidate")
+        if base is None or cand is None:
+            continue
+        for group in groups:
+            if group in base and group in cand:
+                paired[f"{dataset}:{group}"].append(float(base[group]) - float(cand[group]))
+    return dict(paired)
+
+
+def _role_means(records: Sequence[dict[str, Any]], name: str, role: str) -> dict[str, float]:
+    values: dict[str, list[float]] = defaultdict(list)
+    for record in records:
+        if record.get("ok") and record.get("role") == role and record.get(name) is not None:
+            values[str(record["dataset"])].append(float(record[name]))
+    return {dataset: sum(v) / len(v) for dataset, v in values.items()}
 
 
 def _paired_structure(records: Sequence[dict[str, Any]]) -> dict[str, list[float]]:

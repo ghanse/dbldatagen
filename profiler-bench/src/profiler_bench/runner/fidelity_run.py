@@ -162,6 +162,10 @@ def score_one_seed(
             "privacy_unmeasured": scores.privacy_unmeasured,
             "ceiling": scores.ceiling,
             "relative_reconstruction": scores.relative_reconstruction,
+            "discriminator_gap": scores.discriminator_gap,
+            "discriminator_auc": scores.discriminator_auc,
+            "discriminator_log_loss": scores.discriminator_log_loss,
+            "reconstruction_groups": scores.reconstruction_groups,
             "detail": scores.detail,
             "metrics_config_hash": scores.metrics_config_hash,
         }

@@ -3,15 +3,22 @@
 Marginals, null fractions, and pairwise dependence are computed on bounded seeded samples collected to the driver.
 Row counts, null fractions of top-level columns, distinct counts, constraints, keys, and foreign keys are Spark
 aggregates over the full tables.
+
+The discriminator sees row values, not relational identities: keys, foreign-key columns, unique or monotonic columns,
+and near-unique integer identifiers are left out of its features (their quality has dedicated metrics), and its
+train/test split keeps every entity (the rows sharing a foreign-key or primary-key value) in one half. Each foreign
+key also gets a discriminator on child rows joined to their parent's non-key columns.
 """
 
 from __future__ import annotations
 
 import itertools
+import operator
 import os
 import re
 import zlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from functools import reduce
 from typing import Any, Literal
 
 import numpy as np
@@ -49,6 +56,7 @@ from profiler_bench.fidelity.scores import (
     ColumnScore,
     DiscriminatorScore,
     ForeignKeyScore,
+    JoinDiscriminator,
     KeyScore,
     PairScore,
     ReconstructionScore,
@@ -64,6 +72,7 @@ MARGINAL_METRICS = frozenset(
     {"ks", "wasserstein", "tvd", "format", "length_ks", "length_wasserstein", "special_values", "missing"}
 )
 MIN_DISCRIMINATOR_ROWS = 20
+INTEGRAL_TYPES = (T.ByteType, T.ShortType, T.IntegerType, T.LongType)
 
 
 def score_reconstruction(
@@ -100,6 +109,11 @@ def score_reconstruction(
         config_version=config.version,
         config_hash=config.hash(),
         tables=tables,
+        joins=[
+            _join_discriminator(fk, manifest, real, synth, seed, config)
+            for fk in manifest.foreign_keys
+            if fk.child_table in real and fk.parent_table in real
+        ],
         score=mean([t.score for t in tables]) or 0.0,
     )
 
@@ -201,7 +215,17 @@ def _score_table(
     keys = _keys(truth, synth_df, set(good))
     fks = [_foreign_key(fk, real, synth) for fk in foreign_keys if fk.child_table == truth.name]
     usable = {p: k for p, k in row_frame_kinds.items() if p in synth_frames[ROW_FRAME].columns}
-    discriminator = _discriminator(real_frames[ROW_FRAME], synth_frames[ROW_FRAME], usable, seed, config)
+    discriminator = _discriminator(
+        real_frames[ROW_FRAME],
+        synth_frames[ROW_FRAME],
+        usable,
+        {leaf.path: leaf.root for leaf in real_leaves},
+        declared_identifiers(truth, foreign_keys),
+        real_df.schema,
+        _split_columns(truth, foreign_keys, real_frames[ROW_FRAME]),
+        seed,
+        config,
+    )
     marginal = [mean([v for k, v in c.metrics.items() if k in MARGINAL_METRICS]) for c in columns]
     groups, weights, score = weighted(
         {
@@ -622,7 +646,7 @@ def _keys(truth: Table, df: DataFrame, present: set[str]) -> list[KeyScore]:
 
 
 def _foreign_key(fk: ForeignKey, real: Mapping[str, DataFrame], synth: Mapping[str, DataFrame]) -> ForeignKeyScore:
-    label = f"{fk.child_table}{list(fk.child_columns)} -> {fk.parent_table}{list(fk.parent_columns)}"
+    label = _fk_label(fk)
     real_coverage, real_fanout = _fanout(fk, real)
     try:
         synth_coverage, synth_fanout = _fanout(fk, synth)
@@ -674,15 +698,190 @@ def _fanout(fk: ForeignKey, frames: Mapping[str, DataFrame]) -> tuple[float, pd.
     return (1.0 - missing / total if total else 1.0), fanout
 
 
+def declared_identifiers(truth: Table, foreign_keys: Sequence[ForeignKey]) -> set[str]:
+    """Returns the top-level columns of `truth` the manifest declares as relational identities or orderings.
+
+    These are primary and unique key columns, columns of every foreign key from or to the table, and columns
+    declared unique or monotonic.
+    """
+    names = {*truth.primary_key, *(c for key in truth.unique_keys for c in key)}
+    names |= {c for fk in foreign_keys if fk.child_table == truth.name for c in fk.child_columns}
+    names |= {c for fk in foreign_keys if fk.parent_table == truth.name for c in fk.parent_columns}
+    return names | {c.name for c in truth.columns if c.unique or c.monotonic}
+
+
+def _split_columns(truth: Table, foreign_keys: Sequence[ForeignKey], frame: pd.DataFrame) -> list[tuple[str, ...]]:
+    """Returns the entity columns of a table's rows for the discriminator's split, largest entities first.
+
+    A child table's entities are its foreign keys (its parents, whose sample-specific values such as a product's
+    price its rows repeat), ordered by fewest distinct sampled values; a table without one uses its primary key;
+    otherwise rows split by position.
+    """
+    candidates = [fk.child_columns for fk in foreign_keys if fk.child_table == truth.name]
+    candidates = [c for c in dict.fromkeys(candidates) if set(c) <= set(frame.columns)]
+    if candidates:
+        return sorted(candidates, key=lambda columns: len(frame[list(columns)].drop_duplicates()))
+    return [truth.primary_key] if truth.primary_key and set(truth.primary_key) <= set(frame.columns) else []
+
+
+def _near_unique_integers(schema: T.StructType, frame: pd.DataFrame, share: float) -> set[str]:
+    """Returns the integer columns whose sampled values are at least `share` distinct: undeclared identifiers."""
+    found = set()
+    for field in schema.fields:
+        if isinstance(field.dataType, INTEGRAL_TYPES) and field.name in frame.columns:
+            values = frame[field.name].dropna()
+            if len(values) >= MIN_DISCRIMINATOR_ROWS and values.nunique() >= share * len(values):
+                found.add(field.name)
+    return found
+
+
+def _entities(frame: pd.DataFrame, split: Sequence[tuple[str, ...]]) -> list[pd.Series]:
+    if not split:
+        return [pd.Series(np.arange(len(frame)))]
+    return [frame[c[0]] if len(c) == 1 else frame[list(c)].astype(str).agg("\x1f".join, axis=1) for c in split]
+
+
 def _discriminator(
-    real: pd.DataFrame, synth: pd.DataFrame, kinds: Mapping[str, str], seed: int, config: MetricsConfig
+    real: pd.DataFrame,
+    synth: pd.DataFrame,
+    kinds: Mapping[str, str],
+    roots: Mapping[str, str],
+    declared: set[str],
+    schema: T.StructType,
+    split_by: Sequence[tuple[str, ...]],
+    seed: int,
+    config: MetricsConfig,
 ) -> DiscriminatorScore | None:
+    """Scores how well a classifier tells the synth rows from the real ones on non-identifier features.
+
+    Args:
+        real: Real row frame.
+        synth: Synth row frame.
+        kinds: Kind of every candidate feature path.
+        roots: Top-level column of every leaf path; derived `#` features take the root of their leaf.
+        declared: Top-level columns the manifest declares as identifiers, see `declared_identifiers`.
+        schema: Real Spark schema, used to find undeclared integer identifiers.
+        split_by: Entity columns of the split, see `_split_columns`; empty splits by position. A side whose entities
+            leave the fit or test fold empty (a constant synthetic key) splits by position instead: key quality has
+            its own metrics.
+        seed: Seed of the split and the classifier.
+        config: Metrics configuration.
+    """
     rows = min(config.sampling.discriminator_rows, len(real), len(synth))
-    if rows < MIN_DISCRIMINATOR_ROWS or not kinds:
+    if rows < MIN_DISCRIMINATOR_ROWS:
         return None
-    encoder_kinds = {p: "numeric" if k in ("numeric", "length") else k for p, k in kinds.items()}
     real, synth = real.iloc[:rows], synth.iloc[:rows]
+    settings = config.discriminator
+    excluded = declared | _near_unique_integers(schema, real, settings.id_min_distinct_share)
+    features = {p: k for p, k in kinds.items() if roots.get(p.split("#")[0], p) not in excluded}
+    if not features:
+        return None
+    encoder_kinds = {p: "numeric" if k in ("numeric", "length") else k for p, k in features.items()}
     encoder = stats.Encoder(real, encoder_kinds, config.marginal.top_values)
     (x_real, categorical), (x_synth, _) = encoder.tree_features(real), encoder.tree_features(synth)
-    value = stats.discriminator_auc(x_real, x_synth, categorical, seed, config.discriminator.max_iter)
-    return DiscriminatorScore(auc=value, rows=rows, score=clamp(1 - abs(value - 0.5) * 2))
+    split = [c for c in split_by if set(c) <= set(real.columns) and set(c) <= set(synth.columns)]
+    split = split if len(split) == len(split_by) else []
+    by_entity = {
+        side: stats.entity_folds(_entities(frame, split), seed) for side, frame in (("real", real), ("synth", synth))
+    }
+    fallback = [side for side, f in by_entity.items() if not ((f == stats.FIT).any() and (f == stats.TEST).any())]
+    by_row = {
+        side: stats.entity_folds(_entities(frame, []), seed) for side, frame in (("real", real), ("synth", synth))
+    }
+    real_folds, synth_folds = (by_row[side] if side in fallback else by_entity[side] for side in ("real", "synth"))
+    result = stats.discriminate(
+        x_real,
+        x_synth,
+        categorical,
+        (real_folds, synth_folds),
+        seed,
+        settings.max_iter,
+        settings.min_samples_leaf,
+        settings.histogram_bins,
+    )
+    if result is None:
+        return None
+    return DiscriminatorScore(
+        auc=result.auc,
+        log_loss=result.log_loss,
+        rows=rows,
+        n_test=result.n_test,
+        histogram=result.histogram,
+        features=len(features),
+        excluded=sorted(excluded & set(roots.values())),
+        split_by=["+".join(c) for c in split],
+        split_fallback=fallback,
+        score=clamp(1 - abs(result.auc - 0.5) * 2),
+    )
+
+
+def _join_discriminator(
+    fk: ForeignKey,
+    manifest: Manifest,
+    real: Mapping[str, DataFrame],
+    synth: Mapping[str, DataFrame],
+    seed: int,
+    config: MetricsConfig,
+) -> JoinDiscriminator:
+    """Scores the discriminator on child rows joined to their parent's non-identifier columns, split by entity.
+
+    A synth that keeps both tables' marginals but attaches children to the wrong parents is caught here.
+    """
+    label = _fk_label(fk)
+    tables = {t.name: t for t in manifest.tables}
+    try:
+        real_df = _joined(fk, tables, real, manifest.foreign_keys)
+        synth_df = _joined(fk, tables, synth, manifest.foreign_keys)
+        cap = config.sampling.discriminator_rows
+        leaves, real_frames = collect(real_df, None, real_df.count(), cap, seed)
+        _, synth_frames = collect(synth_df, None, synth_df.count(), cap, seed)
+    except (KeyError, AnalysisException):
+        return JoinDiscriminator(label=label)
+    real_rows, synth_rows = real_frames[ROW_FRAME], synth_frames[ROW_FRAME]
+    limit = config.marginal.categorical_max_distinct
+    kinds = {leaf.path: leaf_kind(leaf, real_rows[leaf.path], limit) for leaf in leaves if leaf.path in synth_rows}
+    child = tables[fk.child_table]
+    discriminator = _discriminator(
+        real_rows,
+        synth_rows,
+        kinds,
+        {leaf.path: leaf.root for leaf in leaves},
+        declared_identifiers(child, manifest.foreign_keys),
+        real_df.schema,
+        _split_columns(child, manifest.foreign_keys, real_rows),
+        seed,
+        config,
+    )
+    return JoinDiscriminator(label=label, discriminator=discriminator)
+
+
+def _joined(
+    fk: ForeignKey, tables: Mapping[str, Table], frames: Mapping[str, DataFrame], foreign_keys: Sequence[ForeignKey]
+) -> DataFrame:
+    """Returns the child's atomic columns inner-joined to the parent's, named `<parent>:<column>`.
+
+    Parent columns that are identifiers (`declared_identifiers`) are left out. A parent key held by several rows
+    (a broken synthetic key) keeps one of them, the least by value, so the join cannot multiply the child rows.
+    """
+    child, parent = frames[fk.child_table], frames[fk.parent_table]
+    hidden = declared_identifiers(tables[fk.parent_table], foreign_keys)
+    keys = [f"__fk{i}" for i in range(len(fk.parent_columns))]
+    values = [
+        quoted(f.name).alias(f"{fk.parent_table}:{f.name}")
+        for f in parent.schema.fields
+        if _atomic(f) and f.name not in hidden
+    ]
+    right = parent.select(*(quoted(p).alias(k) for p, k in zip(fk.parent_columns, keys, strict=True)), *values)
+    if values:
+        right = (
+            right.groupBy(*keys).agg(F.min(F.struct(*right.columns[len(keys) :])).alias("__v")).select(*keys, "__v.*")
+        )
+    else:
+        right = right.distinct()
+    left = child.select(*(quoted(f.name) for f in child.schema.fields if _atomic(f)))
+    condition = reduce(operator.and_, [quoted(c) == F.col(k) for c, k in zip(fk.child_columns, keys, strict=True)])
+    return left.join(right, condition, "inner").drop(*keys)
+
+
+def _fk_label(fk: ForeignKey) -> str:
+    return f"{fk.child_table}{list(fk.child_columns)} -> {fk.parent_table}{list(fk.parent_columns)}"

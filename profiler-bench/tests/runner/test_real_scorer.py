@@ -36,6 +36,19 @@ class _Score:
         assert ceiling.score == 0.9
         return 0.75
 
+    def discriminator_gap(self, ceiling: Any) -> _Gap:
+        return _Gap()
+
+    def group_means(self) -> dict[str, float]:
+        return {"keys": 1.0}
+
+
+class _Gap:
+    gap, auc, log_loss = 0.2, 0.6, 0.55
+
+    def model_dump(self, *, mode: str) -> dict[str, Any]:
+        return {"gap": self.gap}
+
 
 def _real_scorer(tmp_path: Path, **overrides: Any) -> _RealScorer:
     values: dict[str, Any] = {
