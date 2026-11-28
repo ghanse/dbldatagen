@@ -102,6 +102,23 @@ def test_discriminator_uses_categorical_codes() -> None:
     assert _discriminate(real, synth, np.ones(1, dtype=bool)).auc > 0.95
 
 
+def test_discriminator_drops_high_cardinality_string_identity() -> None:
+    real = pd.DataFrame({"value": [f"real-{i:04d}" for i in range(2000)]})
+    synth = pd.DataFrame({"value": [f"fake-{i:04d}" for i in range(2000)]})
+    encoder = stats.Encoder(real, {"value": "string"}, top=20)
+    (x_real, categorical), (x_synth, _) = encoder.tree_features(real), encoder.tree_features(synth)
+    result = _discriminate(x_real, x_synth, categorical)
+    assert result.auc == pytest.approx(0.5, abs=0.05)
+
+
+def test_discriminator_keeps_low_cardinality_label_identity() -> None:
+    real = pd.DataFrame({"value": ["real-a", "real-b"] * 1000})
+    synth = pd.DataFrame({"value": ["fake-a", "fake-b"] * 1000})
+    encoder = stats.Encoder(real, {"value": "categorical"}, top=20)
+    (x_real, categorical), (x_synth, _) = encoder.tree_features(real), encoder.tree_features(synth)
+    assert _discriminate(x_real, x_synth, categorical).auc > 0.95
+
+
 def test_entity_folds_keep_every_entity_on_one_side() -> None:
     rng = np.random.default_rng(0)
     orders, products = pd.Series(rng.integers(0, 300, 5000)), pd.Series(rng.integers(0, 40, 5000))

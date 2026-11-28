@@ -221,8 +221,10 @@ not relational identities:
 
 - **Features** leave out primary and unique key columns, the columns of every foreign key from or to the table,
   columns declared `unique` or `monotonic`, and integer columns whose sampled real values are at least 95% distinct
-  (undeclared ids, which real datasets have; `discriminator.id_min_distinct_share`). Derived string features count.
-  Key, foreign-key, and ordering quality keep their own metrics.
+  (undeclared ids, which real datasets have; `discriminator.id_min_distinct_share`). Low-cardinality categorical
+  strings keep their real top-value identities. High-cardinality strings omit value identity and use only shape:
+  length, character-class counts, and declared-format matches. The real sample alone decides which classification
+  applies. Key, foreign-key, and ordering quality keep their own metrics.
 - **Entity split.** A child table's entities are its foreign keys (a product, an order), a table without one its
   primary key; otherwise rows split by position. Each entity value hashes into the train or test half; a row is in
   the test fold when all its entities are, in training when all are, and dropped otherwise, so no product or order has

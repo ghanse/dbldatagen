@@ -697,10 +697,10 @@ def _discriminator_targeted_gate(
         details[target] = ci.to_dict() | {"baseline_gap": baseline.get(target), "saturated": saturated}
         if ci.high < -noise:
             outcome["worse"].append(target)
-        elif ci.point >= required and ci.low > floor:
-            outcome["improved"].append(target)
         elif saturated:
             outcome["saturated"].append(target)
+        elif ci.point >= required and ci.low > floor:
+            outcome["improved"].append(target)
         elif ci.low <= floor < ci.high:
             outcome["inconclusive"].append(target)
     status: Literal["pass", "fail", "inconclusive"] = "fail"

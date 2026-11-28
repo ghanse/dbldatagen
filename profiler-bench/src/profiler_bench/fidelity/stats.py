@@ -164,8 +164,9 @@ class Encoder:
     def tree_features(self, frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         """Returns features for a tree model and which of them are categorical.
 
-        Numeric columns become their real rank, categorical and string columns the index of their top-value bucket
-        (`other` last), and string columns also their length rank; nulls are NaN.
+        Numeric columns become their real rank. Categorical columns become the index of their top-value bucket
+        (`other` last), preserving meaningful low-cardinality label identity. High-cardinality strings contribute
+        only their length rank; their derived shape features are separate numeric/categorical columns. Nulls are NaN.
         """
         blocks: list[np.ndarray] = []
         categorical: list[bool] = []
@@ -175,13 +176,14 @@ class Encoder:
                 blocks.append(_ranks(values, self.sorted[column]))
                 categorical.append(False)
                 continue
+            if kind == "string":
+                blocks.append(_ranks(values.dropna().map(len).reindex(values.index), self.lengths[column]))
+                categorical.append(False)
+                continue
             index = {b: i for i, b in enumerate(self.buckets[column])}
             other = float(len(index))
             blocks.append(np.array([np.nan if pd.isna(v) else index.get(v, other) for v in values], dtype=np.float64))
             categorical.append(True)
-            if kind == "string":
-                blocks.append(_ranks(values.dropna().map(len).reindex(values.index), self.lengths[column]))
-                categorical.append(False)
         matrix = np.column_stack(blocks) if blocks else np.zeros((len(frame), 0))
         return matrix, np.array(categorical, dtype=bool)
 

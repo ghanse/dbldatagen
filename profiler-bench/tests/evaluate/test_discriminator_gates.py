@@ -148,11 +148,44 @@ def test_targeted_path_rejects_a_worse_target() -> None:
     assert verdict["verdict"] == "rejected"
 
 
+def test_targeted_path_is_inconclusive_when_ci_straddles_zero() -> None:
+    policy = _policy()
+    speed, fidelity = _records({})
+    improvements = [0.04, 0.04, -0.01, -0.01]
+    baseline = {
+        (record["dataset"], record["seed"]): record["discriminator_gap"]
+        for record in fidelity
+        if record["role"] == "baseline"
+    }
+    for record in fidelity:
+        if record["dataset"] == "numeric" and record["role"] == "candidate":
+            record["discriminator_gap"] = baseline[("numeric", record["seed"])] - improvements[record["seed"]]
+    verdict = evaluate_gates(
+        speed_records=speed,
+        fidelity_records=fidelity,
+        policy=policy,
+        proposal={"type": "accuracy", "targets": {"datasets": ["numeric"]}},
+        run=_run(policy),
+    )
+    gate = _gate(verdict, "accuracy_targeted")
+    assert gate["status"] == "inconclusive"
+    assert gate["reason"] == "target_improvement_inconclusive"
+
+
+def test_targeted_path_rejects_improvement_below_required_minimum() -> None:
+    verdict = _evaluate({"numeric": {"gap": 0.49}}, targets=["numeric"])
+    gate = _gate(verdict, "accuracy_targeted")
+    assert gate["status"] == "fail"
+    assert gate["reason"] == "target_improvement_insufficient"
+
+
 def test_saturated_target_cannot_carry_the_targeted_path() -> None:
-    verdict = _evaluate({"numeric": {"gap": 0.001}}, baseline={"numeric": {"gap": 0.001}}, targets=["numeric"])
+    verdict = _evaluate({"numeric": {"gap": -0.025}}, baseline={"numeric": {"gap": 0.001}}, targets=["numeric"])
     gate = _gate(verdict, "accuracy_targeted")
     assert gate["reason"] == "targets_saturated"
     assert gate["detail"]["targets"]["numeric"]["saturated"] is True
+    assert gate["detail"]["outcome"]["saturated"] == ["numeric"]
+    assert gate["detail"]["outcome"]["improved"] == []
     assert verdict["verdict"] == "rejected"
 
 
