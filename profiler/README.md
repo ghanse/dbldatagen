@@ -183,8 +183,11 @@ The Spark profiler emits numeric and temporal quantiles on the fixed grid
 Quantiles require at least six times `privacy.min_value_count` (k) non-null values, one k-sized support interval per
 core grid step. A tail point `q` also needs k rows beyond it (`non_null * min(q, 1 - q) >= k`); otherwise it is dropped.
 
-Integer columns with 2 to 64 distinct values get an exact histogram instead of quantiles, from one extra grouped Spark
-job per table (or nested level: all sibling fields of a struct/map share that job). Each bin starts as one value and
+Integer columns with 2 to 64 distinct values get an exact histogram instead of quantiles. When the active Spark
+*session* is 4.1+ (detected from `df.sparkSession.version`, not the PySpark client wheel), value counts are folded
+into the chunked per-table (and nested) main aggregates via `approx_top_k(col, 65, maxItemsTracked=65)` — the extra
+slot covers null (which ApproxTopK returns as an item) so 64 non-null distinct values stay exact after nulls are
+dropped. Older session runtimes keep one grouped job per table or nested level. Each bin starts as one value and
 merges with its upper neighbour until it holds at least k rows. When `privacy.extremes` is `suppressed`, the outer
 edges are widened to the nearest multiples, strictly outside the data, of a power of ten one digit shorter than the
 value range, and `generalized_outer_edges` is true; the histogram is omitted if the widened edges fall outside the
