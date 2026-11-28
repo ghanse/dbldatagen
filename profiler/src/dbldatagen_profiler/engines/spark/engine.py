@@ -78,6 +78,10 @@ _MAX_PEARSON_CORRELATION = 0.999
 # efficiently. Each chunk is evaluated independently in schema order.
 _AGGREGATE_COLUMNS_PER_CHUNK = 25
 
+# Spark 4.1's approx_top_k is exact when distinct <= k and folds into the main
+# aggregate; older runtimes keep the separate groupBy value-count job.
+_APPROX_TOP_K_VERSION = (4, 1)
+
 
 def profile_tables(
     tables: Mapping[str, DataFrame],
@@ -407,6 +411,13 @@ def _aggregate_expressions(column: Column, data_type: T.DataType, index: int) ->
                 F.percentile_approx(column, list(_QUANTILE_GRID), _QUANTILE_ACCURACY).alias(f"{prefix}_quantiles"),
             ]
         )
+        if isinstance(data_type, tuple(_INTEGER_BITS)) and _fold_histogram_value_counts():
+            # approx_top_k is exact for distinct <= k (see Spark 4.1 ApproxTopK); nulls are dropped below.
+            expressions.append(
+                F.call_function("approx_top_k", column.cast("long"), F.lit(_HISTOGRAM_MAX_DISTINCT)).alias(
+                    f"{prefix}_top_k"
+                )
+            )
     elif isinstance(data_type, _string_types()):
         length = F.length(column)
         expressions.extend(
@@ -514,7 +525,7 @@ def _profile_children(df: DataFrame, field: T.StructField, privacy: PrivacyPolic
 def _profile_nested_fields(
     df: DataFrame, children: list[tuple[T.StructField, Column]], privacy: PrivacyPolicy
 ) -> list[ColumnProfile]:
-    """Profiles sibling nested fields with one aggregate and one histogram value-count job per level."""
+    """Profiles sibling nested fields with one aggregate per level (value counts folded when supported)."""
     expressions: list[Column] = [F.count(F.lit(1)).alias("__row_count")]
     for index, (field, column) in enumerate(children):
         expressions.extend(_aggregate_expressions(column, field.dataType, index))
@@ -546,10 +557,44 @@ def _collect_aggregate(df: DataFrame, expressions: list[Column]) -> dict[str, An
     return row.asDict()
 
 
+def _fold_histogram_value_counts() -> bool:
+    """Returns whether integer histogram counts are folded into the main aggregate via approx_top_k."""
+    parts = pyspark.__version__.split(".")[:2]
+    try:
+        return tuple(int(part) for part in parts) >= _APPROX_TOP_K_VERSION
+    except ValueError:
+        return False
+
+
+def _value_counts_from_top_k(top_k: object) -> list[tuple[int, int]] | None:
+    """Converts an approx_top_k result into ascending (value, count) pairs, dropping nulls."""
+    if not isinstance(top_k, list):
+        return None
+    pairs: list[tuple[int, int]] = []
+    for entry in top_k:
+        if entry is None:
+            continue
+        try:
+            value, count = entry["item"], entry["count"]
+        except (KeyError, TypeError):
+            continue
+        if value is None:
+            continue
+        pairs.append((int(value), int(count)))
+    pairs.sort(key=lambda pair: pair[0])
+    return pairs
+
+
 def _with_value_counts(
     df: DataFrame, columns: list[tuple[str, Column, T.DataType]], values: dict[str, Any]
 ) -> dict[str, Any]:
-    """Adds exact sorted (value, count) pairs for low-cardinality integer columns, in one grouped job."""
+    """Adds exact sorted (value, count) pairs for low-cardinality integer columns.
+
+    On Spark 4.1+, counts come from ``approx_top_k`` already collected in the chunked /
+    nested main aggregate (exact when distinct is at most ``_HISTOGRAM_MAX_DISTINCT``), so
+    no extra job runs. Older Spark falls back to one grouped job. ``df`` and ``columns``
+    stay in the signature so a later frequent-string path (rsi-0009) can reuse this hook.
+    """
     eligible = [
         (prefix, column)
         for prefix, column, data_type in columns
@@ -557,14 +602,24 @@ def _with_value_counts(
     ]
     if not eligible:
         return values
+
+    if _fold_histogram_value_counts():
+        counts: dict[str, list[tuple[int, int]]] = {}
+        for prefix, _ in eligible:
+            pairs = _value_counts_from_top_k(values.get(f"{prefix}_top_k"))
+            distinct = int(values[f"{prefix}_distinct"])
+            if pairs is not None and len(pairs) == distinct:
+                counts[prefix] = pairs
+        return {**values, **{f"{prefix}_value_counts": pairs for prefix, pairs in counts.items()}}
+
     entries = F.explode(
         F.array(*(F.struct(F.lit(prefix).alias("p"), column.cast("long").alias("v")) for prefix, column in eligible))
     )
     rows = df.select(entries.alias("e")).select("e.*").where(F.col("v").isNotNull()).groupBy("p", "v").count()
-    counts: dict[str, list[tuple[int, int]]] = {prefix: [] for prefix, _ in eligible}
+    grouped: dict[str, list[tuple[int, int]]] = {prefix: [] for prefix, _ in eligible}
     for row in sorted(rows.collect(), key=lambda row: (row["p"], row["v"])):
-        counts[row["p"]].append((row["v"], row["count"]))
-    return {**values, **{f"{prefix}_value_counts": pairs for prefix, pairs in counts.items()}}
+        grouped[row["p"]].append((row["v"], row["count"]))
+    return {**values, **{f"{prefix}_value_counts": pairs for prefix, pairs in grouped.items()}}
 
 
 def _numeric_stats(

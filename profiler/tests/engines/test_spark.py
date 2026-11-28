@@ -1,6 +1,7 @@
 """Tests for the baseline PySpark profiling engine."""
 
 import time
+from collections.abc import Callable
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
@@ -12,7 +13,14 @@ from pyspark.sql import types as T
 from dbldatagen_profiler.engines.spark import engine as spark_engine
 from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
 from dbldatagen_profiler.engines.spark.engine import _histogram, _logical_type, _numeric_stats, _pearson_pairs
-from dbldatagen_profiler.model import LogicalType, PrivacyPolicy, TableProfile, ValueTreatment, profile_json_schema
+from dbldatagen_profiler.model import (
+    LogicalType,
+    PrivacyPolicy,
+    Profile,
+    TableProfile,
+    ValueTreatment,
+    profile_json_schema,
+)
 
 
 pytestmark = [pytest.mark.spark, pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")]
@@ -418,6 +426,69 @@ def test_nested_integer_children_get_histograms(spark: SparkSession) -> None:
     assert histogram.counts == [25, 25, 25, 25]
     assert columns[1].children is not None
     assert [child.numeric.histogram is not None for child in columns[1].children if child.numeric] == [True, True]
+
+
+def _low_cardinality_histogram_frame(spark: SparkSession) -> DataFrame:
+    """Top-level and nested low-cardinality ints used for fold-vs-groupby parity tests."""
+    return spark.range(100).selectExpr(
+        "CAST(id % 4 AS INT) AS top",
+        "array(CAST(id % 4 AS INT)) AS items",
+        "named_struct('a', CAST(id % 3 AS INT), 'b', CAST(id % 5 AS INT)) AS pair",
+    )
+
+
+def _normalized_profile_json(profile: Profile) -> str:
+    return profile.model_copy(update={"created_at": datetime(2000, 1, 1, tzinfo=timezone.utc)}).model_dump_json()
+
+
+def _spark_job_count(spark: SparkSession, run: Callable[[], object]) -> int:
+    group = f"profiler-jobs-{time.time_ns()}"
+    spark.sparkContext.setJobGroup(group, group)
+    run()
+    return len(spark.sparkContext.statusTracker().getJobIdsForGroup(group))
+
+
+@pytest.mark.skipif(
+    not spark_engine._fold_histogram_value_counts(),
+    reason="folded histogram value counts require Spark 4.1+ approx_top_k",
+)
+def test_folded_histogram_profiles_match_groupby_engine(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    frame = _low_cardinality_histogram_frame(spark).cache()
+    frame.count()
+
+    monkeypatch.setattr(spark_engine, "_fold_histogram_value_counts", lambda: False)
+    groupby_profile = profile_dataframe("hist", frame, detect_pii=False)
+    monkeypatch.setattr(spark_engine, "_fold_histogram_value_counts", lambda: True)
+    folded_profile = profile_dataframe("hist", frame, detect_pii=False)
+
+    assert _normalized_profile_json(folded_profile) == _normalized_profile_json(groupby_profile)
+    table = folded_profile.tables[0]
+    assert table.columns[0].numeric is not None and table.columns[0].numeric.histogram is not None
+    assert table.columns[1].children is not None and table.columns[1].children[0].numeric is not None
+    assert table.columns[1].children[0].numeric.histogram is not None
+    assert table.columns[2].children is not None
+    assert all(child.numeric is not None and child.numeric.histogram is not None for child in table.columns[2].children)
+    frame.unpersist()
+
+
+@pytest.mark.skipif(
+    not spark_engine._fold_histogram_value_counts(),
+    reason="folded histogram value counts require Spark 4.1+ approx_top_k",
+)
+def test_folded_histogram_value_counts_remove_extra_spark_job(
+    spark: SparkSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frame = _low_cardinality_histogram_frame(spark).cache()
+    frame.count()
+
+    def count_jobs(*, fold: bool) -> int:
+        monkeypatch.setattr(spark_engine, "_fold_histogram_value_counts", lambda fold=fold: fold)
+        return _spark_job_count(spark, lambda: profile_dataframe("hist", frame, detect_pii=False))
+
+    with_groupby = count_jobs(fold=False)
+    folded = count_jobs(fold=True)
+    assert folded < with_groupby
+    frame.unpersist()
 
 
 @pytest.mark.parametrize(
