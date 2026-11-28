@@ -126,11 +126,25 @@ def _comparable(profile: Profile) -> dict[str, Any]:
     data = profile.model_dump(mode="json")
     data.pop("created_at")
     data.pop("engine")
+    _drop_batch_only_string_stats(data)
     # The streaming state does not retain cross-column moments, so dependencies
     # are intentionally outside the documented batch/stream equivalence set.
     for table in data["tables"]:
         table.pop("dependencies")
     return data
+
+
+def _drop_batch_only_string_stats(data: object) -> None:
+    """Drops string statistics that the mergeable streaming state does not retain."""
+    if isinstance(data, dict):
+        string = data.get("string")
+        if isinstance(string, dict):
+            string["top_values"] = None
+        for value in data.values():
+            _drop_batch_only_string_stats(value)
+    elif isinstance(data, list):
+        for item in data:
+            _drop_batch_only_string_stats(item)
 
 
 def _assert_equivalent(batch: object, stream: object, path: str = "") -> None:

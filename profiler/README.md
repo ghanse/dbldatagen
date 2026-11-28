@@ -47,6 +47,16 @@ uv run --package dbldatagen-profiler --all-extras dbldatagen-profile profile \
 The input format may be `parquet`, `csv`, or `delta`. PySpark is an optional extra; install
 `dbldatagen-profiler[spark]` when using the engine as a library.
 
+### Frequent string values
+
+The batch engine emits up to 32 `string.top_values`, ordered by frequency and then value, only when the full column
+has at most 64 distinct non-null values and the emitted k-safe values cover at least 90% of its non-null population.
+Each value is counted exactly, occurs at least `privacy.min_value_count` times, and its frequency uses that population.
+Values are omitted when enumerations are suppressed or PII detection is disabled, and from direct identifiers,
+secrets, free text, and columns covered by a PII policy rule. Nested values use their nested population for both the
+threshold and frequency. A table or nested level with more than 16 sibling string columns emits none, preventing
+high-dimensional combinations of individually frequent literals from recreating rare row pairs.
+
 ### Streaming
 
 `dbldatagen_profiler.engines.streaming` profiles data as it arrives. Each micro-batch is reduced to a mergeable
@@ -76,8 +86,8 @@ With an interval trigger the command runs until interrupted and rewrites `profil
 
 The streaming engine requires pyspark 3.5 or later (for Spark's `hll_sketch_agg`); `StreamingProfiler` and
 `dbldatagen-profile stream` fail with a clear error on older versions. The batch engine still supports pyspark 3.4.1.
-Quantiles and cross-column dependencies are batch-only because streaming checkpoints do not retain mergeable
-percentile sketches or cross-column moments.
+Quantiles, string `top_values`, and cross-column dependencies are batch-only because streaming checkpoints do not
+retain mergeable percentile sketches, exact value counts, or cross-column moments.
 
 A snapshot equals the batch profile of the same rows on these statistics: row count, null fraction, nested
 `value_count`, numeric and temporal min/max (lossless for decimal and int64), string and collection length
