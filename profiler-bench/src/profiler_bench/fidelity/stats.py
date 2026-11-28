@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -163,8 +164,9 @@ class Encoder:
     def tree_features(self, frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         """Returns features for a tree model and which of them are categorical.
 
-        Numeric columns become their real rank, categorical and string columns the index of their top-value bucket
-        (`other` last), and string columns also their length rank; nulls are NaN.
+        Numeric columns become their real rank. Categorical columns become the index of their top-value bucket
+        (`other` last), preserving meaningful low-cardinality label identity. High-cardinality strings contribute
+        only their length rank; their derived shape features are separate numeric/categorical columns. Nulls are NaN.
         """
         blocks: list[np.ndarray] = []
         categorical: list[bool] = []
@@ -174,13 +176,14 @@ class Encoder:
                 blocks.append(_ranks(values, self.sorted[column]))
                 categorical.append(False)
                 continue
+            if kind == "string":
+                blocks.append(_ranks(values.dropna().map(len).reindex(values.index), self.lengths[column]))
+                categorical.append(False)
+                continue
             index = {b: i for i, b in enumerate(self.buckets[column])}
             other = float(len(index))
             blocks.append(np.array([np.nan if pd.isna(v) else index.get(v, other) for v in values], dtype=np.float64))
             categorical.append(True)
-            if kind == "string":
-                blocks.append(_ranks(values.dropna().map(len).reindex(values.index), self.lengths[column]))
-                categorical.append(False)
         matrix = np.column_stack(blocks) if blocks else np.zeros((len(frame), 0))
         return matrix, np.array(categorical, dtype=bool)
 
@@ -245,27 +248,135 @@ def mismatches(codes_a: list[np.ndarray], codes_b: list[np.ndarray]) -> np.ndarr
     return total
 
 
-def discriminator_auc(real: np.ndarray, synth: np.ndarray, categorical: np.ndarray, seed: int, max_iter: int) -> float:
-    """Returns the held-out AUC of a gradient-boosted classifier telling synthetic (positive) from real rows.
+LOG_LOSS_EPS = 1e-6
 
-    Row `i` of both sides goes to the same half, so the split is stratified and an identical pair of samples cannot
-    be told apart. The classifier trains on one half and is scored on the other, on one thread: parallel histogram
-    building is many times slower beside a local Spark session.
+
+@dataclass(frozen=True)
+class Discrimination:
+    """Held-out result of a two-sample classifier telling synthetic (positive) from real rows.
+
+    Attributes:
+        auc: Area under the ROC curve on the test half.
+        log_loss: Mean binary cross-entropy on the test half, with probabilities clipped to
+            [`LOG_LOSS_EPS`, 1 - `LOG_LOSS_EPS`]; ln 2 for a classifier that always says 0.5.
+        n_test: Test rows per side.
+        histogram: Counts of the predicted synthetic probability in equal-width bins over [0, 1], per side.
+    """
+
+    auc: float
+    log_loss: float
+    n_test: int
+    histogram: dict[str, list[int]]
+
+
+FIT, VALIDATION, TEST, DROPPED = 0, 1, 2, -1
+VALIDATION_SHARE = 5
+
+
+def entity_folds(entities: Sequence[pd.Series], seed: int) -> np.ndarray:
+    """Returns the fold of each row (`FIT`, `VALIDATION`, `TEST`, or `DROPPED`) from seeded hashes of its entities.
+
+    Each entity column (say a row's product and its order) hashes every value into the train or the test half. A row
+    is in the test fold when all its entities are in the test half, in training when all are in the train half, and
+    dropped otherwise, so no entity has rows on both sides of the split. One training row in `VALIDATION_SHARE`, by a
+    second hash of the first entity column, is held out for choosing the boosting iteration. Equal entity values on
+    both sides of a comparison land in the same fold, so identical samples cannot be told apart. `entities` must not
+    be empty; pass the row position to split by row.
+    """
+
+    def hashed(values: pd.Series, salt: int) -> np.ndarray:
+        key = f"{(seed * 2 + salt) % 10**16:016d}"
+        hashes: np.ndarray = pd.util.hash_pandas_object(values.astype(str), index=False, hash_key=key).to_numpy()
+        return hashes
+
+    train = np.ones(len(entities[0]), dtype=bool)
+    test = np.ones(len(entities[0]), dtype=bool)
+    for values in entities:
+        half = hashed(values, 0) % 2 == 0
+        train &= half
+        test &= ~half
+    validation = train & (hashed(entities[0], 1) % VALIDATION_SHARE == 0)
+    folds = np.full(len(train), DROPPED)
+    folds[train] = FIT
+    folds[validation] = VALIDATION
+    folds[test] = TEST
+    return folds
+
+
+def discriminate(
+    real: np.ndarray,
+    synth: np.ndarray,
+    categorical: np.ndarray,
+    folds: tuple[np.ndarray, np.ndarray],
+    seed: int,
+    max_iter: int,
+    min_samples_leaf: int,
+    bins: int,
+) -> Discrimination | None:
+    """Trains a gradient-boosted classifier on the fit fold of each side and scores it on the test fold.
+
+    Each fold keeps as many rows of each side as the smaller side has, so the classes are balanced and the trivial
+    log-loss is ln 2. The boosting iteration, including none (the constant prior 0.5), is the one with the lowest
+    log-loss on the validation fold. That fold holds out whole entities, so a classifier that only memorizes entity
+    values (a product's sample-specific price) stops early instead of turning overconfident, and two samples of one
+    distribution score a log-loss near ln 2. The classifier runs on one thread: parallel histogram building is many
+    times slower beside a local Spark session.
 
     Args:
         real: Real feature rows.
-        synth: Synthetic feature rows, as many as `real`.
+        synth: Synthetic feature rows.
         categorical: Which feature columns hold category codes.
-        seed: Seed of the split and the classifier.
-        max_iter: Boosting iterations.
+        folds: Fold of each real and each synthetic row, see `entity_folds`.
+        seed: Seed of the classifier.
+        max_iter: Most boosting iterations.
+        min_samples_leaf: Fewest training rows per leaf.
+        bins: Histogram bins of the predicted probabilities.
+
+    Returns:
+        None when the fit or test fold has no row of one side.
     """
-    order = np.random.default_rng(seed).permutation(len(real))
-    train, test = order[: len(order) // 2], order[len(order) // 2 :]
+
+    def balanced(fold: int) -> tuple[np.ndarray, np.ndarray]:
+        a, b = np.flatnonzero(folds[0] == fold), np.flatnonzero(folds[1] == fold)
+        n = min(len(a), len(b))
+        labels = np.concatenate([np.zeros(n), np.ones(n)]).astype(np.int64)
+        return np.vstack([real[a[:n]], synth[b[:n]]]), labels
+
+    (x_fit, y_fit), (x_val, y_val), (x_test, y_test) = balanced(FIT), balanced(VALIDATION), balanced(TEST)
+    if len(y_fit) == 0 or len(y_test) == 0:
+        return None
     model = HistGradientBoostingClassifier(
-        max_iter=max_iter, early_stopping=False, categorical_features=categorical, random_state=seed
+        max_iter=max_iter,
+        min_samples_leaf=min_samples_leaf,
+        early_stopping=False,
+        categorical_features=categorical,
+        random_state=seed,
     )
-    labels = np.concatenate([np.zeros(len(train)), np.ones(len(train))])
     with threadpool_limits(1):
-        model.fit(np.vstack([real[train], synth[train]]), labels)
-        scores = model.predict_proba(np.vstack([real[test], synth[test]]))[:, 1]
-    return auc(scores, np.concatenate([np.zeros(len(test)), np.ones(len(test))]).astype(np.int64))
+        model.fit(x_fit, y_fit)
+        best = max_iter
+        if len(y_val):
+            losses = [log_loss(np.full(len(y_val), 0.5), y_val)]
+            losses += [log_loss(p[:, 1], y_val) for p in model.staged_predict_proba(x_val)]
+            best = int(np.argmin(losses))
+        scores = np.full(len(y_test), 0.5)
+        for iteration, staged in enumerate(model.staged_predict_proba(x_test), start=1):
+            if iteration == best:
+                scores = staged[:, 1]
+                break
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    return Discrimination(
+        auc=auc(scores, y_test),
+        log_loss=log_loss(scores, y_test),
+        n_test=len(y_test) // 2,
+        histogram={
+            side: np.histogram(scores[y_test == label], bins=edges)[0].tolist()
+            for side, label in (("real", 0), ("synth", 1))
+        },
+    )
+
+
+def log_loss(probabilities: np.ndarray, labels: np.ndarray) -> float:
+    """Returns the mean binary cross-entropy of `probabilities` of the positive class, clipped by `LOG_LOSS_EPS`."""
+    p = np.clip(probabilities, LOG_LOSS_EPS, 1 - LOG_LOSS_EPS)
+    return float(-np.mean(labels * np.log(p) + (1 - labels) * np.log(1 - p)))

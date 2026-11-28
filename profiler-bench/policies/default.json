@@ -1,5 +1,5 @@
 {
-  "version": "2.2.0",
+  "version": "3.0.0",
   "bootstrap": {
     "samples": 2000,
     "seed": 0,
@@ -29,14 +29,24 @@
     "speed_samples": {
       "r": 2
     },
-    "note": "Screening never accepts. Gate thresholds use the same accuracy logic with looser margins: improvement floors are multiplied by (1-margin) and regression ceilings by (1+margin), so borderline proposals become screen_pass. Verdicts are only screen_pass or screen_fail; screen_fail is a rejection, screen_pass proceeds to the official tier-s run. Privacy failure is always screen_fail. Synthetic suite and accuracy proposals only."
+    "note": "Screening never accepts. Gate thresholds use the same accuracy logic with looser margins: improvement floors are multiplied by (1-margin) and regression ceilings by (1+margin), so borderline proposals become screen_pass. The discriminator section is loosened the same way (max_group_regression is a regression ceiling). Verdicts are only screen_pass or screen_fail; screen_fail is a rejection, screen_pass proceeds to the official tier-s run. Privacy failure is always screen_fail. Synthetic suite and accuracy proposals only."
   },
+  "accuracy_metric": "discriminator",
   "accuracy": {
-    "min_mean_improvement": 0.005,
-    "min_target_improvement": 0.01,
     "ci_lower_must_exceed": 0.0,
     "max_dataset_regression": 0.01,
-    "max_structure_regression": 0.02
+    "max_structure_regression": 0.02,
+    "note": "Under accuracy_metric discriminator the composite (relative reconstruction) is a guard, not a target: no dataset may regress by more than max_dataset_regression; structure keeps max_structure_regression."
+  },
+  "discriminator": {
+    "min_mean_improvement": 0.01,
+    "min_target_improvement": 0.02,
+    "ci_lower_must_exceed": 0.0,
+    "max_dataset_regression": 0.02,
+    "max_group_regression": 0.02,
+    "guard_groups": ["keys", "foreign_keys", "constraints"],
+    "noise_floor": 0.005,
+    "note": "Improvement is baseline minus candidate discriminator_gap (lower gap is better). Accept on the global mean over datasets or on targets (a target is worse when its improvement CI lies below -noise_floor, and saturated when its baseline gap is at most noise_floor); guards reject a dataset gap worsening, a guard group regressing, a composite regression, structure, privacy, completeness, and control. min_mean_improvement starts at 0.01 and is to be calibrated from the baseline-refresh noise."
   },
   "speed": {
     "min_target_improvement": 0.05,

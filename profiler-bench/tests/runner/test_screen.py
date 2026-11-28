@@ -70,6 +70,7 @@ def _fidelity(
         "reconstruction": relative * 0.9,
         "structure": structure,
         "relative_reconstruction": relative,
+        "discriminator_gap": 1.0 - relative,
         "privacy_passed": privacy,
         "ceiling": 0.9,
     }
@@ -102,11 +103,14 @@ def _run_meta(*, stage: str = "official", tier: str = "s", seeds: int = 5, datas
 def test_screen_thresholds_apply_margin() -> None:
     policy = load_policy(DEFAULT_POLICY)
     screened = screened_accuracy_thresholds(policy)
-    assert screened["min_mean_improvement"] == pytest.approx(0.0025)
-    assert screened["min_target_improvement"] == pytest.approx(0.005)
     assert screened["max_dataset_regression"] == pytest.approx(0.015)
     assert screened["max_structure_regression"] == pytest.approx(0.03)
     assert screened["ci_lower_must_exceed"] == 0.0
+    discriminator = screened_accuracy_thresholds(policy, section="discriminator")
+    assert discriminator["min_mean_improvement"] == pytest.approx(0.005)
+    assert discriminator["min_target_improvement"] == pytest.approx(0.01)
+    assert discriminator["max_dataset_regression"] == pytest.approx(0.03)
+    assert discriminator["max_group_regression"] == pytest.approx(0.03)
 
 
 def test_apply_screen_overrides_sets_tier_and_seeds() -> None:
@@ -115,7 +119,7 @@ def test_apply_screen_overrides_sets_tier_and_seeds() -> None:
     assert policy["fidelity_seeds"] == 3
     assert policy["speed_tiers"] == ["r"]
     assert policy["speed_samples_accuracy"]["r"] == 2
-    assert policy["accuracy"]["min_mean_improvement"] == pytest.approx(0.0025)
+    assert policy["discriminator"]["min_mean_improvement"] == pytest.approx(0.005)
 
 
 def test_screen_pass_never_accepted() -> None:
@@ -176,14 +180,14 @@ def test_screen_privacy_failure_is_screen_fail() -> None:
 
 
 def test_screen_margin_lets_borderline_through() -> None:
-    """Official thresholds would reject +0.003; screen margin 0.5 accepts as screen_pass."""
+    """Official discriminator threshold rejects +0.007; screen margin 0.5 accepts it as screen_pass."""
     run = _run_meta(stage="screen")
     policy = run["policy"]
     speed = [_speed(role, "numeric", "r", i) for role in ("baseline", "candidate") for i in range(2)]
     fidelity = []
     for seed in range(3):
         fidelity.append(_fidelity("baseline", "numeric", "r", seed, relative=0.80))
-        fidelity.append(_fidelity("candidate", "numeric", "r", seed, relative=0.803))
+        fidelity.append(_fidelity("candidate", "numeric", "r", seed, relative=0.807))
     screen = evaluate_gates(
         speed_records=speed,
         fidelity_records=fidelity,

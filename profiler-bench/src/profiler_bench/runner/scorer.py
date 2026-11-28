@@ -32,6 +32,11 @@ class FidelityScores:
         detail: Full per-metric detail from the underlying scorers.
         metrics_config_hash: Hash of the metrics configuration that produced the scores.
         privacy_status: `pass`, `fail`, or `unmeasured` on real datasets (see `PrivacyScore.status`); None otherwise.
+        discriminator_gap: Discriminator log-loss gap against the ceiling, in [0, 1], lower is better (see
+            `ReconstructionScore.discriminator_gap`); None when the ceiling has no discriminator unit.
+        discriminator_auc: Mean held-out discriminator AUC over the dataset's tables and foreign-key joins.
+        discriminator_log_loss: Mean held-out discriminator log-loss over the same.
+        reconstruction_groups: Mean of each reconstruction group over the tables that have it.
     """
 
     reconstruction: float
@@ -43,6 +48,10 @@ class FidelityScores:
     detail: dict[str, Any]
     metrics_config_hash: str
     privacy_status: str | None = None
+    discriminator_gap: float | None = None
+    discriminator_auc: float | None = None
+    discriminator_log_loss: float | None = None
+    reconstruction_groups: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a JSON-serializable mapping."""
@@ -83,6 +92,7 @@ class FakeScorer:
     structure: float = 0.7
     privacy_passed: bool = True
     ceiling_value: float = 0.9
+    discriminator_gap: float = 0.3
     metrics_config_hash: str = "fake-metrics"
     by_seed: dict[int, dict[str, Any]] = field(default_factory=dict)
     by_role_seed: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
@@ -103,7 +113,11 @@ class FakeScorer:
         structure_seed: int,
         sample_seed: int,
     ) -> FidelityScores:
-        """Returns configured scores, optionally overridden per seed or (role, seed)."""
+        """Returns configured scores, optionally overridden per seed or (role, seed).
+
+        Overridable values: `reconstruction`, `structure`, `privacy_passed`, `discriminator_gap`, and
+        `reconstruction_groups` (default 1.0 for `keys`, `foreign_keys`, and `constraints`).
+        """
         del profile, tier, structure_seed, sample_seed
         if not self.fail_datasets or dataset in self.fail_datasets:
             if self.crash_exit_code is not None:
@@ -114,6 +128,8 @@ class FakeScorer:
             "reconstruction": self.reconstruction,
             "structure": self.structure,
             "privacy_passed": self.privacy_passed,
+            "discriminator_gap": self.discriminator_gap,
+            "reconstruction_groups": dict.fromkeys(("keys", "foreign_keys", "constraints"), 1.0),
         }
         if seed in self.by_seed:
             values.update(self.by_seed[seed])
@@ -131,6 +147,10 @@ class FakeScorer:
             privacy_unmeasured=[],
             detail={"dataset": dataset, "seed": seed, "values": values},
             metrics_config_hash=self.metrics_config_hash,
+            discriminator_gap=float(values["discriminator_gap"]),
+            discriminator_auc=0.5 + float(values["discriminator_gap"]) / 2,
+            discriminator_log_loss=0.7 * (1 - float(values["discriminator_gap"])),
+            reconstruction_groups={k: float(v) for k, v in dict(values["reconstruction_groups"]).items()},
         )
 
     def ceiling(self, dataset: str, tier: str, *, structure_seed: int = 0) -> float:
@@ -145,6 +165,7 @@ class FakeScorer:
             structure=self.structure,
             privacy_passed=self.privacy_passed,
             ceiling_value=self.ceiling_value,
+            discriminator_gap=self.discriminator_gap,
             metrics_config_hash=self.metrics_config_hash,
             by_seed=dict(self.by_seed),
             by_role_seed=dict(self.by_role_seed),
@@ -164,6 +185,7 @@ class FakeScorer:
             "structure": self.structure,
             "privacy_passed": self.privacy_passed,
             "ceiling_value": self.ceiling_value,
+            "discriminator_gap": self.discriminator_gap,
             "metrics_config_hash": self.metrics_config_hash,
             "by_seed": {str(seed): dict(values) for seed, values in self.by_seed.items()},
             "by_role_seed": {f"{role}:{seed}": dict(values) for (role, seed), values in self.by_role_seed.items()},
@@ -189,6 +211,7 @@ def scorer_from_spec(spec: dict[str, Any]) -> Scorer:
             structure=float(spec.get("structure", 0.7)),
             privacy_passed=bool(spec.get("privacy_passed", True)),
             ceiling_value=float(spec.get("ceiling_value", 0.9)),
+            discriminator_gap=float(spec.get("discriminator_gap", 0.3)),
             metrics_config_hash=str(spec.get("metrics_config_hash", "fake-metrics")),
             by_seed={int(seed): dict(values) for seed, values in dict(spec.get("by_seed", {})).items()},
             by_role_seed=by_role_seed,
@@ -432,6 +455,7 @@ def _score_with_real_modules(
             "privacy": privacy.model_dump(mode="json"),
             "ceiling": ceiling.model_dump(mode="json"),
             "relative_to_ceiling": relative,
+            "discriminator_gap": reconstruction.discriminator_gap(ceiling).model_dump(mode="json"),
             "seeds": {
                 "sampler": seed,
                 "structure": structure_seed,
@@ -441,7 +465,19 @@ def _score_with_real_modules(
             },
         },
         metrics_config_hash=str(reconstruction.config_hash),
+        **_discriminator_fields(reconstruction, ceiling),
     )
+
+
+def _discriminator_fields(reconstruction: ReconstructionScore, ceiling: ReconstructionScore) -> dict[str, Any]:
+    """Returns the `FidelityScores` discriminator fields and the reconstruction group means."""
+    gap = reconstruction.discriminator_gap(ceiling)
+    return {
+        "discriminator_gap": gap.gap,
+        "discriminator_auc": gap.auc,
+        "discriminator_log_loss": gap.log_loss,
+        "reconstruction_groups": reconstruction.group_means(),
+    }
 
 
 def _real_ceiling(scorer: _RealScorer, dataset: str, tier: str, spark: SparkSession) -> ReconstructionScore:
@@ -511,6 +547,7 @@ def _score_real_dataset(
             "privacy": privacy.model_dump(mode="json"),
             "ceiling": ceiling.model_dump(mode="json"),
             "relative_to_ceiling": relative,
+            "discriminator_gap": reconstruction.discriminator_gap(ceiling).model_dump(mode="json"),
             "seeds": {"sampler": seed},
             "parts": {
                 "profiled": "profiled",
@@ -524,6 +561,7 @@ def _score_real_dataset(
             "split": SPLIT,
         },
         metrics_config_hash=str(reconstruction.config_hash),
+        **_discriminator_fields(reconstruction, ceiling),
     )
 
 

@@ -97,10 +97,17 @@ class Discriminator(_Model):
     """Discriminator settings.
 
     Attributes:
-        max_iter: Boosting iterations of the gradient-boosted classifier.
+        max_iter: Most boosting iterations of the gradient-boosted classifier, which stops early on a validation tenth.
+        min_samples_leaf: Fewest training rows per leaf of the classifier.
+        histogram_bins: Bins of the stored histogram of predicted probabilities.
+        id_min_distinct_share: An integer column whose sampled real values are at least this share distinct is
+            treated as an identifier and left out of the features, like declared keys.
     """
 
     max_iter: int = Field(gt=0)
+    min_samples_leaf: int = Field(gt=0)
+    histogram_bins: int = Field(gt=0)
+    id_min_distinct_share: float = Field(gt=0.0, le=1.0)
 
 
 class StructureTolerances(_Model):

@@ -56,6 +56,7 @@ def _fidelity(dataset: str, role: str, seed: int, relative: float, privacy: bool
         "seed": seed,
         "ok": True,
         "relative_reconstruction": relative,
+        "discriminator_gap": 1.0 - relative,
         "structure": None if real else 0.7,
         **({"structure_status": "not_applicable"} if real else {}),
         "privacy_passed": privacy,
@@ -101,6 +102,8 @@ def test_synthetic_verdict_has_no_holdout_gate() -> None:
         "privacy",
         "control",
         "accuracy_mean",
+        "discriminator_per_dataset",
+        "reconstruction_groups",
         "accuracy_per_dataset",
         "structure",
     ]

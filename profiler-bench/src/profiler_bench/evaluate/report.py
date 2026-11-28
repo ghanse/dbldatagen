@@ -66,6 +66,10 @@ def build_summary(
             ),
             "privacy_all_passed": all(bool(row["privacy_passed"]) for row in rows),
         }
+        for name in ("discriminator_gap", "discriminator_auc", "discriminator_log_loss"):
+            values = [float(row[name]) for row in rows if row.get(name) is not None]
+            if values:
+                fidelity[f"{role}/{dataset}"][f"{name}_mean"] = sum(values) / len(values)
 
     summary: dict[str, Any] = {
         "experiment_id": run.get("experiment_id"),
@@ -226,6 +230,9 @@ def render_report(
     lines.extend(["", "## Gates", ""])
     for gate in verdict.get("gates", []):
         lines.append(f"- `{gate['name']}`: {gate['status']} ({gate['reason']})")
+    if verdict.get("accuracy_metric"):
+        lines.extend(["", f"Accuracy metric: `{verdict['accuracy_metric']}`"])
+    lines.extend(_discriminator_lines(verdict.get("discriminator")))
     n_star = verdict.get("n_star")
     if isinstance(n_star, dict) and n_star:
         lines.extend(["", "## n* (grid f and realized overall input fraction)", ""])
@@ -257,3 +264,23 @@ def render_report(
             ]
         )
     return "\n".join(lines)
+
+
+def _discriminator_lines(discriminator: object) -> list[str]:
+    """Returns the REPORT.md lines of the verdict's per-dataset discriminator summary."""
+    if not isinstance(discriminator, dict) or not discriminator:
+        return []
+    lines = ["", "## Discriminator gap (lower is better; regression = candidate - baseline)", ""]
+    for dataset, row in sorted(discriminator.items()):
+        regression = row.get("regression") or {}
+        lines.append(
+            f"- `{dataset}`: gap {_number(row.get('baseline_gap'))} -> {_number(row.get('candidate_gap'))}, "
+            f"AUC {_number(row.get('baseline_auc'))} -> {_number(row.get('candidate_auc'))}, "
+            f"regression {_number(regression.get('point'))} "
+            f"[{_number(regression.get('low'))}, {_number(regression.get('high'))}]"
+        )
+    return lines
+
+
+def _number(value: object) -> str:
+    return f"{value:.4f}" if isinstance(value, int | float) else "n/a"

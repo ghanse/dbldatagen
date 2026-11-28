@@ -249,7 +249,7 @@ def test_default_policy_gates_and_worker_timing_unchanged() -> None:
     """Data-volume work must not alter the default accuracy/speed policy surface."""
     policy = load_policy(DEFAULT_POLICY)
     assert policy["accuracy"]["max_dataset_regression"] == 0.01
-    assert policy["accuracy"]["min_mean_improvement"] == 0.005
+    assert policy["discriminator"]["min_mean_improvement"] == 0.01
     assert policy["speed"]["min_target_improvement"] == 0.05
     assert policy["fidelity_seeds"] == 5
     assert policy["speed_samples"] == {"xs": 2, "r": 2, "s": 15, "m": 15}
