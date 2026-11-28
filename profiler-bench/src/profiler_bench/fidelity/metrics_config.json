@@ -1,8 +1,8 @@
 {
-  "version": "1.9.0",
+  "version": "2.1.0",
   "sampling": {
     "max_rows": 20000,
-    "discriminator_rows": 2000,
+    "discriminator_rows": 4000,
     "privacy_rows": 2000,
     "pattern_samples": 200,
     "ceiling_sample_offset": 1,
@@ -17,7 +17,10 @@
     "correlation_bins": 50
   },
   "discriminator": {
-    "max_iter": 100
+    "max_iter": 100,
+    "min_samples_leaf": 50,
+    "histogram_bins": 10,
+    "id_min_distinct_share": 0.95
   },
   "reconstruction_weights": {
     "schema": 0.05,

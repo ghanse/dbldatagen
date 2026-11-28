@@ -28,10 +28,11 @@ from profiler_bench.runner.spark_conf import fidelity_spark_config
 DATASETS = ["numeric", "retail"]
 
 
-def test_default_policy_is_2_2_0_with_screen_defaults() -> None:
+def test_default_policy_is_3_0_0_with_discriminator_and_screen_defaults() -> None:
     policy = load_policy(DEFAULT_POLICY)
-    assert policy["version"] == "2.2.0"
-    assert policy["accuracy"]["min_target_improvement"] == 0.01
+    assert policy["version"] == "3.0.0"
+    assert policy["accuracy_metric"] == "discriminator"
+    assert policy["discriminator"]["min_target_improvement"] == 0.02
     assert policy["spark"]["master"] == "local[8]"
     assert policy["spark"]["configs"] == {
         "spark.sql.shuffle.partitions": "2",

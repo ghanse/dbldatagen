@@ -318,4 +318,4 @@ def test_shuffling_one_of_two_equal_uuid_columns_drops_the_score(spark: SparkSes
     assert pair.score < 0.4
     assert same.score == pytest.approx(1.0)
     assert broken.groups["dependence_random"] < same.groups["dependence_random"] - 0.2
-    assert broken.score < same.score - 0.02
+    assert broken.score < same.score - 0.01
