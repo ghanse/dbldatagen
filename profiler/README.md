@@ -183,12 +183,14 @@ The Spark profiler emits numeric and temporal quantiles on the fixed grid
 Quantiles require at least six times `privacy.min_value_count` (k) non-null values, one k-sized support interval per
 core grid step. A tail point `q` also needs k rows beyond it (`non_null * min(q, 1 - q) >= k`); otherwise it is dropped.
 
-Integer columns with 2 to 64 distinct values get an exact histogram instead of quantiles. On Spark 4.1+, value counts
-are folded into the chunked per-table (and nested) main aggregates via `approx_top_k` (exact at this distinct bound);
-older Spark keeps one grouped job per table or nested level. Each bin starts as one value and merges with its upper
-neighbour until it holds at least k rows. When `privacy.extremes` is `suppressed`, the outer edges are widened to the
-nearest multiples, strictly outside the data, of a power of ten one digit shorter than the value range, and
-`generalized_outer_edges` is true; the histogram is omitted if the widened edges fall outside the integer type.
+Integer columns with 2 to 64 distinct values get an exact histogram instead of quantiles. When the active Spark
+*session* is 4.1+ (detected from `df.sparkSession.version`, not the PySpark client wheel), value counts are folded
+into the chunked per-table (and nested) main aggregates via `approx_top_k(col, 64, maxItemsTracked=64)` — exact at
+this distinct bound when every value fits in the tracked set. Older session runtimes keep one grouped job per table
+or nested level. Each bin starts as one value and merges with its upper neighbour until it holds at least k rows.
+When `privacy.extremes` is `suppressed`, the outer edges are widened to the nearest multiples, strictly outside the
+data, of a power of ten one digit shorter than the value range, and `generalized_outer_edges` is true; the histogram
+is omitted if the widened edges fall outside the integer type.
 
 `mean` and `stddev` are always approximate JSON numbers. Histogram bins are `[lo, hi)` except the last, which is
 `[lo, hi]`. The edges span every profiled value, and `counts` are row counts, with `sampled: true` when they come from

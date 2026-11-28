@@ -78,9 +78,14 @@ _MAX_PEARSON_CORRELATION = 0.999
 # efficiently. Each chunk is evaluated independently in schema order.
 _AGGREGATE_COLUMNS_PER_CHUNK = 25
 
-# Spark 4.1's approx_top_k is exact when distinct <= k and folds into the main
-# aggregate; older runtimes keep the separate groupBy value-count job.
+# Spark 4.1 ApproxTopK is exact for our histogram path when every observed distinct
+# value fits in the tracked set. Fold into the main aggregate when the *session*
+# (not the PySpark client package) is new enough; older servers keep groupBy.
 _APPROX_TOP_K_VERSION = (4, 1)
+# Explicit maxItemsTracked (>= histogram distinct bound) so exactness does not depend
+# on Spark's default (10000).
+_APPROX_TOP_K_MAX_ITEMS_TRACKED = _HISTOGRAM_MAX_DISTINCT
+_FOLD_VALUE_COUNTS_CACHE: dict[int, bool] = {}
 
 
 def profile_tables(
@@ -207,13 +212,16 @@ def _collect_column_aggregates(df: DataFrame, columns_per_chunk: int = _AGGREGAT
     if columns_per_chunk < 1:
         raise ValueError("columns_per_chunk must be positive")
 
+    fold_value_counts = _fold_histogram_value_counts(df.sparkSession)
     values: dict[str, Any] = {}
     fields = df.schema.fields
     for start in range(0, len(fields), columns_per_chunk):
         expressions = ([F.count(F.lit(1)).alias("__row_count")] if start == 0 else []) + [
             expression
             for index, field in enumerate(fields[start : start + columns_per_chunk], start=start)
-            for expression in _aggregate_expressions(df[field.name], field.dataType, index)
+            for expression in _aggregate_expressions(
+                df[field.name], field.dataType, index, fold_value_counts=fold_value_counts
+            )
         ]
         values.update(_collect_aggregate(df, expressions))
     if not fields:
@@ -386,7 +394,9 @@ def _utc_session_time_zones(frames: Iterable[DataFrame]) -> Iterator[None]:
                 session.conf.set(key, previous)
 
 
-def _aggregate_expressions(column: Column, data_type: T.DataType, index: int) -> list[Column]:
+def _aggregate_expressions(
+    column: Column, data_type: T.DataType, index: int, *, fold_value_counts: bool = False
+) -> list[Column]:
     prefix = f"c{index}"
     if isinstance(data_type, T.MapType):
         distinct_value = F.to_json(F.sort_array(F.map_entries(column)))
@@ -411,12 +421,16 @@ def _aggregate_expressions(column: Column, data_type: T.DataType, index: int) ->
                 F.percentile_approx(column, list(_QUANTILE_GRID), _QUANTILE_ACCURACY).alias(f"{prefix}_quantiles"),
             ]
         )
-        if isinstance(data_type, tuple(_INTEGER_BITS)) and _fold_histogram_value_counts():
-            # approx_top_k is exact for distinct <= k (see Spark 4.1 ApproxTopK); nulls are dropped below.
+        if isinstance(data_type, tuple(_INTEGER_BITS)) and fold_value_counts:
+            # ApproxTopK(k, maxItemsTracked>=k) returns exact per-value counts when distinct <= k.
+            # Null items are omitted when reshaping into histogram value counts.
             expressions.append(
-                F.call_function("approx_top_k", column.cast("long"), F.lit(_HISTOGRAM_MAX_DISTINCT)).alias(
-                    f"{prefix}_top_k"
-                )
+                F.call_function(
+                    "approx_top_k",
+                    column.cast("long"),
+                    F.lit(_HISTOGRAM_MAX_DISTINCT),
+                    F.lit(_APPROX_TOP_K_MAX_ITEMS_TRACKED),
+                ).alias(f"{prefix}_top_k")
             )
     elif isinstance(data_type, _string_types()):
         length = F.length(column)
@@ -526,9 +540,10 @@ def _profile_nested_fields(
     df: DataFrame, children: list[tuple[T.StructField, Column]], privacy: PrivacyPolicy
 ) -> list[ColumnProfile]:
     """Profiles sibling nested fields with one aggregate per level (value counts folded when supported)."""
+    fold_value_counts = _fold_histogram_value_counts(df.sparkSession)
     expressions: list[Column] = [F.count(F.lit(1)).alias("__row_count")]
     for index, (field, column) in enumerate(children):
-        expressions.extend(_aggregate_expressions(column, field.dataType, index))
+        expressions.extend(_aggregate_expressions(column, field.dataType, index, fold_value_counts=fold_value_counts))
     values = _with_value_counts(
         df,
         [(f"c{index}", column, field.dataType) for index, (field, column) in enumerate(children)],
@@ -557,13 +572,30 @@ def _collect_aggregate(df: DataFrame, expressions: list[Column]) -> dict[str, An
     return row.asDict()
 
 
-def _fold_histogram_value_counts() -> bool:
-    """Returns whether integer histogram counts are folded into the main aggregate via approx_top_k."""
-    parts = pyspark.__version__.split(".")[:2]
-    try:
-        return tuple(int(part) for part in parts) >= _APPROX_TOP_K_VERSION
-    except ValueError:
-        return False
+def _session_version_tuple(session: SparkSession) -> tuple[int, ...]:
+    """Parses ``session.version`` (the active Spark runtime, not the PySpark wheel)."""
+    parts: list[int] = []
+    for part in session.version.split("."):
+        digits = "".join(character for character in part if character.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _fold_histogram_value_counts(session: SparkSession) -> bool:
+    """Returns whether this Spark *session* can fold histogram counts via approx_top_k.
+
+    Uses the session's reported runtime version (cached per session object) so a newer
+    PySpark client talking to an older Connect/cluster server does not emit approx_top_k.
+    """
+    cache_key = id(session)
+    cached = _FOLD_VALUE_COUNTS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    supported = _session_version_tuple(session) >= _APPROX_TOP_K_VERSION
+    _FOLD_VALUE_COUNTS_CACHE[cache_key] = supported
+    return supported
 
 
 def _value_counts_from_top_k(top_k: object) -> list[tuple[int, int]] | None:
@@ -590,10 +622,12 @@ def _with_value_counts(
 ) -> dict[str, Any]:
     """Adds exact sorted (value, count) pairs for low-cardinality integer columns.
 
-    On Spark 4.1+, counts come from ``approx_top_k`` already collected in the chunked /
-    nested main aggregate (exact when distinct is at most ``_HISTOGRAM_MAX_DISTINCT``), so
-    no extra job runs. Older Spark falls back to one grouped job. ``df`` and ``columns``
-    stay in the signature so a later frequent-string path (rsi-0009) can reuse this hook.
+    When the active Spark session supports ApproxTopK (4.1+), counts come from
+    ``approx_top_k`` already collected in the chunked / nested main aggregate — exact for
+    distinct in ``[2, _HISTOGRAM_MAX_DISTINCT]`` with ``maxItemsTracked`` set to that bound —
+    so no extra job runs. Otherwise one grouped job collects the pairs. ``df`` and
+    ``columns`` stay in the signature so a later frequent-string path (rsi-0009) can reuse
+    this hook.
     """
     eligible = [
         (prefix, column)
@@ -603,7 +637,7 @@ def _with_value_counts(
     if not eligible:
         return values
 
-    if _fold_histogram_value_counts():
+    if _fold_histogram_value_counts(df.sparkSession):
         counts: dict[str, list[tuple[int, int]]] = {}
         for prefix, _ in eligible:
             pairs = _value_counts_from_top_k(values.get(f"{prefix}_top_k"))

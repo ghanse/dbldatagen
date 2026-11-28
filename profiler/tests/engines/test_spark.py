@@ -448,17 +448,30 @@ def _spark_job_count(spark: SparkSession, run: Callable[[], object]) -> int:
     return len(spark.sparkContext.statusTracker().getJobIdsForGroup(group))
 
 
-@pytest.mark.skipif(
-    not spark_engine._fold_histogram_value_counts(),
-    reason="folded histogram value counts require Spark 4.1+ approx_top_k",
-)
+def _require_fold_support(spark: SparkSession) -> None:
+    spark_engine._FOLD_VALUE_COUNTS_CACHE.clear()
+    if not spark_engine._fold_histogram_value_counts(spark):
+        pytest.skip("folded histogram value counts require a Spark 4.1+ session with approx_top_k")
+
+
+def _patch_fold(monkeypatch: pytest.MonkeyPatch, fold: bool) -> None:
+    spark_engine._FOLD_VALUE_COUNTS_CACHE.clear()
+    monkeypatch.setattr(spark_engine, "_fold_histogram_value_counts", lambda _session, fold=fold: fold)
+
+
+# Three eligible integer groups (top-level, array element, struct fields) each add a
+# groupBy value-count collect that resolves to two Spark jobs under local[2]/2 partitions.
+_HISTOGRAM_VALUE_COUNT_JOB_DELTA = 6
+
+
 def test_folded_histogram_profiles_match_groupby_engine(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    _require_fold_support(spark)
     frame = _low_cardinality_histogram_frame(spark).cache()
     frame.count()
 
-    monkeypatch.setattr(spark_engine, "_fold_histogram_value_counts", lambda: False)
+    _patch_fold(monkeypatch, False)
     groupby_profile = profile_dataframe("hist", frame, detect_pii=False)
-    monkeypatch.setattr(spark_engine, "_fold_histogram_value_counts", lambda: True)
+    _patch_fold(monkeypatch, True)
     folded_profile = profile_dataframe("hist", frame, detect_pii=False)
 
     assert _normalized_profile_json(folded_profile) == _normalized_profile_json(groupby_profile)
@@ -471,24 +484,75 @@ def test_folded_histogram_profiles_match_groupby_engine(spark: SparkSession, mon
     frame.unpersist()
 
 
-@pytest.mark.skipif(
-    not spark_engine._fold_histogram_value_counts(),
-    reason="folded histogram value counts require Spark 4.1+ approx_top_k",
-)
 def test_folded_histogram_value_counts_remove_extra_spark_job(
     spark: SparkSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _require_fold_support(spark)
     frame = _low_cardinality_histogram_frame(spark).cache()
     frame.count()
 
     def count_jobs(*, fold: bool) -> int:
-        monkeypatch.setattr(spark_engine, "_fold_histogram_value_counts", lambda fold=fold: fold)
+        _patch_fold(monkeypatch, fold)
         return _spark_job_count(spark, lambda: profile_dataframe("hist", frame, detect_pii=False))
 
     with_groupby = count_jobs(fold=False)
     folded = count_jobs(fold=True)
-    assert folded < with_groupby
+    assert with_groupby - folded == _HISTOGRAM_VALUE_COUNT_JOB_DELTA
     frame.unpersist()
+
+
+def test_older_session_version_falls_back_to_groupby(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 4.1 client must not emit approx_top_k when the session reports an older runtime."""
+    spark_engine._FOLD_VALUE_COUNTS_CACHE.clear()
+    monkeypatch.setattr(spark_engine, "_session_version_tuple", lambda _session: (3, 5, 0))
+    try:
+        assert spark_engine._fold_histogram_value_counts(spark) is False
+
+        frame = spark.createDataFrame([(value,) for value in (0, 0, 1, 1, 2, 2) for _ in range(10)], "n int")
+        stats = profile_dataframe("fallback", frame, detect_pii=False).tables[0].columns[0].numeric
+        assert stats is not None and stats.histogram is not None
+        assert stats.histogram.edges == [0, 1, 2, 2]
+        assert stats.histogram.counts == [20, 20, 20]
+    finally:
+        spark_engine._FOLD_VALUE_COUNTS_CACHE.clear()
+
+
+def test_histogram_distinct_boundary_64_vs_65(spark: SparkSession) -> None:
+    at_bound = spark.range(640).selectExpr("CAST(id % 64 AS INT) AS n")
+    over_bound = spark.range(650).selectExpr("CAST(id % 65 AS INT) AS n")
+    at_stats = profile_dataframe("bound64", at_bound, detect_pii=False).tables[0].columns[0].numeric
+    over_stats = profile_dataframe("bound65", over_bound, detect_pii=False).tables[0].columns[0].numeric
+
+    assert at_stats is not None and at_stats.histogram is not None and at_stats.quantiles is None
+    assert over_stats is not None and over_stats.histogram is None and over_stats.quantiles is not None
+
+
+def test_histogram_value_counts_survive_skew_nulls_and_ties(spark: SparkSession) -> None:
+    rows = [(0,)] * 40 + [(1,)] * 40 + [(2,)] * 15 + [(3,)] * 5 + [(None,)] * 12  # tied equal mass
+    frame = spark.createDataFrame(rows, "n int").repartition(7)
+    stats = (
+        profile_dataframe("skew", frame, detect_pii=False, privacy=PrivacyPolicy(min_value_count=10))
+        .tables[0]
+        .columns[0]
+        .numeric
+    )
+
+    assert stats is not None and stats.histogram is not None
+    assert stats.histogram.counts == [40, 40, 20]
+    assert stats.histogram.edges == [0, 1, 2, 3]
+    assert sum(stats.histogram.counts) == 100
+
+
+def test_histogram_privacy_merges_bins_below_min_value_count(spark: SparkSession) -> None:
+    # One value at k-1 and neighbours at/above k: the rare bin merges into the next value.
+    rows = [(0,)] * 9 + [(1,)] * 10 + [(2,)] * 20 + [(3,)] * 20
+    frame = spark.createDataFrame(rows, "n int")
+    policy = PrivacyPolicy(min_value_count=10)
+    stats = profile_dataframe("k_edge", frame, detect_pii=False, privacy=policy).tables[0].columns[0].numeric
+
+    assert stats is not None and stats.histogram is not None
+    assert stats.histogram.edges == [0, 2, 3, 3]
+    assert stats.histogram.counts == [19, 20, 20]
 
 
 @pytest.mark.parametrize(
