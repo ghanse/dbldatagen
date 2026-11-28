@@ -1049,20 +1049,21 @@ def _check_column_privacy(column: ColumnProfile, value_count: int | None, policy
             literal-bearing statistics have no known value count, or a suppressed value class is present.
     """
     k = policy.min_value_count
+    string = column.string or StringStats()
     if column.semantic is not None and column.semantic.sensitivity in {
         Sensitivity.DIRECT_IDENTIFIER,
         Sensitivity.SECRET,
     }:
-        string = column.string or StringStats()
         if column.literals() or string.top_values:
             raise ValueError(f"column {column.name!r}: direct identifiers and secrets cannot carry literal statistics")
         if string.patterns and any(not _is_generalized_pattern(pattern.regex) for pattern in string.patterns):
             raise ValueError(f"column {column.name!r}: sensitive patterns must contain character classes only")
+    if column.semantic is not None and column.semantic.sensitivity == Sensitivity.FREE_TEXT and string.top_values:
+        raise ValueError(f"column {column.name!r}: free text cannot carry top_values")
     stats = column.numeric or column.temporal
     histogram = column.numeric.histogram if column.numeric else None
     if policy.extremes == ValueTreatment.SUPPRESSED and stats is not None:
         _check_suppressed_extremes(column.name, stats, histogram)
-    string = column.string or StringStats()
     if string.top_values and policy.enumerations == ValueTreatment.SUPPRESSED:
         raise ValueError(f"column {column.name!r}: top_values present but privacy.enumerations is suppressed")
     if value_count is None:

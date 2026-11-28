@@ -72,6 +72,9 @@ _QUANTILE_ACCURACY = 10_000
 _HISTOGRAM_MAX_DISTINCT = 64
 _MAX_TOP_VALUES = 32
 _MAX_LITERAL_STRING_COLUMNS = 16
+_MAX_CATEGORICAL_DISTINCT = 64
+_MIN_CATEGORICAL_COVERAGE_NUMERATOR = 9
+_MIN_CATEGORICAL_COVERAGE_DENOMINATOR = 10
 _LITERAL_SENSITIVITIES = frozenset({"direct_identifier", "secret", "free_text"})
 
 # Pearson pairs are selected in increasing schema-index distance, then by the
@@ -191,11 +194,18 @@ def _profile_table(
         values.update(_collect_aggregate(df, pearson_expressions))
     row_count = int(values["__row_count"])
     columns = [
-        _column_from_aggregate(field, values, index, row_count, privacy, nested=False, df=df)
+        _column_from_aggregate(
+            field,
+            values,
+            index,
+            row_count,
+            privacy,
+            nested=False,
+            df=df,
+            emit_string_values=emit_string_values,
+        )
         for index, field in enumerate(df.schema.fields)
     ]
-    if not emit_string_values:
-        columns = [_without_top_values(column) for column in columns]
     protected = [
         _protect_column(column, table=name, path=column.name, semantics=semantics, pii_policy=pii_policy)
         for column in columns
@@ -372,16 +382,6 @@ def _pii_policy_covers(reference: str, semantic: Semantic | None, pii_policy: Pi
     return semantic is not None and pii_policy.resolve(reference, semantic)[0].action != PiiAction.KEEP
 
 
-def _without_top_values(column: ColumnProfile) -> ColumnProfile:
-    """Removes frequent literals recursively when PII detection is disabled."""
-    updates: dict[str, Any] = {}
-    if column.string is not None and column.string.top_values is not None:
-        updates["string"] = column.string.model_copy(update={"top_values": None})
-    if column.children is not None:
-        updates["children"] = [_without_top_values(child) for child in column.children]
-    return column.model_copy(update=updates) if updates else column
-
-
 def _schema_paths(schema: T.StructType) -> Iterator[str]:
     """Yields top-level and nested profile paths from a Spark schema."""
 
@@ -491,6 +491,7 @@ def _column_from_aggregate(
     *,
     nested: bool,
     df: DataFrame,
+    emit_string_values: bool,
 ) -> ColumnProfile:
     prefix = f"c{index}"
     non_null = int(values[f"{prefix}_non_null"])
@@ -522,11 +523,13 @@ def _column_from_aggregate(
         attributes["collection_length"] = _length_stats(values, prefix, include_stddev=True)
     if isinstance(field.dataType, (T.StructType, T.ArrayType, T.MapType)):
         nested_df = df if nested else df.select(df[field.name].alias(_VALUE))
-        attributes["children"] = _profile_children(nested_df, field, privacy)
+        attributes["children"] = _profile_children(nested_df, field, privacy, emit_string_values)
     return ColumnProfile(**attributes)
 
 
-def _profile_children(df: DataFrame, field: T.StructField, privacy: PrivacyPolicy) -> list[ColumnProfile]:
+def _profile_children(
+    df: DataFrame, field: T.StructField, privacy: PrivacyPolicy, emit_string_values: bool
+) -> list[ColumnProfile]:
     data_type = field.dataType
     value = df[_VALUE]
     if isinstance(data_type, T.StructType):
@@ -534,13 +537,14 @@ def _profile_children(df: DataFrame, field: T.StructField, privacy: PrivacyPolic
             (T.StructField(child.name, child.dataType, child.nullable), value.getField(child.name))
             for child in data_type.fields
         ]
-        return _profile_nested_fields(df, fields, privacy)
+        return _profile_nested_fields(df, fields, privacy, emit_string_values)
     if isinstance(data_type, T.ArrayType):
         child_df = df.select(F.explode(value).alias(_VALUE))
         return _profile_nested_fields(
             child_df,
             [(T.StructField("element", data_type.elementType, data_type.containsNull), child_df[_VALUE])],
             privacy,
+            emit_string_values,
         )
     if not isinstance(data_type, T.MapType):
         raise TypeError(f"unsupported nested Spark data type: {data_type}")
@@ -552,11 +556,15 @@ def _profile_children(df: DataFrame, field: T.StructField, privacy: PrivacyPolic
             (T.StructField("value", data_type.valueType, data_type.valueContainsNull), F.col("value")),
         ],
         privacy,
+        emit_string_values,
     )
 
 
 def _profile_nested_fields(
-    df: DataFrame, children: list[tuple[T.StructField, Column]], privacy: PrivacyPolicy
+    df: DataFrame,
+    children: list[tuple[T.StructField, Column]],
+    privacy: PrivacyPolicy,
+    emit_string_values: bool,
 ) -> list[ColumnProfile]:
     """Profiles sibling nested fields with one aggregate and one histogram value-count job per level."""
     expressions: list[Column] = [F.count(F.lit(1)).alias("__row_count")]
@@ -567,7 +575,7 @@ def _profile_nested_fields(
         [(f"c{index}", column, field.dataType) for index, (field, column) in enumerate(children)],
         _collect_aggregate(df, expressions),
         privacy,
-        include_strings=True,
+        include_strings=emit_string_values,
     )
     row_count = int(values["__row_count"])
     return [
@@ -579,6 +587,7 @@ def _profile_nested_fields(
             privacy,
             nested=True,
             df=df.select(column.alias(_VALUE)),
+            emit_string_values=emit_string_values,
         )
         for index, (field, column) in enumerate(children)
     ]
@@ -627,6 +636,7 @@ def _with_value_counts(
         if include_strings
         and privacy.enumerations != ValueTreatment.SUPPRESSED
         and isinstance(data_type, _string_types())
+        and int(values[f"{prefix}_distinct"]) <= _MAX_CATEGORICAL_DISTINCT
     ]
     if len(string_columns) > _MAX_LITERAL_STRING_COLUMNS:
         string_columns = []
@@ -656,9 +666,12 @@ def _with_value_counts(
 
 
 def _top_values(values: Mapping[str, Any], prefix: str, non_null: int) -> list[ValueFrequency] | None:
-    """Builds deterministic frequent values using the non-null column population."""
+    """Builds deterministic values only when k-safe atoms cover at least 90% of a categorical column."""
     counts = values.get(f"{prefix}_top_value_counts")
     if not counts or non_null <= 0:
+        return None
+    covered = sum(count for _, count in counts)
+    if covered * _MIN_CATEGORICAL_COVERAGE_DENOMINATOR < non_null * _MIN_CATEGORICAL_COVERAGE_NUMERATOR:
         return None
     return [ValueFrequency(value=value, frequency=count / non_null) for value, count in counts]
 

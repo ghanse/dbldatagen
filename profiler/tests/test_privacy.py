@@ -51,6 +51,18 @@ def test_top_values_below_default_k_are_rejected(minimal_profile: dict[str, Any]
         load_profile(profile_with(minimal_profile, string=top_values(0.5, 0.018)))
 
 
+def test_free_text_top_values_are_rejected(minimal_profile: dict[str, Any]) -> None:
+    semantic = {
+        "pii_class": "free_text_pii",
+        "sensitivity": "free_text",
+        "confidence": 1.0,
+        "evidence": [],
+    }
+
+    with pytest.raises(ValidationError, match="free text cannot carry top_values"):
+        load_profile(profile_with(minimal_profile, string=top_values(0.5), semantic=semantic))
+
+
 @pytest.mark.parametrize(("k", "frequency", "ok"), [(1, 0.002, True), (100, 0.1, False), (100, 0.2, True)])
 def test_k_is_taken_from_the_policy(minimal_profile: dict[str, Any], k: int, frequency: float, ok: bool) -> None:
     profile = profile_with(minimal_profile, {"min_value_count": k}, string=top_values(frequency))
