@@ -66,6 +66,24 @@ def _column(data: dict, table: str, column: str) -> dict:
     return next(c for t in data["tables"] if t["name"] == table for c in t["columns"] if c["name"] == column)
 
 
+def _rename_column(data: dict, table: str, old: str, new: str) -> None:
+    """Renames a top-level column and every table-level reference to it: keys, constraints, dependencies, QI sets."""
+    entry = next(t for t in data["tables"] if t["name"] == table)
+    _column(data, table, old)["name"] = new
+    keys = [entry["primary_key"]] if entry.get("primary_key") else []
+    lists = [
+        *(key["columns"] for key in [*keys, *(entry.get("unique_keys") or [])]),
+        *(dependency["columns"] for dependency in entry.get("dependencies") or []),
+        *(item["columns"] for item in entry.get("quasi_identifier_sets") or []),
+    ]
+    for names in lists:
+        names[:] = [new if name == old else name for name in names]
+    for constraint in entry.get("check_constraints") or []:
+        for field in ("column", "left", "right"):
+            if constraint.get(field) == old:
+                constraint[field] = new
+
+
 def test_structural_text_is_verified_against_schema_model_and_engine(
     planted: dict[str, DataFrame], profile: Profile
 ) -> None:
@@ -97,10 +115,14 @@ def test_deliberate_copies_still_fail(
         elif where == "top_value":
             sku["string"] = {**(sku.get("string") or {}), "top_values": [{"value": PLANTED, "frequency": 0.1}]}
         else:
-            department = _column(data, "products", "department")
-            department["name"], department["string"] = f"{PLANTED}nx", None
+            _column(data, "products", "department")["string"] = None
+            _rename_column(data, "products", "department", f"{PLANTED}nx")
 
-    score = score_privacy(planted, load("retail", "xs", 0, spark, sample_seed=3), _edit(profile, edit), manifest)
+    edited = _edit(profile, edit)
+    if where == "fake_column_name":
+        products = next(t for t in edited.tables if t.name == "products")
+        assert any(f"{PLANTED}nx" in dependency.columns for dependency in products.dependencies or [])
+    score = score_privacy(planted, load("retail", "xs", 0, spark, sample_seed=3), edited, manifest)
     assert _email_hits(score), where
     leaks = next(c for c in score.checks if c.name == "profile.sensitive_value_leaks")
     assert not leaks.passed

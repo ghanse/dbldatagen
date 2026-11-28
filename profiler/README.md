@@ -149,6 +149,14 @@ A profile contains:
   dates to UTC epoch days; timestamps, timestamp-without-time-zone, and times to UTC epoch seconds. The profile
   contains only the aggregate coefficient and column names, never source values or row samples. Dependencies are
   batch-only.
+  The engine also measures Cramér's V (bias-corrected) for at most 32 pairs of top-level string or boolean columns
+  with 2 to 64 distinct values, chosen in the same schema-distance order and counted in one grouped Spark job per
+  table. ID/key-named columns, detected direct identifiers, secrets, and free text, columns covered by a non-`keep`
+  PII rule, detected two-column quasi-identifier sets, and pairs of two detected quasi-identifiers are not candidates.
+  Contingency cells with fewer than `privacy.min_value_count` rows are dropped before V is computed, so V is
+  computed only from cells with at least that many rows. Pairs with V below 0.1 are omitted, and each column joins
+  at most one emitted pair, the strongest. The column with more distinct values comes first. Only the coefficient
+  is emitted; the cell counts stay internal. With PII detection off, only the name and policy exclusions apply.
 - `semantic`: optional PII class, sensitivity, confidence, and value-free detection evidence. Each evidence entry is a
   `method` from a fixed set (`EvidenceMethod`, e.g. `column_name`, `email`, `luhn`, `sample_uniqueness`) and its sampled
   `match_rate`; unknown methods are rejected. Tables may also record sampled pairs and triples that behave as

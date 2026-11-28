@@ -30,6 +30,7 @@ from dbldatagen_profiler.model import (
     Profile,
     Quantile,
     QuasiIdentifierSet,
+    Sensitivity,
     StringStats,
     TableProfile,
     TemporalStats,
@@ -73,6 +74,15 @@ _HISTOGRAM_MAX_DISTINCT = 64
 # growth deterministically instead of constructing every possible pair.
 _MAX_PEARSON_PAIRS = 64
 _MAX_PEARSON_CORRELATION = 0.999
+
+# Cramér's V pairs: top-level string and boolean columns with few distinct values, ordered like Pearson
+# pairs and capped; integers are left to Pearson. Contingency cells below `min_value_count` are dropped
+# before V is computed, weak associations are not emitted, and each column joins at most one emitted pair
+# so the sampler's overwrites do not compound.
+_MAX_CRAMERS_PAIRS = 32
+_CRAMERS_MAX_DISTINCT = 64
+_MIN_CRAMERS_V = 0.1
+_UNSHARED_SENSITIVITIES = frozenset({Sensitivity.DIRECT_IDENTIFIER, Sensitivity.SECRET, Sensitivity.FREE_TEXT})
 
 # Keep wide-table aggregate plans small enough for Spark to optimize and codegen
 # efficiently. Each chunk is evaluated independently in schema order.
@@ -185,6 +195,8 @@ def _profile_table(
         QuasiIdentifierSet(columns=names, unique_fraction=unique, k_anonymity=k) for names, unique, k in quasi_sets
     ]
     dependencies = _dependencies_from_aggregate(pairs, values, privacy)
+    categorical = _cramers_pairs(df, values, name, semantics, pii_policy, quasi_sets)
+    dependencies += _cramers_dependencies(categorical, _pair_counts(df, categorical), privacy)
     return TableProfile(
         name=name,
         row_count=row_count,
@@ -280,6 +292,132 @@ def _dependencies_from_aggregate(
                 )
             )
     return dependencies
+
+
+def _cramers_pairs(
+    df: DataFrame,
+    values: Mapping[str, Any],
+    table: str,
+    semantics: Mapping[str, Any],
+    pii_policy: PiiPolicy | None,
+    quasi_sets: list[tuple[list[str], float, int]],
+) -> list[tuple[str, str]]:
+    """Returns a deterministic, bounded set of low-cardinality categorical column pairs.
+
+    Eligible columns are top-level strings and booleans with 2 to 64 distinct values that are not
+    key-like, not detected as direct identifiers, secrets, or free text, and not covered by a non-keep PII rule.
+    A pair is skipped when it is a detected two-column quasi-identifier set or both columns are detected
+    quasi-identifiers. Each pair puts the column with more distinct values first. Pairs are ordered by schema
+    distance and then left schema index.
+    """
+    quasi_pairs = {frozenset(names) for names, _, _ in quasi_sets if len(names) == 2}
+    quasi_columns = {
+        path for path, semantic in semantics.items() if semantic.sensitivity == Sensitivity.QUASI_IDENTIFIER
+    }
+    eligible = [
+        (index, field.name, int(values[f"c{index}_distinct"]))
+        for index, field in enumerate(df.schema.fields)
+        if isinstance(field.dataType, (*_string_types(), T.BooleanType))
+        and 2 <= values[f"c{index}_distinct"] <= _CRAMERS_MAX_DISTINCT
+        and not _key_like_name(field.name)
+        and not _withheld_from_dependence(field.name, table, semantics, pii_policy)
+    ]
+    ordered = sorted(
+        (right[0] - left[0], left[0], left, right)
+        for position, left in enumerate(eligible)
+        for right in eligible[position + 1 :]
+        if frozenset((left[1], right[1])) not in quasi_pairs and not {left[1], right[1]} <= quasi_columns
+    )
+    return [
+        (left[1], right[1]) if left[2] >= right[2] else (right[1], left[1])
+        for _, _, left, right in ordered[:_MAX_CRAMERS_PAIRS]
+    ]
+
+
+def _withheld_from_dependence(
+    name: str, table: str, semantics: Mapping[str, Any], pii_policy: PiiPolicy | None
+) -> bool:
+    semantic = semantics.get(name)
+    if semantic is not None and semantic.sensitivity in _UNSHARED_SENSITIVITIES:
+        return True
+    if pii_policy is None:
+        return False
+    reference = f"{table}.{name}"
+    rule = pii_policy.resolve(reference, semantic)[0] if semantic is not None else pii_policy.columns.get(reference)
+    return rule is not None and rule.action != PiiAction.KEEP
+
+
+def _pair_counts(df: DataFrame, pairs: list[tuple[str, str]]) -> list[dict[tuple[str, str], int]]:
+    """Counts each pair's non-null (left, right) cells in one grouped job."""
+    if not pairs:
+        return []
+    entries = F.explode(
+        F.array(
+            *(
+                F.struct(
+                    F.lit(index).alias("p"), df[left].cast("string").alias("l"), df[right].cast("string").alias("r")
+                )
+                for index, (left, right) in enumerate(pairs)
+            )
+        )
+    )
+    rows = (
+        df.select(entries.alias("e"))
+        .select("e.*")
+        .where(F.col("l").isNotNull() & F.col("r").isNotNull())
+        .groupBy("p", "l", "r")
+        .count()
+    )
+    counts: list[dict[tuple[str, str], int]] = [{} for _ in pairs]
+    for row in rows.collect():
+        counts[row["p"]][(row["l"], row["r"])] = row["count"]
+    return counts
+
+
+def _cramers_dependencies(
+    pairs: list[tuple[str, str]], counts: list[dict[tuple[str, str], int]], privacy: PrivacyPolicy
+) -> list[Dependency]:
+    """Returns the strongest pairs whose bias-corrected Cramér's V reaches the floor, one pair per column."""
+    measured = [
+        (value, index)
+        for index, cells in enumerate(counts)
+        if (value := _cramers_v({cell: n for cell, n in cells.items() if n >= privacy.min_value_count})) is not None
+        and value >= _MIN_CRAMERS_V
+    ]
+    used: set[str] = set()
+    chosen = []
+    for value, index in sorted(measured, key=lambda item: (-item[0], item[1])):
+        if used.isdisjoint(pairs[index]):
+            used.update(pairs[index])
+            chosen.append((index, value))
+    return [
+        Dependency(columns=pairs[index], method=DependenceMethod.CRAMERS_V, value=value)
+        for index, value in sorted(chosen)
+    ]
+
+
+def _cramers_v(cells: Mapping[tuple[str, str], int]) -> float | None:
+    """Returns Bergsma's bias-corrected Cramér's V of a contingency table, or None below a 2x2 table."""
+    rows: dict[str, int] = {}
+    columns: dict[str, int] = {}
+    for (left, right), count in sorted(cells.items()):
+        rows[left] = rows.get(left, 0) + count
+        columns[right] = columns.get(right, 0) + count
+    total = sum(rows.values())
+    if len(rows) < 2 or len(columns) < 2 or total < 2:
+        return None
+    chi2 = sum(
+        (cells.get((left, right), 0) - expected) ** 2 / expected
+        for left, row in sorted(rows.items())
+        for right, column in sorted(columns.items())
+        for expected in [row * column / total]
+    )
+    r, c = len(rows), len(columns)
+    phi2 = max(0.0, chi2 / total - (r - 1) * (c - 1) / (total - 1))
+    r_corrected = r - (r - 1) ** 2 / (total - 1)
+    c_corrected = c - (c - 1) ** 2 / (total - 1)
+    denominator = min(r_corrected, c_corrected) - 1
+    return min(1.0, (phi2 / denominator) ** 0.5) if denominator > 0 else None
 
 
 def _protect_column(
