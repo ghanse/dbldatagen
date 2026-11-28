@@ -527,6 +527,31 @@ def test_histogram_distinct_boundary_64_vs_65(spark: SparkSession) -> None:
     assert over_stats is not None and over_stats.histogram is None and over_stats.quantiles is not None
 
 
+def test_histogram_keeps_64_distinct_when_nulls_are_frequent(spark: SparkSession) -> None:
+    """Null must not consume an approx_top_k slot that would drop a real value at the 64 bound."""
+    # 10 rows per value (0..63) plus many nulls — null would be top-frequency without the extra slot.
+    dense = (
+        spark.range(640)
+        .selectExpr("CAST(id % 64 AS INT) AS v")
+        .unionByName(spark.range(200).selectExpr("CAST(NULL AS INT) AS v"))
+    )
+    top_level = dense.selectExpr("v AS top")
+    nested = dense.selectExpr("array(v) AS items")
+
+    top_column = profile_dataframe("null64", top_level, detect_pii=False).tables[0].columns[0]
+    nested_columns = profile_dataframe("null64_nested", nested, detect_pii=False).tables[0].columns
+    nested_child = nested_columns[0].children[0] if nested_columns[0].children else None
+    nested_hist = nested_child.numeric.histogram if nested_child is not None and nested_child.numeric else None
+
+    assert top_column.distinct_count is not None and top_column.distinct_count.value == 64
+    assert top_column.numeric is not None and top_column.numeric.histogram is not None
+    assert sum(top_column.numeric.histogram.counts) == 640
+    assert nested_child is not None and nested_child.distinct_count is not None
+    assert nested_child.distinct_count.value == 64
+    assert nested_hist is not None
+    assert sum(nested_hist.counts) == 640
+
+
 def test_histogram_value_counts_survive_skew_nulls_and_ties(spark: SparkSession) -> None:
     rows = [(0,)] * 40 + [(1,)] * 40 + [(2,)] * 15 + [(3,)] * 5 + [(None,)] * 12  # tied equal mass
     frame = spark.createDataFrame(rows, "n int").repartition(7)

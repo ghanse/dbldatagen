@@ -82,9 +82,9 @@ _AGGREGATE_COLUMNS_PER_CHUNK = 25
 # value fits in the tracked set. Fold into the main aggregate when the *session*
 # (not the PySpark client package) is new enough; older servers keep groupBy.
 _APPROX_TOP_K_VERSION = (4, 1)
-# Explicit maxItemsTracked (>= histogram distinct bound) so exactness does not depend
-# on Spark's default (10000).
-_APPROX_TOP_K_MAX_ITEMS_TRACKED = _HISTOGRAM_MAX_DISTINCT
+# ApproxTopK counts null as an item. Request one extra slot so 64 non-null distinct
+# values plus frequent nulls are not truncated before we drop the null entry.
+_APPROX_TOP_K_ITEMS = _HISTOGRAM_MAX_DISTINCT + 1
 _FOLD_VALUE_COUNTS_CACHE: dict[int, bool] = {}
 
 
@@ -422,14 +422,14 @@ def _aggregate_expressions(
             ]
         )
         if isinstance(data_type, tuple(_INTEGER_BITS)) and fold_value_counts:
-            # ApproxTopK(k, maxItemsTracked>=k) returns exact per-value counts when distinct <= k.
-            # Null items are omitted when reshaping into histogram value counts.
+            # k/maxItemsTracked = distinct bound + 1 so a null item cannot displace a real value.
+            # Nulls are dropped when reshaping; remaining pairs must match countDistinct.
             expressions.append(
                 F.call_function(
                     "approx_top_k",
                     column.cast("long"),
-                    F.lit(_HISTOGRAM_MAX_DISTINCT),
-                    F.lit(_APPROX_TOP_K_MAX_ITEMS_TRACKED),
+                    F.lit(_APPROX_TOP_K_ITEMS),
+                    F.lit(_APPROX_TOP_K_ITEMS),
                 ).alias(f"{prefix}_top_k")
             )
     elif isinstance(data_type, _string_types()):
@@ -624,10 +624,10 @@ def _with_value_counts(
 
     When the active Spark session supports ApproxTopK (4.1+), counts come from
     ``approx_top_k`` already collected in the chunked / nested main aggregate — exact for
-    distinct in ``[2, _HISTOGRAM_MAX_DISTINCT]`` with ``maxItemsTracked`` set to that bound —
-    so no extra job runs. Otherwise one grouped job collects the pairs. ``df`` and
-    ``columns`` stay in the signature so a later frequent-string path (rsi-0009) can reuse
-    this hook.
+    distinct in ``[2, _HISTOGRAM_MAX_DISTINCT]`` with ``k`` / ``maxItemsTracked`` set to
+    that bound plus one (null occupies a slot) — so no extra job runs. Otherwise one
+    grouped job collects the pairs. ``df`` and ``columns`` stay in the signature so a later
+    frequent-string path (rsi-0009) can reuse this hook.
     """
     eligible = [
         (prefix, column)
