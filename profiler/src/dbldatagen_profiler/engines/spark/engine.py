@@ -13,6 +13,7 @@ import pyspark
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
+from pyspark.sql.window import Window
 
 from dbldatagen_profiler.model import (
     SPEC_VERSION,
@@ -30,9 +31,11 @@ from dbldatagen_profiler.model import (
     Profile,
     Quantile,
     QuasiIdentifierSet,
+    Semantic,
     StringStats,
     TableProfile,
     TemporalStats,
+    ValueFrequency,
     ValueTreatment,
     canonicalize_iso_fraction,
 )
@@ -67,6 +70,9 @@ _QUANTILE_GRID = (0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0)
 _TAIL_QUANTILES = frozenset({0.01, 0.05, 0.95, 0.99})
 _QUANTILE_ACCURACY = 10_000
 _HISTOGRAM_MAX_DISTINCT = 64
+_MAX_TOP_VALUES = 32
+_MAX_LITERAL_STRING_COLUMNS = 16
+_LITERAL_SENSITIVITIES = frozenset({"direct_identifier", "secret", "free_text"})
 
 # Pearson pairs are selected in increasing schema-index distance, then by the
 # left index. This puts adjacent columns first and caps wide-table aggregate
@@ -113,7 +119,15 @@ def profile_tables(
             engine=EngineInfo(name="pyspark", version=pyspark.__version__),
             privacy=policy,
             tables=[
-                _profile_table(name, frame, policy, analyses.get(name), pii_policy) for name, frame in tables.items()
+                _profile_table(
+                    name,
+                    frame,
+                    policy,
+                    analyses.get(name),
+                    pii_policy,
+                    emit_string_values=detect_pii,
+                )
+                for name, frame in tables.items()
             ],
         )
         return Profile.model_validate(result.model_dump(), context={"strict": True})
@@ -147,6 +161,7 @@ def _profile_table(
     privacy: PrivacyPolicy,
     analysis: tuple[dict[str, Any], list[tuple[list[str], float, int]]] | None,
     pii_policy: PiiPolicy | None,
+    emit_string_values: bool = True,
     aggregate_columns_per_chunk: int = _AGGREGATE_COLUMNS_PER_CHUNK,
 ) -> TableProfile:
     semantics, quasi_sets = analysis or ({}, [])
@@ -169,6 +184,8 @@ def _profile_table(
         df,
         [(f"c{index}", df[field.name], field.dataType) for index, field in enumerate(df.schema.fields)],
         _collect_column_aggregates(df, aggregate_columns_per_chunk),
+        privacy,
+        include_strings=emit_string_values,
     )
     if pearson_expressions:
         values.update(_collect_aggregate(df, pearson_expressions))
@@ -177,6 +194,8 @@ def _profile_table(
         _column_from_aggregate(field, values, index, row_count, privacy, nested=False, df=df)
         for index, field in enumerate(df.schema.fields)
     ]
+    if not emit_string_values:
+        columns = [_without_top_values(column) for column in columns]
     protected = [
         _protect_column(column, table=name, path=column.name, semantics=semantics, pii_policy=pii_policy)
         for column in columns
@@ -318,6 +337,9 @@ def _protect_column(
         )
     else:
         protect = rule is not None and rule.action not in {PiiAction.KEEP, PiiAction.PERTURB}
+    forbid_literals = (
+        semantic is not None and semantic.sensitivity.value in _LITERAL_SENSITIVITIES
+    ) or _pii_policy_covers(reference, semantic, pii_policy)
     if protect:
         if column.numeric is not None:
             updates["numeric"] = column.numeric.model_copy(
@@ -325,8 +347,8 @@ def _protect_column(
             )
         if column.temporal is not None:
             updates["temporal"] = column.temporal.model_copy(update={"min": None, "max": None, "quantiles": None})
-        if column.string is not None:
-            updates["string"] = column.string.model_copy(update={"top_values": None})
+    if forbid_literals and column.string is not None:
+        updates["string"] = column.string.model_copy(update={"top_values": None})
     if column.children is not None:
         updates["children"] = [
             _protect_column(
@@ -338,6 +360,25 @@ def _protect_column(
             )
             for child in column.children
         ]
+    return column.model_copy(update=updates) if updates else column
+
+
+def _pii_policy_covers(reference: str, semantic: Semantic | None, pii_policy: PiiPolicy | None) -> bool:
+    """Returns whether a PII policy rule forbids emitting literal values for a path."""
+    if pii_policy is None:
+        return False
+    if reference in pii_policy.columns:
+        return True
+    return semantic is not None and pii_policy.resolve(reference, semantic)[0].action != PiiAction.KEEP
+
+
+def _without_top_values(column: ColumnProfile) -> ColumnProfile:
+    """Removes frequent literals recursively when PII detection is disabled."""
+    updates: dict[str, Any] = {}
+    if column.string is not None and column.string.top_values is not None:
+        updates["string"] = column.string.model_copy(update={"top_values": None})
+    if column.children is not None:
+        updates["children"] = [_without_top_values(child) for child in column.children]
     return column.model_copy(update=updates) if updates else column
 
 
@@ -469,7 +510,10 @@ def _column_from_aggregate(
     if isinstance(field.dataType, _NUMERIC_TYPES):
         attributes["numeric"] = _numeric_stats(field.dataType, values, prefix, privacy)
     elif isinstance(field.dataType, _string_types()):
-        attributes["string"] = StringStats(length=_length_stats(values, prefix, include_stddev=False))
+        attributes["string"] = StringStats(
+            length=_length_stats(values, prefix, include_stddev=False),
+            top_values=_top_values(values, prefix, non_null),
+        )
     elif isinstance(field.dataType, _temporal_types()):
         attributes["temporal"] = _temporal_stats(field.dataType, values, prefix, privacy)
     elif isinstance(field.dataType, T.BooleanType) and values.get(f"{prefix}_true_fraction") is not None:
@@ -522,6 +566,8 @@ def _profile_nested_fields(
         df,
         [(f"c{index}", column, field.dataType) for index, (field, column) in enumerate(children)],
         _collect_aggregate(df, expressions),
+        privacy,
+        include_strings=True,
     )
     row_count = int(values["__row_count"])
     return [
@@ -547,24 +593,74 @@ def _collect_aggregate(df: DataFrame, expressions: list[Column]) -> dict[str, An
 
 
 def _with_value_counts(
-    df: DataFrame, columns: list[tuple[str, Column, T.DataType]], values: dict[str, Any]
+    df: DataFrame,
+    columns: list[tuple[str, Column, T.DataType]],
+    values: dict[str, Any],
+    privacy: PrivacyPolicy,
+    *,
+    include_strings: bool,
 ) -> dict[str, Any]:
-    """Adds exact sorted (value, count) pairs for low-cardinality integer columns, in one grouped job."""
+    """Adds bounded exact value counts for histogram and frequent-string statistics."""
     eligible = [
         (prefix, column)
         for prefix, column, data_type in columns
         if isinstance(data_type, tuple(_INTEGER_BITS)) and 2 <= values[f"{prefix}_distinct"] <= _HISTOGRAM_MAX_DISTINCT
     ]
-    if not eligible:
-        return values
-    entries = F.explode(
-        F.array(*(F.struct(F.lit(prefix).alias("p"), column.cast("long").alias("v")) for prefix, column in eligible))
-    )
-    rows = df.select(entries.alias("e")).select("e.*").where(F.col("v").isNotNull()).groupBy("p", "v").count()
-    counts: dict[str, list[tuple[int, int]]] = {prefix: [] for prefix, _ in eligible}
-    for row in sorted(rows.collect(), key=lambda row: (row["p"], row["v"])):
-        counts[row["p"]].append((row["v"], row["count"]))
-    return {**values, **{f"{prefix}_value_counts": pairs for prefix, pairs in counts.items()}}
+    result = dict(values)
+    if eligible:
+        entries = F.explode(
+            F.array(
+                *(F.struct(F.lit(prefix).alias("p"), column.cast("long").alias("v")) for prefix, column in eligible)
+            )
+        )
+        integer_rows = (
+            df.select(entries.alias("e")).select("e.*").where(F.col("v").isNotNull()).groupBy("p", "v").count()
+        )
+        integer_counts: dict[str, list[tuple[int, int]]] = {prefix: [] for prefix, _ in eligible}
+        for row in sorted(integer_rows.collect(), key=lambda row: (row["p"], row["v"])):
+            integer_counts[row["p"]].append((row["v"], row["count"]))
+        result.update({f"{prefix}_value_counts": pairs for prefix, pairs in integer_counts.items()})
+
+    string_columns = [
+        (prefix, column)
+        for prefix, column, data_type in columns
+        if include_strings
+        and privacy.enumerations != ValueTreatment.SUPPRESSED
+        and isinstance(data_type, _string_types())
+    ]
+    if len(string_columns) > _MAX_LITERAL_STRING_COLUMNS:
+        string_columns = []
+    if string_columns:
+        entries = F.explode(
+            F.array(*(F.struct(F.lit(prefix).alias("p"), column.alias("v")) for prefix, column in string_columns))
+        )
+        string_counts = (
+            df.select(entries.alias("e"))
+            .select("e.*")
+            .where(F.col("v").isNotNull())
+            .groupBy("p", "v")
+            .count()
+            .where(F.col("count") >= privacy.min_value_count)
+        )
+        rank = Window.partitionBy("p").orderBy(F.desc("count"), F.asc("v"))
+        string_rows = (
+            string_counts.withColumn("rank", F.row_number().over(rank))
+            .where(F.col("rank") <= _MAX_TOP_VALUES)
+            .collect()
+        )
+        found: dict[str, list[tuple[str, int]]] = {prefix: [] for prefix, _ in string_columns}
+        for row in sorted(string_rows, key=lambda row: (row["p"], row["rank"])):
+            found[row["p"]].append((row["v"], row["count"]))
+        result.update({f"{prefix}_top_value_counts": pairs for prefix, pairs in found.items()})
+    return result
+
+
+def _top_values(values: Mapping[str, Any], prefix: str, non_null: int) -> list[ValueFrequency] | None:
+    """Builds deterministic frequent values using the non-null column population."""
+    counts = values.get(f"{prefix}_top_value_counts")
+    if not counts or non_null <= 0:
+        return None
+    return [ValueFrequency(value=value, frequency=count / non_null) for value, count in counts]
 
 
 def _numeric_stats(

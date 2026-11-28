@@ -47,6 +47,15 @@ uv run --package dbldatagen-profiler --all-extras dbldatagen-profile profile \
 The input format may be `parquet`, `csv`, or `delta`. PySpark is an optional extra; install
 `dbldatagen-profiler[spark]` when using the engine as a library.
 
+### Frequent string values
+
+The batch engine emits up to 32 `string.top_values`, ordered by frequency and then value. Each value is counted
+exactly, occurs at least `privacy.min_value_count` times, and its frequency uses the non-null string population.
+Values are omitted when enumerations are suppressed or PII detection is disabled, and from direct identifiers,
+secrets, free text, and columns covered by a PII policy rule. Nested values use their nested population for both the
+threshold and frequency. A table or nested level with more than 16 sibling string columns emits none, preventing
+high-dimensional combinations of individually frequent literals from recreating rare row pairs.
+
 ### Streaming
 
 `dbldatagen_profiler.engines.streaming` profiles data as it arrives. Each micro-batch is reduced to a mergeable

@@ -13,6 +13,7 @@ from dbldatagen_profiler.engines.spark import engine as spark_engine
 from dbldatagen_profiler.engines.spark import profile_dataframe, profile_tables
 from dbldatagen_profiler.engines.spark.engine import _histogram, _logical_type, _numeric_stats, _pearson_pairs
 from dbldatagen_profiler.model import LogicalType, PrivacyPolicy, TableProfile, ValueTreatment, profile_json_schema
+from dbldatagen_profiler.pii import PiiAction, PiiPolicy, PiiRule
 
 
 pytestmark = [pytest.mark.spark, pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")]
@@ -360,6 +361,93 @@ def test_profiles_empty_table(spark: SparkSession) -> None:
     assert table.columns[0].null_fraction == 0.0
     assert table.columns[0].distinct_count is not None
     assert table.columns[0].distinct_count.value == 0
+
+
+def test_string_top_values_are_exact_k_safe_and_deterministic(spark: SparkSession) -> None:
+    values = ["blue"] * 20 + ["red"] * 10 + ["rare"] * 9 + [None]
+    frame = spark.createDataFrame([(value,) for value in values], "category string").repartition(3)
+
+    first = profile_dataframe("t", frame)
+    second = profile_dataframe("t", frame)
+    stats = first.tables[0].columns[0].string
+
+    assert stats is not None and stats.top_values is not None
+    assert [item.value for item in stats.top_values] == ["blue", "red"]
+    assert [item.frequency for item in stats.top_values] == pytest.approx([20 / 39, 10 / 39])
+    assert first.tables[0].columns[0].model_dump() == second.tables[0].columns[0].model_dump()
+
+
+def test_string_top_values_honor_custom_k_cap_and_tie_order(spark: SparkSession) -> None:
+    values = [f"value-{index:02d}" for index in range(40) for _ in range(3)]
+    frame = spark.createDataFrame([(value,) for value in values], "category string")
+
+    stats = profile_dataframe("t", frame, privacy=PrivacyPolicy(min_value_count=3)).tables[0].columns[0].string
+
+    assert stats is not None and stats.top_values is not None
+    assert [item.value for item in stats.top_values] == [f"value-{index:02d}" for index in range(32)]
+    assert all(item.frequency == pytest.approx(3 / 120) for item in stats.top_values)
+
+
+def test_high_dimensional_string_literals_are_suppressed_as_a_linkage_set(spark: SparkSession) -> None:
+    schema = ", ".join(f"c{index} string" for index in range(17))
+    frame = spark.createDataFrame([tuple(f"value-{index}" for index in range(17))] * 10, schema)
+
+    columns = profile_dataframe("t", frame).tables[0].columns
+
+    assert all(column.string is not None and column.string.top_values is None for column in columns)
+
+
+@pytest.mark.parametrize(
+    ("detect_pii", "privacy", "policy"),
+    [
+        (False, None, None),
+        (True, PrivacyPolicy(enumerations=ValueTreatment.SUPPRESSED), None),
+        (True, None, PiiPolicy(columns={"t.category": PiiRule(action=PiiAction.KEEP)})),
+    ],
+    ids=["pii-detection-off", "enumerations-suppressed", "pii-policy-rule"],
+)
+def test_string_top_values_are_suppressed_by_privacy_controls(
+    spark: SparkSession, detect_pii: bool, privacy: PrivacyPolicy | None, policy: PiiPolicy | None
+) -> None:
+    frame = spark.createDataFrame([("public",)] * 20, "category string")
+
+    column = (
+        profile_dataframe("t", frame, detect_pii=detect_pii, privacy=privacy, pii_policy=policy).tables[0].columns[0]
+    )
+
+    assert column.string is not None and column.string.top_values is None
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("email", "alice@example.com"),
+        ("secret_token", "yZ2mQ8vL5pR9tW3nK7xC"),
+        ("notes", "contact alice@example.com today"),
+    ],
+    ids=["direct-identifier", "secret", "free-text"],
+)
+def test_sensitive_strings_never_emit_top_values(spark: SparkSession, name: str, value: str) -> None:
+    frame = spark.createDataFrame([(value,)] * 20, f"{name} string")
+
+    column = profile_dataframe("t", frame).tables[0].columns[0]
+
+    assert column.semantic is not None
+    assert column.string is not None and column.string.top_values is None
+
+
+def test_nested_string_top_values_use_nested_population_and_k(spark: SparkSession) -> None:
+    frame = spark.createDataFrame(
+        [(["common", "common", f"rare-{index}"],) for index in range(6)], "tags array<string>"
+    )
+
+    tags = profile_dataframe("t", frame, privacy=PrivacyPolicy(min_value_count=10)).tables[0].columns[0]
+    (element,) = tags.children or []
+
+    assert element.value_count == 18
+    assert element.string is not None and element.string.top_values is not None
+    assert [item.value for item in element.string.top_values] == ["common"]
+    assert [item.frequency for item in element.string.top_values] == pytest.approx([12 / 18])
 
 
 CORE_GRID = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
